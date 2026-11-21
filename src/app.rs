@@ -24129,6 +24129,10 @@ If you step every basis for a                          type and NONE of them mat
         if let Some(error) = retimed.error {
             lifetime_error = Some(error);
         }
+        // Validate the replacement before generating any suppression for its source.
+        let refused_retime = retimed.block_missing_retimed_donors(&current, |h| {
+            Self::build_attack_args(h, Self::exact_attack_donor(&captures, h.id)).is_some()
+        });
 
         // Phase 2 — unmatched pristine → suppress that specific hit (deleted or retimed away).
         for (pi, p) in pristine.iter().enumerate() {
@@ -24168,6 +24172,10 @@ If you step every basis for a                          type and NONE of them mat
                 crate::data::CAT_ATTACK_FP => {
                     Self::build_attack_fp_args(h, donor_for(crate::data::CAT_ATTACK_FP, h.id))
                 }
+                0 => Self::build_attack_args(
+                    h,
+                    Self::exact_attack_donor(&captures, h.id).or_else(|| donor_for(0, h.id)),
+                ),
                 _ => Self::build_attack_args(h, donor_for(0, h.id)),
             };
             let command = Self::inject_command(h);
@@ -24228,6 +24236,11 @@ If you step every basis for a                          type and NONE of them mat
         }
         if let Some(error) = lifetime_error {
             self.state.status = error.into();
+        }
+        if refused_retime {
+            self.state.status =
+                "Start Frame edit not applied live: matching ATTACK capture missing. Original hitbox kept; perform the move in game once."
+                    .into();
         }
     }
 
@@ -28210,6 +28223,11 @@ If you step every basis for a                          type and NONE of them mat
             if retimed.error.is_some() {
                 incomplete.insert(key.clone());
             }
+            if retimed.block_missing_retimed_donors(current, |h| {
+                Self::build_attack_args(h, Self::exact_attack_donor(&captures, h.id)).is_some()
+            }) {
+                incomplete.insert(key.clone());
+            }
             for (index, original) in pristine.iter().enumerate() {
                 if pristine_used[index] {
                     continue;
@@ -28243,6 +28261,11 @@ If you step every basis for a                          type and NONE of them mat
                     crate::data::CAT_ATTACK_FP => Self::build_attack_fp_args(
                         edited,
                         donor_for(crate::data::CAT_ATTACK_FP, edited.id),
+                    ),
+                    0 => Self::build_attack_args(
+                        edited,
+                        Self::exact_attack_donor(&captures, edited.id)
+                            .or_else(|| donor_for(0, edited.id)),
                     ),
                     _ => Self::build_attack_args(edited, donor_for(0, edited.id)),
                 };
@@ -28464,6 +28487,19 @@ If you step every basis for a                          type and NONE of them mat
     /// Full 36-slot ATTACK arg vector for injection: donor capture args (exact tail) with
     /// the modeled slots overwritten from the Hitbox. Without a donor: None (template
     /// injection is too risky — masks/flags would be guesses).
+    /// A retimed ATTACK must reuse its own captured call, not a fallback
+    /// from another hitbox ID or the separate ATTACK_FP family.
+    fn exact_attack_donor(
+        captures: &[crate::game_link::CaptureLine],
+        id: u32,
+    ) -> Option<&crate::game_link::CaptureLine> {
+        captures.iter().find(|capture| {
+            matches!(capture.func.as_str(), "ATTACK" | "ATTACK_IGNORE_THROW")
+                && capture.args.len() >= 36
+                && capture.args.first().and_then(|arg| arg.as_i64()) == Some(id as i64)
+        })
+    }
+
     fn build_attack_args(
         h: &crate::data::Hitbox,
         donor: Option<&crate::game_link::CaptureLine>,
