@@ -849,8 +849,8 @@ struct TimelineRow {
 /// Stable ordering for timeline hitbox rows: dragging Start Frame must not
 /// move the bar into a different row while the mouse is held down.
 fn timeline_row_sort_key(row: &TimelineRow) -> (u8, u32, u8) {
-    match row.selection {
-        TimelineSelection::Hitbox(index) => (0, index as u32, 0),
+    match &row.selection {
+        TimelineSelection::Hitbox(index) => (0, *index as u32, 0),
         _ => (1, row.start, row.category as u8),
     }
 }
