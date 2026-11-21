@@ -24122,9 +24122,20 @@ If you step every basis for a                          type and NONE of them mat
             }
         }
 
+        // Re-injected ATTACKs need the same lifetime rules as edits at a fixed start.
+        let mut retimed = Self::plan_retimed_attack_lifetimes(
+            motion, &pristine, &pri_used, &current, &cur_used,
+        );
+        if let Some(error) = retimed.error {
+            lifetime_error = Some(error);
+        }
+
         // Phase 2 — unmatched pristine → suppress that specific hit (deleted or retimed away).
         for (pi, p) in pristine.iter().enumerate() {
             if pri_used[pi] {
+                continue;
+            }
+            if p.category == 0 && retimed.skipped_ids.contains(&p.id) {
                 continue;
             }
             let (fs, fe) = win(p.active_start);
@@ -24144,6 +24155,9 @@ If you step every basis for a                          type and NONE of them mat
         // Phase 3 — unmatched current → inject at its frame (added or retimed here).
         for (ci, h) in current.iter().enumerate() {
             if cur_used[ci] {
+                continue;
+            }
+            if h.category == 0 && retimed.skipped_ids.contains(&h.id) {
                 continue;
             }
             // Build the inject arg vector for this collision family.
@@ -24174,6 +24188,9 @@ If you step every basis for a                          type and NONE of them mat
                         }),
                         func: None,
                     });
+                    if h.category == 0 {
+                        rules.extend(std::mem::take(&mut retimed.rules_by_index[ci]));
+                    }
                     if let Some(end) = Self::collision_end_injection(h) {
                         rules.push(crate::game_link::HitboxRuleWire {
                             motion,
@@ -28187,8 +28204,17 @@ If you step every basis for a                          type and NONE of them mat
                     }
                 }
             }
+            let mut retimed = Self::plan_retimed_attack_lifetimes(
+                motion, pristine, &pristine_used, current, &current_used,
+            );
+            if retimed.error.is_some() {
+                incomplete.insert(key.clone());
+            }
             for (index, original) in pristine.iter().enumerate() {
                 if pristine_used[index] {
+                    continue;
+                }
+                if original.category == 0 && retimed.skipped_ids.contains(&original.id) {
                     continue;
                 }
                 let (frame_start, frame_end) = Self::rule_frame_window(original.active_start);
@@ -28206,6 +28232,9 @@ If you step every basis for a                          type and NONE of them mat
             }
             for (index, edited) in current.iter().enumerate() {
                 if current_used[index] {
+                    continue;
+                }
+                if edited.category == 0 && retimed.skipped_ids.contains(&edited.id) {
                     continue;
                 }
                 let args = match edited.category {
@@ -28234,6 +28263,9 @@ If you step every basis for a                          type and NONE of them mat
                         }),
                         func: None,
                     });
+                    if edited.category == 0 {
+                        rules.extend(std::mem::take(&mut retimed.rules_by_index[index]));
+                    }
                     if let Some(end) = Self::collision_end_injection(edited) {
                         rules.push(crate::game_link::HitboxRuleWire {
                             motion,
