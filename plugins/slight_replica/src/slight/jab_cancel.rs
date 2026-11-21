@@ -1,6 +1,6 @@
 //! Test ciblé : autoriser la vérification de cancel uniquement pour Mario jab 1 → grab.
 
-use smash::app::lua_bind::{CancelModule, ControlModule, MotionModule, StatusModule};
+use smash::app::lua_bind::{ControlModule, MotionModule, StatusModule};
 use smash::app::BattleObjectModuleAccessor;
 use smash::lib::lua_const::{
     BATTLE_OBJECT_CATEGORY_FIGHTER, FIGHTER_KIND_MARIO, FIGHTER_PAD_CMD_CAT1_FLAG_CATCH,
