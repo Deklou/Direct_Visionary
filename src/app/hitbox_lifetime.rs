@@ -330,4 +330,53 @@ mod tests {
         assert!(plan.skipped_ids.is_empty());
     }
 
+    #[test]
+    fn a_moved_attack_can_be_injected_without_live_capture() {
+        let hitbox = box_at(0, 8, 12);
+        let args = VisionaryApp::retimed_attack_args(&hitbox, &[])
+            .expect("a normal ATTACK can supply its own modeled arguments");
+        assert_eq!(args.len(), 36);
+        assert_eq!(args[0], LuaArgWire::Int(0));
+        assert!(matches!(args[2], LuaArgWire::Hash(_)));
+        assert_eq!(args[3], LuaArgWire::Num(hitbox.damage));
+        assert_eq!(args[21], LuaArgWire::Num(hitbox.hitbox_attr));
+        assert!(matches!(args[32], LuaArgWire::Hash(_)));
+    }
+
+    #[test]
+    fn unknown_attack_constants_are_not_guessed() {
+        let mut hitbox = box_at(0, 8, 12);
+        hitbox.situation_mask = "UNKNOWN_SITUATION_MASK".into();
+        assert!(VisionaryApp::retimed_attack_args(&hitbox, &[]).is_none());
+    }
+
+    #[test]
+    fn an_unhandled_attack_function_is_not_injected() {
+        let mut hitbox = box_at(0, 8, 12);
+        hitbox.func = "ATTACK_ABS".into();
+        assert!(VisionaryApp::retimed_attack_args(&hitbox, &[]).is_none());
+    }
+
+    #[test]
+    fn timeline_hitboxes_keep_their_rows_when_start_changes() {
+        use super::super::{timeline_row_sort_key, TimelineCategory, TimelineRow, TimelineSelection};
+        let row = |index, start| TimelineRow {
+            category: TimelineCategory::Collisions,
+            selection: TimelineSelection::Hitbox(index),
+            label: format!("Attack #{index}"),
+            start,
+            end: start + 1,
+            seek_frame: start,
+            color: egui::Color32::WHITE,
+        };
+        let mut rows = vec![row(0, 20), row(1, 10)];
+        rows.sort_by_key(timeline_row_sort_key);
+        assert_eq!(rows[0].selection, TimelineSelection::Hitbox(0));
+        rows[0].start = 2;
+        rows[1].start = 30;
+        rows.sort_by_key(timeline_row_sort_key);
+        assert_eq!(rows[0].selection, TimelineSelection::Hitbox(0));
+        assert_eq!(rows[1].selection, TimelineSelection::Hitbox(1));
+    }
+
 }
