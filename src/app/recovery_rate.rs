@@ -250,7 +250,7 @@ mod tests {
         let events: Vec<(u32, f32)> =
             rules.iter().map(|rule| rate_from_rule(rule).unwrap()).collect();
         assert_eq!(events, [(11, 0.1), (14, 1.0), (20, 10.0), (26, 1.0)]);
-        assert_eq!(read_speed_ranges(Some(&rules), 50), ranges);
+        assert_eq!(read_speed_ranges(Some(&rules), 50), ranges.to_vec());
     }
 
     #[test]
