@@ -3783,6 +3783,15 @@ pub unsafe fn inject_tick(lua_state: u64) {
                 );
                 continue;
             }
+            if category == CAT_MOTION_RATE
+                && (inj.command.as_deref() != Some("FT_MOTION_RATE")
+                    || !matches!(args.as_slice(), [LuaArg::Num(rate)] if rate.is_finite() && *rate > 0.0))
+            {
+                crate::slight::diag::note(
+                    "rejected motion-rate injection: expected FT_MOTION_RATE with one positive finite rate",
+                );
+                continue;
+            }
             if category == CAT_FT_CATCH_STOP {
                 crate::slight::diag::note(
                     "rejected FT_CATCH_STOP injection: this slice supports value overrides only",
@@ -3919,6 +3928,9 @@ pub unsafe fn inject_tick(lua_state: u64) {
                             ));
                             continue;
                         }
+                    }
+                    CAT_MOTION_RATE => {
+                        smash::app::sv_animcmd::FT_MOTION_RATE(agent.lua_state_agent)
                     }
                     CAT_REVERSE_LR => smash::app::sv_animcmd::REVERSE_LR(agent.lua_state_agent),
                     CAT_SET_AIR => smash::app::sv_animcmd::SET_AIR(agent.lua_state_agent),
