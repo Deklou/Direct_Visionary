@@ -6,7 +6,7 @@ use crate::game_link::{HitboxRuleWire, InjectRuleWire, LuaArgWire, CAT_ATTACK_LI
 impl VisionaryApp {
     /// Keep a box through its original clear_all, or clear it earlier, by ID.
     /// Reused IDs cannot overlap the scheduled clear: the game has only one slot per ID.
-    fn attack_lifetime_rules(
+    pub(super) fn attack_lifetime_rules(
         motion: u64,
         original: &Hitbox,
         edited: &Hitbox,
