@@ -23,7 +23,7 @@ impl VisionaryApp {
             .and_then(|injection| {
                 let rate = injection.args.first()?.as_f32()?;
                 (rate.is_finite() && rate > 0.0)
-                    .then_some((injection.frame, 1.0 / rate))
+                    .then_some((injection.frame, rate))
             });
 
         let max_start = self.state.total_frames - 1;
