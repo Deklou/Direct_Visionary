@@ -254,6 +254,9 @@ mod tests {
         ];
         let rules = speed_range_rules(0x1234, &ranges);
         assert_eq!(rules.len(), 4);
+        assert_eq!(rules[0].frame_end, Some(13.0));
+        assert_eq!(rules[1].frame_end, None);
+        assert_eq!(rules[2].frame_end, Some(25.0));
         let events: Vec<(u32, f32)> =
             rules.iter().map(|rule| rate_from_rule(rule).unwrap()).collect();
         assert_eq!(events, vec![(11, 0.1), (14, 1.0), (20, 10.0), (26, 1.0)]);
