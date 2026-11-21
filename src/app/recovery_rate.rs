@@ -89,7 +89,10 @@ fn live_rate_rule(motion: u64, frame: u32, speed: f32) -> HitboxRuleWire {
 fn speed_range_rules(motion: u64, ranges: &[SpeedRange]) -> Vec<HitboxRuleWire> {
     let mut rules = Vec::with_capacity(ranges.len() * 2);
     for range in ranges {
-        rules.push(live_rate_rule(motion, range.start, range.speed));
+        let mut start = live_rate_rule(motion, range.start, range.speed);
+        // Do not reapply a modified start rate if this interval has already ended.
+        start.frame_end = Some(range.end as f32);
+        rules.push(start);
         // End is inclusive: the native playback rate returns to 1x on the next frame.
         rules.push(live_rate_rule(motion, range.end + 1, 1.0));
     }
