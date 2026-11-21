@@ -2,6 +2,7 @@ use crate::data::{fighter_display_name, AppState, Hitbox, MoveEntry};
 use crate::renderer::{HitboxRenderState, ViewportCallback};
 use egui::{Color32, RichText, ScrollArea, Ui};
 mod recovery_rate;
+mod hitbox_lifetime;
 /// Main egui application for Visionary.
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::Hash;
@@ -24080,6 +24081,7 @@ If you step every basis for a                          type and NONE of them mat
         let mut pri_used = vec![false; pristine.len()];
         let mut rules: Vec<crate::game_link::HitboxRuleWire> = Vec::new();
         let mut missing_donor = false;
+        let mut lifetime_error: Option<&'static str> = None;
 
         // Phase 1 — exact (id, start) pairs: unchanged → nothing, changed → scoped override.
         for (pi, p) in pristine.iter().enumerate() {
@@ -24109,6 +24111,12 @@ If you step every basis for a                          type and NONE of them mat
                             inject: None,
                             func: None,
                         });
+                        if p.category == 0 {
+                            match Self::attack_lifetime_rules(motion, p, h, &current) {
+                                Ok(extra) => rules.extend(extra),
+                                Err(error) => lifetime_error = Some(error),
+                            }
+                        }
                     }
                 }
             }
@@ -24200,6 +24208,9 @@ If you step every basis for a                          type and NONE of them mat
             self.state.status =
                 "Added/retimed hitbox needs live capture args — perform the move in game once."
                     .into();
+        }
+        if let Some(error) = lifetime_error {
+            self.state.status = error.into();
         }
     }
 
@@ -28166,6 +28177,12 @@ If you step every basis for a                          type and NONE of them mat
                                 inject: None,
                                 func: None,
                             });
+                            if original.category == 0 {
+                                match Self::attack_lifetime_rules(motion, original, edited, current) {
+                                    Ok(extra) => rules.extend(extra),
+                                    Err(_) => { incomplete.insert(key.clone()); },
+                                }
+                            }
                         }
                     }
                 }
