@@ -3754,6 +3754,7 @@ mod tests {
         assert!(editor.contains("const MIN_SPEED: f32 = 0.1;"));
         assert!(editor.contains("const MAX_SPEED: f32 = 10.0;"));
         assert!(editor.contains("speed_range_rules(motion, &ranges)"));
+        assert!(editor.contains("start.frame_end = Some(range.end as f32);"));
 
         let callback = plugin
             .split_once("pub unsafe fn inject_tick(lua_state: u64)")
@@ -3767,6 +3768,7 @@ mod tests {
             .expect("find ACMD argument setup");
         assert!(native < lua_stack, "native rate must not use the ACMD Lua stack");
         assert!(callback.contains("*rate >= 0.1 && *rate <= 10.0"));
+        assert!(plugin.contains("r.frame_end.map(|end| frame <= end).unwrap_or(true)"));
         assert!(!callback.contains("sv_animcmd::FT_MOTION_RATE(agent.lua_state_agent)"));
     }
 
