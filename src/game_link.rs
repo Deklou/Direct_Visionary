@@ -733,6 +733,10 @@ pub const CAT_WORK_MODULE_INC_INT: u8 = 35;
 /// Wire category for direct `MotionModule::set_frame_partial` point overrides.
 pub const CAT_MOTION_MODULE_SET_FRAME_PARTIAL: u8 = 36;
 
+/// Live ATTACK lifetime controls: per-ID clear injection and selective clear_all preservation.
+/// Must match the Skyline plugin's wire category.
+pub const CAT_ATTACK_LIFETIME: u8 = 37;
+
 /// The wire category a modifier's rules go out under.
 pub fn attack_mod_category(kind: crate::data::AttackModKind) -> u8 {
     match kind {
