@@ -60,9 +60,6 @@ try {
     if (Get-Process -Name visionary -ErrorAction SilentlyContinue) {
         throw 'Ferme Visionary avant de compiler.'
     }
-    if ($Action -eq 'All' -and (Get-Process -Name Ryujinx -ErrorAction SilentlyContinue)) {
-        throw 'Ferme Ryujinx avant de remplacer le NRO.'
-    }
     if ($Action -eq 'All' -and -not (Test-Path -LiteralPath $target -PathType Leaf)) {
         throw "NRO installe introuvable, aucun nouveau chemin cree : $target"
     }
@@ -86,6 +83,13 @@ try {
     if ($Action -eq 'Build') {
         Write-Host "Compilation terminee. NRO : $builtNro"
         return
+    }
+
+    if (Get-Process -Name Ryujinx -ErrorAction SilentlyContinue) {
+        [void](Read-Host 'Compilation terminee. Ferme Ryujinx, puis appuie sur Entree pour deployer le NRO')
+        if (Get-Process -Name Ryujinx -ErrorAction SilentlyContinue) {
+            throw 'Ryujinx est encore ouvert : aucun NRO remplace.'
+        }
     }
 
     $backupDir = Join-Path $sdDir 'backups'
@@ -134,4 +138,5 @@ finally {
     Pop-Location
 }
 
+[void](Read-Host 'Demarre Ryujinx et Smash, puis appuie sur Entree pour lancer Visionary')
 Start-Visionary
