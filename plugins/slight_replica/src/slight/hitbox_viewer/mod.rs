@@ -3731,6 +3731,33 @@ pub unsafe fn inject_tick(lua_state: u64) {
                 ));
                 continue;
             }
+            // A status-line callback has a valid boma, but is not an ACMD coroutine.
+            // sv_animcmd::FT_MOTION_RATE requires the latter and crashes if called here.
+            // Use the direct MotionModule setter before touching the Lua argument stack.
+            if category == CAT_MOTION_MODULE_SET_RATE {
+                let rate = match (inj.command.as_deref(), inj.args.as_slice()) {
+                    (Some("MotionModule::set_rate"), [LuaArg::Num(rate)])
+                        if rate.is_finite() && *rate > 0.0 && *rate <= 4.0 =>
+                    {
+                        *rate
+                    }
+                    _ => {
+                        crate::slight::diag::note(
+                            "rejected native recovery rate injection: invalid command or speed",
+                        );
+                        continue;
+                    }
+                };
+                {
+                    let _g = InjectGuard::new();
+                    smash::app::lua_bind::MotionModule::set_rate(boma, rate);
+                }
+                FIRED.lock().insert(key, (motion, frame));
+                crate::slight::diag::note(format!(
+                    "set native recovery rate {rate:.2} (motion {motion:#x} frame {frame:.1})"
+                ));
+                continue;
+            }
             let mut agent = smash::lib::L2CAgent::new(lua_state);
             agent.clear_lua_stack();
             let mut args = inj.args.clone();

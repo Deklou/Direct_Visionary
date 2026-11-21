@@ -3736,6 +3736,36 @@ mod tests {
         );
     }
 
+    /// Live recovery executes from a status-line callback, which has a module accessor
+    /// but no ACMD coroutine context. Never call sv_animcmd from that path.
+    #[test]
+    fn live_recovery_uses_native_motion_setter() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let editor = std::fs::read_to_string(root.join("src/app/recovery_rate.rs"))
+            .expect("read recovery-rate editor");
+        let plugin = std::fs::read_to_string(
+            root.join("plugins/slight_replica/src/slight/hitbox_viewer/mod.rs"),
+        )
+        .expect("read plugin hitbox viewer");
+
+        assert!(editor.contains("category: crate::game_link::CAT_MOTION_MODULE_SET_RATE"));
+        assert!(editor.contains("command: Some(\"MotionModule::set_rate\".into())"));
+        assert!(editor.contains("LuaArgWire::Num(speed)"));
+
+        let callback = plugin
+            .split_once("pub unsafe fn inject_tick(lua_state: u64)")
+            .expect("find per-frame injection")
+            .1;
+        let native = callback
+            .find("MotionModule::set_rate(boma, rate);")
+            .expect("inject native playback rate");
+        let lua_stack = callback
+            .find("let mut agent = smash::lib::L2CAgent::new(lua_state);")
+            .expect("find ACMD argument setup");
+        assert!(native < lua_stack, "native rate must not use the ACMD Lua stack");
+        assert!(!callback.contains("sv_animcmd::FT_MOTION_RATE(agent.lua_state_agent)"));
+    }
+
     /// A rate rule serialises under the field names the plugin deserialises.
     #[test]
     fn outbound_motion_rate_rules_match_plugin_field_names() {
