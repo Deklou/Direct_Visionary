@@ -77,7 +77,7 @@ impl VisionaryApp {
                 key,
                 vec![crate::game_link::HitboxRuleWire {
                     motion,
-                    category: crate::game_link::CAT_MOTION_RATE,
+                    category: crate::game_link::CAT_MOTION_MODULE_SET_RATE,
                     hitbox_id: None,
                     suppress: false,
                     frame_start: None,
@@ -85,9 +85,9 @@ impl VisionaryApp {
                     overrides: None,
                     inject: Some(crate::game_link::InjectRuleWire {
                         frame: start as f32,
-                        // FT_MOTION_RATE uses game frames per motion frame: 0.5 = 2x faster.
-                        args: vec![crate::game_link::LuaArgWire::Num(1.0 / speed)],
-                        command: Some("FT_MOTION_RATE".into()),
+                        // Native MotionModule::set_rate takes the direct playback multiplier.
+                        args: vec![crate::game_link::LuaArgWire::Num(speed)],
+                        command: Some("MotionModule::set_rate".into()),
                     }),
                     func: None,
                 }],
