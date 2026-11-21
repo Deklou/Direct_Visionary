@@ -71,11 +71,10 @@ try {
     & cargo +stable build --release --locked
     Test-LastExit 'compilation Windows'
 
-    $linuxRepo = (& wsl.exe -- wslpath -u $repo | Out-String).Trim()
-    Test-LastExit 'conversion du chemin WSL'
-    if (-not $linuxRepo.StartsWith('/')) {
-        throw "Chemin WSL inattendu : $linuxRepo"
+    if ($repo -notmatch '^[A-Za-z]:\\') {
+        throw "Le dossier source doit etre sur un disque Windows : $repo"
     }
+    $linuxRepo = '/mnt/' + $repo.Substring(0, 1).ToLowerInvariant() + '/' + $repo.Substring(3).Replace('\', '/')
     $quotedRepo = "'" + $linuxRepo.Replace("'", "'\''") + "'"
     Write-Host 'Compilation du plugin Skyline...'
     & wsl.exe -- bash -lc "cd $quotedRepo && python3 plugins/slight_replica/tools/build_plugin.py"
@@ -99,6 +98,9 @@ try {
     $stamp = Get-Date -Format 'yyyyMMdd-HHmmss-fff'
     $backup = Join-Path $backupDir ("lib_effect_viewer_" + $stamp + "_" + $shortCommit + ".nro")
 
+    if (Test-Path -LiteralPath $backup) {
+        throw "Sauvegarde deja presente, aucun ecrasement : $backup"
+    }
     Write-Host "Sauvegarde : $backup"
     Copy-Item -LiteralPath $target -Destination $backup -ErrorAction Stop
     $originalHash = (Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash
