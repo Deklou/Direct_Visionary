@@ -3731,6 +3731,33 @@ pub unsafe fn inject_tick(lua_state: u64) {
                 ));
                 continue;
             }
+            // A status-line callback has a valid boma, but is not an ACMD coroutine.
+            // sv_animcmd::FT_MOTION_RATE requires the latter and crashes if called here.
+            // Use the direct MotionModule setter before touching the Lua argument stack.
+            if category == CAT_MOTION_MODULE_SET_RATE {
+                let rate = match (inj.command.as_deref(), inj.args.as_slice()) {
+                    (Some("MotionModule::set_rate"), [LuaArg::Num(rate)])
+                        if rate.is_finite() && *rate > 0.0 && *rate <= 4.0 =>
+                    {
+                        *rate
+                    }
+                    _ => {
+                        crate::slight::diag::note(
+                            "rejected native recovery rate injection: invalid command or speed",
+                        );
+                        continue;
+                    }
+                };
+                {
+                    let _g = InjectGuard::new();
+                    smash::app::lua_bind::MotionModule::set_rate(boma, rate);
+                }
+                FIRED.lock().insert(key, (motion, frame));
+                crate::slight::diag::note(format!(
+                    "set native recovery rate {rate:.2} (motion {motion:#x} frame {frame:.1})"
+                ));
+                continue;
+            }
             let mut agent = smash::lib::L2CAgent::new(lua_state);
             agent.clear_lua_stack();
             let mut args = inj.args.clone();
@@ -3780,15 +3807,6 @@ pub unsafe fn inject_tick(lua_state: u64) {
             if category == CAT_REVERSE_LR && inj.command.as_deref() != Some("REVERSE_LR") {
                 crate::slight::diag::note(
                     "rejected reverse_lr injection without REVERSE_LR command",
-                );
-                continue;
-            }
-            if category == CAT_MOTION_RATE
-                && (inj.command.as_deref() != Some("FT_MOTION_RATE")
-                    || !matches!(args.as_slice(), [LuaArg::Num(rate)] if rate.is_finite() && *rate > 0.0))
-            {
-                crate::slight::diag::note(
-                    "rejected motion-rate injection: expected FT_MOTION_RATE with one positive finite rate",
                 );
                 continue;
             }
@@ -3928,9 +3946,6 @@ pub unsafe fn inject_tick(lua_state: u64) {
                             ));
                             continue;
                         }
-                    }
-                    CAT_MOTION_RATE => {
-                        smash::app::sv_animcmd::FT_MOTION_RATE(agent.lua_state_agent)
                     }
                     CAT_REVERSE_LR => smash::app::sv_animcmd::REVERSE_LR(agent.lua_state_agent),
                     CAT_SET_AIR => smash::app::sv_animcmd::SET_AIR(agent.lua_state_agent),
