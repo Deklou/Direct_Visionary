@@ -846,6 +846,15 @@ struct TimelineRow {
     color: Color32,
 }
 
+/// Stable ordering for timeline hitbox rows: dragging Start Frame must not
+/// move the bar into a different row while the mouse is held down.
+fn timeline_row_sort_key(row: &TimelineRow) -> (u8, u32, u8) {
+    match row.selection {
+        TimelineSelection::Hitbox(index) => (0, index as u32, 0),
+        _ => (1, row.start, row.category as u8),
+    }
+}
+
 impl TimelineSelection {
     /// Collision boxes and effect events own their frames directly; script commands are
     /// re-derived from the parsed source and can't be dragged.
@@ -24131,7 +24140,7 @@ If you step every basis for a                          type and NONE of them mat
         }
         // Validate the replacement before generating any suppression for its source.
         let refused_retime = retimed.block_missing_retimed_donors(&current, |h| {
-            Self::build_attack_args(h, Self::exact_attack_donor(&captures, h.id)).is_some()
+            Self::retimed_attack_args(h, &captures).is_some()
         });
 
         // Phase 2 — unmatched pristine → suppress that specific hit (deleted or retimed away).
@@ -24171,6 +24180,9 @@ If you step every basis for a                          type and NONE of them mat
                 crate::data::CAT_SEARCH => Self::build_search_args(h),
                 crate::data::CAT_ATTACK_FP => {
                     Self::build_attack_fp_args(h, donor_for(crate::data::CAT_ATTACK_FP, h.id))
+                }
+                0 if !retimed.rules_by_index[ci].is_empty() => {
+                    Self::retimed_attack_args(h, &captures)
                 }
                 0 => Self::build_attack_args(
                     h,
@@ -24239,7 +24251,7 @@ If you step every basis for a                          type and NONE of them mat
         }
         if refused_retime {
             self.state.status =
-                "Start Frame edit not applied live: matching ATTACK capture missing. Original hitbox kept; perform the move in game once."
+                "Start Frame edit not applied live: ATTACK arguments unavailable or unsupported. Original hitbox kept."
                     .into();
         }
     }
@@ -28224,7 +28236,7 @@ If you step every basis for a                          type and NONE of them mat
                 incomplete.insert(key.clone());
             }
             if retimed.block_missing_retimed_donors(current, |h| {
-                Self::build_attack_args(h, Self::exact_attack_donor(&captures, h.id)).is_some()
+                Self::retimed_attack_args(h, &captures).is_some()
             }) {
                 incomplete.insert(key.clone());
             }
@@ -28262,6 +28274,9 @@ If you step every basis for a                          type and NONE of them mat
                         edited,
                         donor_for(crate::data::CAT_ATTACK_FP, edited.id),
                     ),
+                    0 if !retimed.rules_by_index[index].is_empty() => {
+                        Self::retimed_attack_args(edited, &captures)
+                    }
                     0 => Self::build_attack_args(
                         edited,
                         Self::exact_attack_donor(&captures, edited.id)
@@ -28498,6 +28513,73 @@ If you step every basis for a                          type and NONE of them mat
                 && capture.args.len() >= 36
                 && capture.args.first().and_then(|arg| arg.as_i64()) == Some(id as i64)
         })
+    }
+
+    /// When the live capture is unavailable, a normal ATTACK has 36 known,
+    /// modeled arguments. Build all of them from the editor without borrowing
+    /// another hitbox ID. Unknown symbolic constants are not guessed.
+    fn attack_args_from_hitbox(
+        h: &crate::data::Hitbox,
+    ) -> Option<Vec<crate::game_link::LuaArgWire>> {
+        use crate::game_link::LuaArgWire as A;
+        use crate::param_labels as pl;
+        if h.category != 0
+            || h.id > 7
+            || !matches!(h.func.as_str(), "ATTACK" | "ATTACK_IGNORE_THROW")
+            || h.bone_name.trim().is_empty()
+        {
+            return None;
+        }
+        let [x2, y2, z2] = match h.capsule_end {
+            Some([x, y, z]) => [A::Num(x), A::Num(y), A::Num(z)],
+            None => [A::Nil, A::Nil, A::Nil],
+        };
+        Some(vec![
+            A::Int(h.id as i64),
+            A::Int(h.part as i64),
+            A::Hash(hash40::hash40(&h.bone_name.to_lowercase()).0),
+            A::Num(h.damage),
+            A::Int(h.angle as i64),
+            A::Int(h.kb_scaling as i64),
+            A::Int(h.fkb as i64),
+            A::Int(h.kb_base as i64),
+            A::Num(h.size),
+            A::Num(h.offset_x),
+            A::Num(h.offset_y),
+            A::Num(h.offset_z),
+            x2,
+            y2,
+            z2,
+            A::Num(h.hitlag_mult),
+            A::Num(h.sdi_mult),
+            A::Int(pl::encode_const(pl::SETOFF_KIND, &h.setoff_kind)?),
+            A::Int(pl::encode_const(pl::LR_CHECK, &h.lr_check)?),
+            A::Bool(h.is_clang),
+            A::Int(h.is_add_attack as i64),
+            A::Num(h.hitbox_attr),
+            A::Int(h.ground_or_air as i64),
+            A::Bool(h.is_mtk),
+            A::Bool(h.is_shield_disable),
+            A::Bool(h.is_reflectable),
+            A::Bool(h.is_absorbable),
+            A::Bool(h.is_landing_attack),
+            A::Int(pl::encode_const(pl::SITUATION_MASK, &h.situation_mask)?),
+            A::Int(pl::encode_const(pl::CATEGORY_MASK, &h.category_mask)?),
+            A::Int(pl::encode_const(pl::PART_MASK, &h.part_mask)?),
+            A::Bool(h.no_finish_camera),
+            A::Hash(pl::encode_collision_attr(&h.collision_attr)?),
+            A::Int(pl::encode_const(pl::SOUND_LEVEL, &h.sound_level)?),
+            A::Int(pl::encode_const(pl::SOUND_ATTR, &h.sound_attr)?),
+            A::Int(pl::encode_const(pl::ATTACK_REGION, &h.attack_region)?),
+        ])
+    }
+
+    fn retimed_attack_args(
+        h: &crate::data::Hitbox,
+        captures: &[crate::game_link::CaptureLine],
+    ) -> Option<Vec<crate::game_link::LuaArgWire>> {
+        Self::build_attack_args(h, Self::exact_attack_donor(captures, h.id))
+            .or_else(|| Self::attack_args_from_hitbox(h))
     }
 
     fn build_attack_args(
@@ -33407,7 +33489,7 @@ If you step every basis for a                          type and NONE of them mat
                 Color32::from_rgb(170, 220, 190),
             );
         }
-        rows.sort_by_key(|row| (row.start, row.category as u8));
+        rows.sort_by_key(timeline_row_sort_key);
         rows
     }
 
