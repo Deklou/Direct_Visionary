@@ -150,9 +150,13 @@ impl VisionaryApp {
                     changed |= ui
                         .add(
                             egui::DragValue::new(&mut range.start)
-                                .range((previous_end + 1)..=range.end),
+                                .range((previous_end + 1)..=next_start.saturating_sub(1)),
                         )
                         .changed();
+                    if range.start > range.end {
+                        range.end = range.start;
+                        changed = true;
+                    }
                     ui.label("To");
                     changed |= ui
                         .add(
