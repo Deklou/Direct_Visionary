@@ -2711,11 +2711,16 @@ fn injection_fingerprint(
     hash
 }
 
-fn injections_for(motion: u64) -> Vec<(u64, u8, InjectRule)> {
+fn injections_for(motion: u64, frame: f32) -> Vec<(u64, u8, InjectRule)> {
     let rules = RULES.lock();
     rules
         .iter()
-        .filter(|r| r.motion == motion && r.inject.is_some())
+        .filter(|r| {
+            r.motion == motion
+                && r.inject.is_some()
+                && (r.category != CAT_MOTION_MODULE_SET_RATE
+                    || r.frame_end.map(|end| frame <= end).unwrap_or(true))
+        })
         .map(|rule| {
             let injection = rule.inject.clone().unwrap();
             (
@@ -3675,11 +3680,11 @@ pub unsafe fn inject_tick(lua_state: u64) {
         return;
     }
     let motion = smash::app::lua_bind::MotionModule::motion_kind(boma);
-    let injections = injections_for(motion);
+    let frame = smash::app::lua_bind::MotionModule::frame(boma);
+    let injections = injections_for(motion, frame);
     if injections.is_empty() {
         return;
     }
-    let frame = smash::app::lua_bind::MotionModule::frame(boma);
     let boid = (*boma).battle_object_id;
     let live_fingerprints: HashSet<u64> = injections
         .iter()
@@ -3737,7 +3742,7 @@ pub unsafe fn inject_tick(lua_state: u64) {
             if category == CAT_MOTION_MODULE_SET_RATE {
                 let rate = match (inj.command.as_deref(), inj.args.as_slice()) {
                     (Some("MotionModule::set_rate"), [LuaArg::Num(rate)])
-                        if rate.is_finite() && *rate > 0.0 && *rate <= 4.0 =>
+                        if rate.is_finite() && *rate >= 0.1 && *rate <= 10.0 =>
                     {
                         *rate
                     }

@@ -3739,7 +3739,7 @@ mod tests {
     /// Live recovery executes from a status-line callback, which has a module accessor
     /// but no ACMD coroutine context. Never call sv_animcmd from that path.
     #[test]
-    fn live_recovery_uses_native_motion_setter() {
+    fn live_speed_ranges_use_native_motion_setter() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let editor = std::fs::read_to_string(root.join("src/app/recovery_rate.rs"))
             .expect("read recovery-rate editor");
@@ -3748,9 +3748,13 @@ mod tests {
         )
         .expect("read plugin hitbox viewer");
 
-        assert!(editor.contains("category: crate::game_link::CAT_MOTION_MODULE_SET_RATE"));
+        assert!(editor.contains("category: CAT_MOTION_MODULE_SET_RATE"));
         assert!(editor.contains("command: Some(\"MotionModule::set_rate\".into())"));
         assert!(editor.contains("LuaArgWire::Num(speed)"));
+        assert!(editor.contains("const MIN_SPEED: f32 = 0.1;"));
+        assert!(editor.contains("const MAX_SPEED: f32 = 10.0;"));
+        assert!(editor.contains("speed_range_rules(motion, &ranges)"));
+        assert!(editor.contains("start.frame_end = Some(range.end as f32);"));
 
         let callback = plugin
             .split_once("pub unsafe fn inject_tick(lua_state: u64)")
@@ -3763,6 +3767,8 @@ mod tests {
             .find("let mut agent = smash::lib::L2CAgent::new(lua_state);")
             .expect("find ACMD argument setup");
         assert!(native < lua_stack, "native rate must not use the ACMD Lua stack");
+        assert!(callback.contains("*rate >= 0.1 && *rate <= 10.0"));
+        assert!(plugin.contains("r.frame_end.map(|end| frame <= end).unwrap_or(true)"));
         assert!(!callback.contains("sv_animcmd::FT_MOTION_RATE(agent.lua_state_agent)"));
     }
 
