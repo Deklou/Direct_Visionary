@@ -3737,7 +3737,7 @@ pub unsafe fn inject_tick(lua_state: u64) {
             if category == CAT_MOTION_MODULE_SET_RATE {
                 let rate = match (inj.command.as_deref(), inj.args.as_slice()) {
                     (Some("MotionModule::set_rate"), [LuaArg::Num(rate)])
-                        if rate.is_finite() && *rate > 0.0 && *rate <= 4.0 =>
+                        if rate.is_finite() && *rate >= 0.1 && *rate <= 10.0 =>
                     {
                         *rate
                     }
