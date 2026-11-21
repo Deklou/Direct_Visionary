@@ -1,6 +1,7 @@
 use crate::data::{fighter_display_name, AppState, Hitbox, MoveEntry};
 use crate::renderer::{HitboxRenderState, ViewportCallback};
 use egui::{Color32, RichText, ScrollArea, Ui};
+mod recovery_rate;
 /// Main egui application for Visionary.
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::Hash;
@@ -11483,6 +11484,7 @@ impl VisionaryApp {
             self.draw_work_transition_term_section(ui);
             self.draw_work_module_inc_int_section(ui);
             self.draw_work_module_set_section(ui);
+            self.draw_recovery_rate_section(ui);
             self.draw_motion_rate_section(ui);
         }
         if matches!(self.primary_tab, PrimaryEditorTab::AudioFeedback) {
