@@ -13,6 +13,32 @@ pub(super) struct RetimedAttackPlan {
     pub(super) error: Option<&'static str>,
 }
 
+impl RetimedAttackPlan {
+    /// Do not suppress a native ATTACK unless its retimed replacement can be built.
+    /// Both callers consult skipped_ids before emitting either side of the edit.
+    pub(super) fn block_missing_retimed_donors(
+        &mut self,
+        edited: &[Hitbox],
+        mut can_inject: impl FnMut(&Hitbox) -> bool,
+    ) -> bool {
+        let mut missing = false;
+        for (index, rules) in self.rules_by_index.iter().enumerate() {
+            if !rules.is_empty() && !can_inject(&edited[index]) {
+                self.skipped_ids.insert(edited[index].id);
+                missing = true;
+            }
+        }
+        if missing {
+            for (index, rules) in self.rules_by_index.iter_mut().enumerate() {
+                if self.skipped_ids.contains(&edited[index].id) {
+                    rules.clear();
+                }
+            }
+        }
+        missing
+    }
+}
+
 impl VisionaryApp {
     fn attack_clear_id_rule(motion: u64, id: u32, end: u32) -> HitboxRuleWire {
         let clear_frame = Self::script_to_motion_frame(end.saturating_add(1));
@@ -268,5 +294,40 @@ mod tests {
         assert!(plan.rules_by_index.iter().all(Vec::is_empty));
     }
 
+
+    #[test]
+    fn missing_capture_keeps_original_attack_and_skips_its_injection() {
+        let original = box_at(0, 7, 10);
+        let edited = box_at(0, 5, 13);
+        let mut plan = VisionaryApp::plan_retimed_attack_lifetimes(
+            123, &[original], &[false], &[edited.clone()], &[false],
+        );
+        assert!(!plan.rules_by_index[0].is_empty());
+        assert!(plan.block_missing_retimed_donors(&[edited], |_| false));
+        assert!(plan.skipped_ids.contains(&0));
+        assert!(plan.rules_by_index[0].is_empty());
+    }
+
+    #[test]
+    fn available_capture_allows_both_sides_of_retime() {
+        let original = box_at(0, 7, 10);
+        let edited = box_at(0, 5, 13);
+        let mut plan = VisionaryApp::plan_retimed_attack_lifetimes(
+            123, &[original], &[false], &[edited.clone()], &[false],
+        );
+        assert!(!plan.block_missing_retimed_donors(&[edited], |_| true));
+        assert!(!plan.skipped_ids.contains(&0));
+        assert_eq!(plan.rules_by_index[0].len(), 2);
+    }
+
+    #[test]
+    fn missing_capture_on_added_attack_does_not_block_deletions() {
+        let added = box_at(1, 5, 13);
+        let mut plan = VisionaryApp::plan_retimed_attack_lifetimes(
+            123, &[], &[], &[added.clone()], &[false],
+        );
+        assert!(!plan.block_missing_retimed_donors(&[added], |_| false));
+        assert!(plan.skipped_ids.is_empty());
+    }
 
 }
