@@ -2,6 +2,7 @@ use crate::data::{fighter_display_name, AppState, Hitbox, MoveEntry};
 use crate::renderer::{HitboxRenderState, ViewportCallback};
 use egui::{Color32, RichText, ScrollArea, Ui};
 mod recovery_rate;
+mod hitbox_lifetime;
 /// Main egui application for Visionary.
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::Hash;
@@ -843,6 +844,15 @@ struct TimelineRow {
     end: u32,
     seek_frame: u32,
     color: Color32,
+}
+
+/// Stable ordering for timeline hitbox rows: dragging Start Frame must not
+/// move the bar into a different row while the mouse is held down.
+fn timeline_row_sort_key(row: &TimelineRow) -> (u8, u32, u8) {
+    match &row.selection {
+        TimelineSelection::Hitbox(index) => (0, *index as u32, 0),
+        _ => (1, row.start, row.category as u8),
+    }
 }
 
 impl TimelineSelection {
@@ -24080,6 +24090,7 @@ If you step every basis for a                          type and NONE of them mat
         let mut pri_used = vec![false; pristine.len()];
         let mut rules: Vec<crate::game_link::HitboxRuleWire> = Vec::new();
         let mut missing_donor = false;
+        let mut lifetime_error: Option<&'static str> = None;
 
         // Phase 1 — exact (id, start) pairs: unchanged → nothing, changed → scoped override.
         for (pi, p) in pristine.iter().enumerate() {
@@ -24109,14 +24120,35 @@ If you step every basis for a                          type and NONE of them mat
                             inject: None,
                             func: None,
                         });
+                        if p.category == 0 {
+                            match Self::attack_lifetime_rules(motion, p, h, &current) {
+                                Ok(extra) => rules.extend(extra),
+                                Err(error) => lifetime_error = Some(error),
+                            }
+                        }
                     }
                 }
             }
         }
 
+        // Re-injected ATTACKs need the same lifetime rules as edits at a fixed start.
+        let mut retimed = Self::plan_retimed_attack_lifetimes(
+            motion, &pristine, &pri_used, &current, &cur_used,
+        );
+        if let Some(error) = retimed.error {
+            lifetime_error = Some(error);
+        }
+        // Validate the replacement before generating any suppression for its source.
+        let refused_retime = retimed.block_missing_retimed_donors(&current, |h| {
+            Self::retimed_attack_args(h, &captures).is_some()
+        });
+
         // Phase 2 — unmatched pristine → suppress that specific hit (deleted or retimed away).
         for (pi, p) in pristine.iter().enumerate() {
             if pri_used[pi] {
+                continue;
+            }
+            if p.category == 0 && retimed.skipped_ids.contains(&p.id) {
                 continue;
             }
             let (fs, fe) = win(p.active_start);
@@ -24138,6 +24170,9 @@ If you step every basis for a                          type and NONE of them mat
             if cur_used[ci] {
                 continue;
             }
+            if h.category == 0 && retimed.skipped_ids.contains(&h.id) {
+                continue;
+            }
             // Build the inject arg vector for this collision family.
             let args = match h.category {
                 1 => Self::build_catch_args(h, donor_for(1, h.id)),
@@ -24146,6 +24181,13 @@ If you step every basis for a                          type and NONE of them mat
                 crate::data::CAT_ATTACK_FP => {
                     Self::build_attack_fp_args(h, donor_for(crate::data::CAT_ATTACK_FP, h.id))
                 }
+                0 if !retimed.rules_by_index[ci].is_empty() => {
+                    Self::retimed_attack_args(h, &captures)
+                }
+                0 => Self::build_attack_args(
+                    h,
+                    Self::exact_attack_donor(&captures, h.id).or_else(|| donor_for(0, h.id)),
+                ),
                 _ => Self::build_attack_args(h, donor_for(0, h.id)),
             };
             let command = Self::inject_command(h);
@@ -24166,6 +24208,9 @@ If you step every basis for a                          type and NONE of them mat
                         }),
                         func: None,
                     });
+                    if h.category == 0 {
+                        rules.extend(std::mem::take(&mut retimed.rules_by_index[ci]));
+                    }
                     if let Some(end) = Self::collision_end_injection(h) {
                         rules.push(crate::game_link::HitboxRuleWire {
                             motion,
@@ -24199,6 +24244,14 @@ If you step every basis for a                          type and NONE of them mat
         if missing_donor {
             self.state.status =
                 "Added/retimed hitbox needs live capture args — perform the move in game once."
+                    .into();
+        }
+        if let Some(error) = lifetime_error {
+            self.state.status = error.into();
+        }
+        if refused_retime {
+            self.state.status =
+                "Start Frame edit not applied live: ATTACK arguments unavailable or unsupported. Original hitbox kept."
                     .into();
         }
     }
@@ -28166,12 +28219,32 @@ If you step every basis for a                          type and NONE of them mat
                                 inject: None,
                                 func: None,
                             });
+                            if original.category == 0 {
+                                match Self::attack_lifetime_rules(motion, original, edited, current) {
+                                    Ok(extra) => rules.extend(extra),
+                                    Err(_) => { incomplete.insert(key.clone()); },
+                                }
+                            }
                         }
                     }
                 }
             }
+            let mut retimed = Self::plan_retimed_attack_lifetimes(
+                motion, pristine, &pristine_used, current, &current_used,
+            );
+            if retimed.error.is_some() {
+                incomplete.insert(key.clone());
+            }
+            if retimed.block_missing_retimed_donors(current, |h| {
+                Self::retimed_attack_args(h, &captures).is_some()
+            }) {
+                incomplete.insert(key.clone());
+            }
             for (index, original) in pristine.iter().enumerate() {
                 if pristine_used[index] {
+                    continue;
+                }
+                if original.category == 0 && retimed.skipped_ids.contains(&original.id) {
                     continue;
                 }
                 let (frame_start, frame_end) = Self::rule_frame_window(original.active_start);
@@ -28191,12 +28264,23 @@ If you step every basis for a                          type and NONE of them mat
                 if current_used[index] {
                     continue;
                 }
+                if edited.category == 0 && retimed.skipped_ids.contains(&edited.id) {
+                    continue;
+                }
                 let args = match edited.category {
                     1 => Self::build_catch_args(edited, donor_for(1, edited.id)),
                     2 => Self::build_wind_args(edited),
                     crate::data::CAT_ATTACK_FP => Self::build_attack_fp_args(
                         edited,
                         donor_for(crate::data::CAT_ATTACK_FP, edited.id),
+                    ),
+                    0 if !retimed.rules_by_index[index].is_empty() => {
+                        Self::retimed_attack_args(edited, &captures)
+                    }
+                    0 => Self::build_attack_args(
+                        edited,
+                        Self::exact_attack_donor(&captures, edited.id)
+                            .or_else(|| donor_for(0, edited.id)),
                     ),
                     _ => Self::build_attack_args(edited, donor_for(0, edited.id)),
                 };
@@ -28217,6 +28301,9 @@ If you step every basis for a                          type and NONE of them mat
                         }),
                         func: None,
                     });
+                    if edited.category == 0 {
+                        rules.extend(std::mem::take(&mut retimed.rules_by_index[index]));
+                    }
                     if let Some(end) = Self::collision_end_injection(edited) {
                         rules.push(crate::game_link::HitboxRuleWire {
                             motion,
@@ -28415,6 +28502,86 @@ If you step every basis for a                          type and NONE of them mat
     /// Full 36-slot ATTACK arg vector for injection: donor capture args (exact tail) with
     /// the modeled slots overwritten from the Hitbox. Without a donor: None (template
     /// injection is too risky — masks/flags would be guesses).
+    /// A retimed ATTACK must reuse its own captured call, not a fallback
+    /// from another hitbox ID or the separate ATTACK_FP family.
+    fn exact_attack_donor(
+        captures: &[crate::game_link::CaptureLine],
+        id: u32,
+    ) -> Option<&crate::game_link::CaptureLine> {
+        captures.iter().find(|capture| {
+            matches!(capture.func.as_str(), "ATTACK" | "ATTACK_IGNORE_THROW")
+                && capture.args.len() >= 36
+                && capture.args.first().and_then(|arg| arg.as_i64()) == Some(id as i64)
+        })
+    }
+
+    /// When the live capture is unavailable, a normal ATTACK has 36 known,
+    /// modeled arguments. Build all of them from the editor without borrowing
+    /// another hitbox ID. Unknown symbolic constants are not guessed.
+    fn attack_args_from_hitbox(
+        h: &crate::data::Hitbox,
+    ) -> Option<Vec<crate::game_link::LuaArgWire>> {
+        use crate::game_link::LuaArgWire as A;
+        use crate::param_labels as pl;
+        if h.category != 0
+            || h.id > 7
+            || !matches!(h.func.as_str(), "ATTACK" | "ATTACK_IGNORE_THROW")
+            || h.bone_name.trim().is_empty()
+        {
+            return None;
+        }
+        let [x2, y2, z2] = match h.capsule_end {
+            Some([x, y, z]) => [A::Num(x), A::Num(y), A::Num(z)],
+            None => [A::Nil, A::Nil, A::Nil],
+        };
+        Some(vec![
+            A::Int(h.id as i64),
+            A::Int(h.part as i64),
+            A::Hash(hash40::hash40(&h.bone_name.to_lowercase()).0),
+            A::Num(h.damage),
+            A::Int(h.angle as i64),
+            A::Int(h.kb_scaling as i64),
+            A::Int(h.fkb as i64),
+            A::Int(h.kb_base as i64),
+            A::Num(h.size),
+            A::Num(h.offset_x),
+            A::Num(h.offset_y),
+            A::Num(h.offset_z),
+            x2,
+            y2,
+            z2,
+            A::Num(h.hitlag_mult),
+            A::Num(h.sdi_mult),
+            A::Int(pl::encode_const(pl::SETOFF_KIND, &h.setoff_kind)?),
+            A::Int(pl::encode_const(pl::LR_CHECK, &h.lr_check)?),
+            A::Bool(h.is_clang),
+            A::Int(h.is_add_attack as i64),
+            A::Num(h.hitbox_attr),
+            A::Int(h.ground_or_air as i64),
+            A::Bool(h.is_mtk),
+            A::Bool(h.is_shield_disable),
+            A::Bool(h.is_reflectable),
+            A::Bool(h.is_absorbable),
+            A::Bool(h.is_landing_attack),
+            A::Int(pl::encode_const(pl::SITUATION_MASK, &h.situation_mask)?),
+            A::Int(pl::encode_const(pl::CATEGORY_MASK, &h.category_mask)?),
+            A::Int(pl::encode_const(pl::PART_MASK, &h.part_mask)?),
+            A::Bool(h.no_finish_camera),
+            A::Hash(pl::encode_collision_attr(&h.collision_attr)?),
+            A::Int(pl::encode_const(pl::SOUND_LEVEL, &h.sound_level)?),
+            A::Int(pl::encode_const(pl::SOUND_ATTR, &h.sound_attr)?),
+            A::Int(pl::encode_const(pl::ATTACK_REGION, &h.attack_region)?),
+        ])
+    }
+
+    fn retimed_attack_args(
+        h: &crate::data::Hitbox,
+        captures: &[crate::game_link::CaptureLine],
+    ) -> Option<Vec<crate::game_link::LuaArgWire>> {
+        Self::build_attack_args(h, Self::exact_attack_donor(captures, h.id))
+            .or_else(|| Self::attack_args_from_hitbox(h))
+    }
+
     fn build_attack_args(
         h: &crate::data::Hitbox,
         donor: Option<&crate::game_link::CaptureLine>,
@@ -33322,7 +33489,7 @@ If you step every basis for a                          type and NONE of them mat
                 Color32::from_rgb(170, 220, 190),
             );
         }
-        rows.sort_by_key(|row| (row.start, row.category as u8));
+        rows.sort_by_key(timeline_row_sort_key);
         rows
     }
 

@@ -287,6 +287,9 @@ pub const CAT_WORK_MODULE_INC_INT: u8 = 35;
 /// Direct `MotionModule::set_frame_partial` point. Must equal the editor's wire category.
 pub const CAT_MOTION_MODULE_SET_FRAME_PARTIAL: u8 = 36;
 
+/// Live ATTACK lifetime control: preserve one ID across clear_all or clear that ID later.
+pub const CAT_ATTACK_LIFETIME: u8 = 37;
+
 /// Targetless rule key for `SET_AIR`. Must equal `game_link::KINETIC_KEY_SET_AIR`.
 const KINETIC_KEY_SET_AIR: u64 = u64::MAX - 2;
 
@@ -1587,6 +1590,7 @@ pub fn set_rules(rules: Vec<HitboxRule>) {
                     CAT_WORK_TRANSITION_TERM => "work_transition_term",
                     CAT_WORK_MODULE_SET => "work_module_set",
                     CAT_WORK_MODULE_INC_INT => "work_module_inc_int",
+                    CAT_ATTACK_LIFETIME => "attack_lifetime",
                     _ => "unknown",
                 };
                 format!("{name}={count}")
@@ -2718,7 +2722,7 @@ fn injections_for(motion: u64, frame: f32) -> Vec<(u64, u8, InjectRule)> {
         .filter(|r| {
             r.motion == motion
                 && r.inject.is_some()
-                && (r.category != CAT_MOTION_MODULE_SET_RATE
+                && (!matches!(r.category, CAT_MOTION_MODULE_SET_RATE | CAT_ATTACK_LIFETIME)
                     || r.frame_end.map(|end| frame <= end).unwrap_or(true))
         })
         .map(|rule| {
@@ -3004,10 +3008,49 @@ unsafe fn hook_attack_fp(lua_state: u64) {
 /// The engine calls this constantly (state changes, and every frame in some situations), so
 /// only a clear that actually ends something is recorded. Without that gate the capture stream
 /// would be mostly clears.
+/// IDs whose edited lifetime must survive a native clear_all at this motion frame.
+/// Rules are separate from ATTACK overrides so they cannot intercept attack spawns.
+fn attack_ids_to_preserve(motion: u64, frame: f32) -> Vec<i32> {
+    let rules = RULES.lock();
+    rules
+        .iter()
+        .filter(|r| {
+            r.category == CAT_ATTACK_LIFETIME
+                && r.motion == motion
+                && r.inject.is_none()
+                && r.frame_start.is_some_and(|start| frame >= start)
+                && r.frame_end.is_some_and(|end| frame <= end)
+        })
+        .filter_map(|r| r.hitbox_id.and_then(|id| i32::try_from(id).ok()))
+        .filter(|id| (0..=7).contains(id))
+        .collect()
+}
+
 #[skyline::hook(replace = smash::app::lua_bind::AttackModule::clear_all)]
 unsafe fn hook_attack_clear_all(boma: *mut smash::app::BattleObjectModuleAccessor) {
     if !boma.is_null() && close_collision_if_open((*boma).battle_object_id) {
         record_for_boma(boma, "ATTACK_CLEAR_ALL", &[]);
+    }
+    if !boma.is_null()
+        && any_rules()
+        && smash::app::utility::get_category(&mut *boma)
+            == *smash::lib::lua_const::BATTLE_OBJECT_CATEGORY_FIGHTER
+    {
+        let motion = smash::app::lua_bind::MotionModule::motion_kind(boma);
+        let frame = smash::app::lua_bind::MotionModule::frame(boma);
+        let keep = attack_ids_to_preserve(motion, frame);
+        if keep.iter().any(|id| smash::app::lua_bind::AttackModule::is_attack(boma, *id, false)) {
+            // clear_all cannot spare a particular ID. Clear the other attack slots individually.
+            // Never leave a non-edited box active just because one other box was extended.
+            for id in 0..=7 {
+                if !keep.contains(&id)
+                    && smash::app::lua_bind::AttackModule::is_attack(boma, id, false)
+                {
+                    smash::app::lua_bind::AttackModule::clear(boma, id, false);
+                }
+            }
+            return;
+        }
     }
     original!()(boma)
 }
@@ -3710,6 +3753,17 @@ pub unsafe fn inject_tick(lua_state: u64) {
         };
         if due && !already {
             let lifecycle_command = match (category, inj.command.as_deref()) {
+                (CAT_ATTACK_LIFETIME, Some("ATTACK_CLEAR_ID")) => {
+                    let Some(LuaArg::Int(id)) = inj.args.first() else {
+                        continue;
+                    };
+                    if !matches!(*id, 0..=7) || inj.args.len() != 1 {
+                        continue;
+                    }
+                    let _g = InjectGuard::new();
+                    smash::app::lua_bind::AttackModule::clear(boma, *id as i32, false);
+                    true
+                }
                 (CAT_GRAB, Some("GRAB_CLEAR_ALL")) => {
                     let _g = InjectGuard::new();
                     smash::app::lua_bind::GrabModule::clear_all(boma);
