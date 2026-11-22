@@ -19,6 +19,9 @@ pub enum CancelTarget {
     SpecialHi,
     SpecialLw,
     Jump,
+    Walk,
+    Dash,
+    Crouch,
     Shield,
 }
 
@@ -28,7 +31,7 @@ impl CancelTarget {
     pub const SMASHES: [Self; 3] = [Self::SmashF, Self::SmashU, Self::SmashD];
     pub const SPECIALS: [Self; 4] =
         [Self::SpecialN, Self::SpecialS, Self::SpecialHi, Self::SpecialLw];
-    pub const MOVEMENT: [Self; 1] = [Self::Jump];
+    pub const MOVEMENT: [Self; 4] = [Self::Jump, Self::Walk, Self::Dash, Self::Crouch];
     pub const DEFENSE: [Self; 1] = [Self::Shield];
 
     pub fn label(self) -> &'static str {
@@ -45,6 +48,9 @@ impl CancelTarget {
             Self::SpecialHi => "Up Special",
             Self::SpecialLw => "Down Special",
             Self::Jump => "Jump",
+            Self::Walk => "Walk",
+            Self::Dash => "Dash",
+            Self::Crouch => "Crouch",
             Self::Shield => "Shield",
         }
     }
@@ -283,14 +289,39 @@ mod tests {
     }
 
     #[test]
-    fn jump_and_shield_preserve_wire_names() {
+    fn movement_and_shield_preserve_wire_names() {
         for (action, expected) in [
             (CancelTarget::Jump, "\"jump\""),
+            (CancelTarget::Walk, "\"walk\""),
+            (CancelTarget::Dash, "\"dash\""),
+            (CancelTarget::Crouch, "\"crouch\""),
             (CancelTarget::Shield, "\"shield\""),
         ] {
             assert_eq!(serde_json::to_string(&action).unwrap(), expected);
             assert_eq!(serde_json::from_str::<CancelTarget>(expected).unwrap(), action);
         }
+    }
+
+    #[test]
+    fn movement_targets_expand_once_per_action() {
+        let mut rule = CancelRule::default();
+        rule.enabled = true;
+        rule.targets = vec![
+            CancelTarget::Walk,
+            CancelTarget::Dash,
+            CancelTarget::Crouch,
+            CancelTarget::Walk,
+        ];
+        let store = HashMap::from([(
+            "mario".to_string(),
+            HashMap::from([("attack_11".to_string(), vec![rule])]),
+        )]);
+        let wires = enabled_wires(&store);
+        assert_eq!(wires.len(), 3);
+        assert_eq!(
+            wires.iter().map(|wire| wire.target).collect::<Vec<_>>(),
+            vec![CancelTarget::Walk, CancelTarget::Dash, CancelTarget::Crouch]
+        );
     }
 
     #[test]
