@@ -13,6 +13,7 @@ use smash::phx::Hash40;
 const START_FRAME: f32 = 4.0;
 const END_FRAME: f32 = 10.0;
 static CANCEL_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
+static JAB_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 static CATCH_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 
 unsafe fn is_mario_jab_grab_window(boma: *mut BattleObjectModuleAccessor) -> bool {
@@ -37,6 +38,24 @@ unsafe fn is_mario_jab_grab_window(boma: *mut BattleObjectModuleAccessor) -> boo
 #[skyline::hook(replace = smash::app::lua_bind::CancelModule::is_enable_cancel)]
 unsafe fn mario_jab_grab_cancel(boma: *mut BattleObjectModuleAccessor) -> bool {
     let vanilla = original!()(boma);
+    if !boma.is_null()
+        && smash::app::utility::get_category(&mut *boma) == *BATTLE_OBJECT_CATEGORY_FIGHTER
+        && smash::app::utility::get_kind(&mut *boma) == *FIGHTER_KIND_MARIO
+        && StatusModule::status_kind(boma) == *FIGHTER_STATUS_KIND_ATTACK
+        && MotionModule::motion_kind(boma) == Hash40::new("attack_11").hash
+    {
+        let frame = MotionModule::frame(boma);
+        if (1.0..=14.0).contains(&frame)
+            && JAB_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < 48
+        {
+            let commands = ControlModule::get_command_flag_cat(boma, 0) as u32;
+            let cmd_catch = commands & (*FIGHTER_PAD_CMD_CAT1_FLAG_CATCH as u32) != 0;
+            skyline::println!(
+                "[jab-cancel] jab1 frame={:.1} vanilla={} cmd_catch={} cat0={:x}",
+                frame, vanilla, cmd_catch, commands
+            );
+        }
+    }
     if vanilla || !is_mario_jab_grab_window(boma) {
         return vanilla;
     }
