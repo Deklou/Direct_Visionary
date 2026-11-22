@@ -180,7 +180,9 @@ impl CancelRule {
         self.enabled
             && !self.fighter.is_empty()
             && self.fighter.len() <= 40
-            && self.fighter.bytes().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+            && self.fighter.bytes().all(|byte| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_'
+            })
             && self.motion != 0
             && self.condition != CancelCondition::OnWhiff
             && (1..=60).contains(&self.start_frame)
