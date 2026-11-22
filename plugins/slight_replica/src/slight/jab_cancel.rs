@@ -7,12 +7,14 @@ use smash::app::lua_bind::{AttackModule, ControlModule, MotionModule, StatusModu
 use smash::app::BattleObjectModuleAccessor;
 use smash::lib::lua_const::{
     BATTLE_OBJECT_CATEGORY_FIGHTER, COLLISION_KIND_MASK_HIT, COLLISION_KIND_MASK_SHIELD,
+    CONTROL_PAD_BUTTON_GUARD,
     FIGHTER_PAD_CMD_CAT1_FLAG_CATCH,
     FIGHTER_PAD_CMD_CAT1_FLAG_ATTACK_S3, FIGHTER_PAD_CMD_CAT1_FLAG_ATTACK_HI3,
     FIGHTER_PAD_CMD_CAT1_FLAG_ATTACK_LW3, FIGHTER_PAD_CMD_CAT1_FLAG_ATTACK_S4,
     FIGHTER_PAD_CMD_CAT1_FLAG_ATTACK_HI4, FIGHTER_PAD_CMD_CAT1_FLAG_ATTACK_LW4,
     FIGHTER_PAD_CMD_CAT1_FLAG_SPECIAL_N, FIGHTER_PAD_CMD_CAT1_FLAG_SPECIAL_S,
     FIGHTER_PAD_CMD_CAT1_FLAG_SPECIAL_HI, FIGHTER_PAD_CMD_CAT1_FLAG_SPECIAL_LW,
+    FIGHTER_PAD_CMD_CAT1_FLAG_JUMP, FIGHTER_PAD_CMD_CAT1_FLAG_JUMP_BUTTON,
     FIGHTER_STATUS_ATTACK_FLAG_ENABLE_COMBO, FIGHTER_STATUS_KIND_ATTACK,
     FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_CATCH,
     FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_ATTACK_S3,
@@ -25,6 +27,9 @@ use smash::lib::lua_const::{
     FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_SPECIAL_S,
     FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_SPECIAL_HI,
     FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_SPECIAL_LW,
+    FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_JUMP_SQUAT,
+    FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_JUMP_SQUAT_BUTTON,
+    FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_GUARD_ON,
     SITUATION_KIND_GROUND,
 };
 
@@ -43,6 +48,8 @@ pub enum CancelTarget {
     SpecialS,
     SpecialHi,
     SpecialLw,
+    Jump,
+    Shield,
 }
 
 impl CancelTarget {
@@ -60,11 +67,17 @@ impl CancelTarget {
             Self::SpecialS => *FIGHTER_PAD_CMD_CAT1_FLAG_SPECIAL_S,
             Self::SpecialHi => *FIGHTER_PAD_CMD_CAT1_FLAG_SPECIAL_HI,
             Self::SpecialLw => *FIGHTER_PAD_CMD_CAT1_FLAG_SPECIAL_LW,
+            Self::Jump => *FIGHTER_PAD_CMD_CAT1_FLAG_JUMP | *FIGHTER_PAD_CMD_CAT1_FLAG_JUMP_BUTTON,
+            Self::Shield => 0, // Shield uses CONTROL_PAD_BUTTON_GUARD, not CAT1.
         }) as u32
     }
 
-    /// Only unblock this target's specific native transition term.
+    /// Only unblock this target's native transition terms.
     unsafe fn matches_transition_term(self, term: i32) -> bool {
+        if self == Self::Jump {
+            return term == *FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_JUMP_SQUAT
+                || term == *FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_JUMP_SQUAT_BUTTON;
+        }
         term == match self {
             Self::Grab => *FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_CATCH,
             Self::TiltF => *FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_ATTACK_S3,
@@ -77,6 +90,15 @@ impl CancelTarget {
             Self::SpecialS => *FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_SPECIAL_S,
             Self::SpecialHi => *FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_SPECIAL_HI,
             Self::SpecialLw => *FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_SPECIAL_LW,
+            Self::Jump => return false, // Handled above (button and stick).
+            Self::Shield => *FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_GUARD_ON,
+        }
+    }
+
+    unsafe fn command_active(self, commands: u32, guard_pressed: bool) -> bool {
+        match self {
+            Self::Shield => guard_pressed,
+            _ => (commands & self.command_flag()) != 0,
         }
     }
 }
@@ -167,13 +189,14 @@ unsafe fn matching_rule(
     let motion = MotionModule::motion_kind(boma);
 
     // Avoid native contact / combo queries unless the selected move actually uses them.
-    let (needs_combo, needs_contact) = {
+    let (needs_combo, needs_contact, needs_guard) = {
         let Some(rules) = RULES.try_read() else {
             return false;
         };
         let mut relevant = false;
         let mut combo = false;
         let mut contact = false;
+        let mut guard = false;
         for rule in rules.iter().filter(|r| r.motion == motion && r.fighter == fighter) {
             if transition_term.map_or(false, |term| !rule.target.matches_transition_term(term)) {
                 continue;
@@ -181,13 +204,16 @@ unsafe fn matching_rule(
             relevant = true;
             combo |= rule.sync_combo;
             contact |= rule.condition != CancelCondition::Anytime;
+            guard |= rule.target == CancelTarget::Shield;
         }
         if !relevant {
             return false;
         }
-        (combo, contact)
+        (combo, contact, guard)
     };
 
+    let guard_pressed = needs_guard
+        && ControlModule::check_button_on(boma, *CONTROL_PAD_BUTTON_GUARD);
     let commands = ControlModule::get_command_flag_cat(boma, 0) as u32;
     let frame = MotionModule::frame(boma);
     let combo_allowed = needs_combo
@@ -209,7 +235,7 @@ unsafe fn matching_rule(
         if rule.motion != motion
             || rule.fighter != fighter
             || transition_term.map_or(false, |term| !rule.target.matches_transition_term(term))
-            || commands & rule.target.command_flag() == 0
+            || !rule.target.command_active(commands, guard_pressed)
         {
             return false;
         }

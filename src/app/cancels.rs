@@ -65,6 +65,8 @@ impl VisionaryApp {
                             ("Tilts", &CancelTarget::TILTS[..]),
                             ("Smashes", &CancelTarget::SMASHES[..]),
                             ("Specials", &CancelTarget::SPECIALS[..]),
+                            ("Movement", &CancelTarget::MOVEMENT[..]),
+                            ("Defense", &CancelTarget::DEFENSE[..]),
                         ] {
                             ui.horizontal_wrapped(|ui| {
                                 ui.label(egui::RichText::new(family).strong());
@@ -83,7 +85,7 @@ impl VisionaryApp {
 
                         ui.add_enabled(
                             false,
-                            egui::Label::new("Movement / Jump · Defense / Shield · Character-specific (not yet available)"),
+                            egui::Label::new("Movement / Dash · Defense / Dodge, Roll · Character-specific (not yet available)"),
                         );
                         ui.horizontal(|ui| {
                             ui.label("Condition");
@@ -143,7 +145,7 @@ impl VisionaryApp {
         }
         ui.separator();
         ui.weak("Ground-only; the game's native transition checks choose priority when inputs overlap.");
-        ui.weak("Hit / Shield and combo sync are experimental. Movement, Defense and On Whiff remain unavailable.");
+        ui.weak("Jump and Shield are experimental ground cancels. Dash, dodges, character-specific moves and On Whiff remain unavailable.");
         ui.weak("Live plugin only; standalone Smashline export is not implemented.");
 
         if rules != original {

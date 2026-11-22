@@ -18,6 +18,8 @@ pub enum CancelTarget {
     SpecialS,
     SpecialHi,
     SpecialLw,
+    Jump,
+    Shield,
 }
 
 impl CancelTarget {
@@ -26,6 +28,8 @@ impl CancelTarget {
     pub const SMASHES: [Self; 3] = [Self::SmashF, Self::SmashU, Self::SmashD];
     pub const SPECIALS: [Self; 4] =
         [Self::SpecialN, Self::SpecialS, Self::SpecialHi, Self::SpecialLw];
+    pub const MOVEMENT: [Self; 1] = [Self::Jump];
+    pub const DEFENSE: [Self; 1] = [Self::Shield];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -40,6 +44,8 @@ impl CancelTarget {
             Self::SpecialS => "Side Special",
             Self::SpecialHi => "Up Special",
             Self::SpecialLw => "Down Special",
+            Self::Jump => "Jump",
+            Self::Shield => "Shield",
         }
     }
 }
@@ -274,6 +280,17 @@ mod tests {
         assert_eq!(wires[0].target, CancelTarget::Grab);
         assert_eq!(wires[1].target, CancelTarget::Grab);
         assert_eq!(wires[1].start_frame, 8);
+    }
+
+    #[test]
+    fn jump_and_shield_preserve_wire_names() {
+        for (action, expected) in [
+            (CancelTarget::Jump, "\"jump\""),
+            (CancelTarget::Shield, "\"shield\""),
+        ] {
+            assert_eq!(serde_json::to_string(&action).unwrap(), expected);
+            assert_eq!(serde_json::from_str::<CancelTarget>(expected).unwrap(), action);
+        }
     }
 
     #[test]
