@@ -96,6 +96,10 @@ unsafe fn matching_rule(boma: *mut BattleObjectModuleAccessor) -> Option<CancelR
     if commands & (*FIGHTER_PAD_CMD_CAT1_FLAG_CATCH as u32) == 0 {
         return None;
     }
+    // Keep the already-tested Anytime path free of extra native contact queries.
+    if rule.condition == CancelCondition::Anytime {
+        return Some(rule);
+    }
     let hit = AttackModule::is_infliction_status(boma, *COLLISION_KIND_MASK_HIT);
     let shield = AttackModule::is_infliction_status(boma, *COLLISION_KIND_MASK_SHIELD);
     let allowed = match rule.condition {
