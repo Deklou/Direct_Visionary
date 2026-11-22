@@ -148,64 +148,93 @@ pub fn set_rules(rules: Vec<CancelRule>) {
     crate::slight::diag::note(format!("cancel rules applied: {count}"));
 }
 
-/// Copies tiny rule fields under try_read; native calls happen after the guard is dropped.
-unsafe fn matching_rule(boma: *mut BattleObjectModuleAccessor) -> Option<CancelTarget> {
+/// Match every authoring rule for this fighter/motion. Game calls never run under RULES.
+unsafe fn matching_rule(
+    boma: *mut BattleObjectModuleAccessor,
+    transition_term: Option<i32>,
+) -> bool {
     if !HAS_RULES.load(Ordering::Acquire)
         || boma.is_null()
         || smash::app::utility::get_category(&mut *boma) != *BATTLE_OBJECT_CATEGORY_FIGHTER
         || StatusModule::situation_kind(boma) != *SITUATION_KIND_GROUND
     {
-        return None;
+        return false;
     }
     let kind = smash::app::utility::get_kind(&mut *boma);
     let Some(fighter) = crate::slight::slight_consts::fighters::game_kind_name(kind) else {
-        return None;
+        return false;
     };
     let motion = MotionModule::motion_kind(boma);
-    let selected = {
+
+    // Avoid native contact / combo queries unless the selected move actually uses them.
+    let (needs_combo, needs_contact) = {
         let Some(rules) = RULES.try_read() else {
-            return None;
+            return false;
         };
-        rules.iter()
-            .find(|rule| rule.motion == motion && rule.fighter == fighter)
-            .map(|rule| (rule.target, rule.condition, rule.start_frame, rule.end_frame, rule.sync_combo))
+        let mut relevant = false;
+        let mut combo = false;
+        let mut contact = false;
+        for rule in rules.iter().filter(|r| r.motion == motion && r.fighter == fighter) {
+            if transition_term.map_or(false, |term| !rule.target.matches_transition_term(term)) {
+                continue;
+            }
+            relevant = true;
+            combo |= rule.sync_combo;
+            contact |= rule.condition != CancelCondition::Anytime;
+        }
+        if !relevant {
+            return false;
+        }
+        (combo, contact)
     };
-    let Some((target, condition, start, end, sync_combo)) = selected else {
-        return None;
-    };
-    let frame = MotionModule::frame(boma);
-    let in_window = if sync_combo {
-        StatusModule::status_kind(boma) == *FIGHTER_STATUS_KIND_ATTACK
-            && WorkModule::is_flag(boma, *FIGHTER_STATUS_ATTACK_FLAG_ENABLE_COMBO)
-    } else {
-        frame >= f32::from(start) && frame <= f32::from(end)
-    };
-    if !in_window {
-        return None;
-    }
+
     let commands = ControlModule::get_command_flag_cat(boma, 0) as u32;
-    if commands & target.command_flag() == 0 {
-        return None;
-    }
-    if condition == CancelCondition::Anytime {
-        return Some(target);
-    }
-    let hit = AttackModule::is_infliction_status(boma, *COLLISION_KIND_MASK_HIT);
-    let shield = AttackModule::is_infliction_status(boma, *COLLISION_KIND_MASK_SHIELD);
-    let allowed = match condition {
-        CancelCondition::Anytime => true,
-        CancelCondition::OnHit => hit,
-        CancelCondition::OnShield => shield,
-        CancelCondition::OnHitOrShield => hit || shield,
-        CancelCondition::OnWhiff => false,
+    let frame = MotionModule::frame(boma);
+    let combo_allowed = needs_combo
+        && StatusModule::status_kind(boma) == *FIGHTER_STATUS_KIND_ATTACK
+        && WorkModule::is_flag(boma, *FIGHTER_STATUS_ATTACK_FLAG_ENABLE_COMBO);
+    let (hit, shield) = if needs_contact {
+        (
+            AttackModule::is_infliction_status(boma, *COLLISION_KIND_MASK_HIT),
+            AttackModule::is_infliction_status(boma, *COLLISION_KIND_MASK_SHIELD),
+        )
+    } else {
+        (false, false)
     };
-    allowed.then_some(target)
+
+    let Some(rules) = RULES.try_read() else {
+        return false;
+    };
+    rules.iter().any(|rule| {
+        if rule.motion != motion
+            || rule.fighter != fighter
+            || transition_term.map_or(false, |term| !rule.target.matches_transition_term(term))
+            || commands & rule.target.command_flag() == 0
+        {
+            return false;
+        }
+        let in_window = if rule.sync_combo {
+            combo_allowed
+        } else {
+            frame >= f32::from(rule.start_frame) && frame <= f32::from(rule.end_frame)
+        };
+        if !in_window {
+            return false;
+        }
+        match rule.condition {
+            CancelCondition::Anytime => true,
+            CancelCondition::OnHit => hit,
+            CancelCondition::OnShield => shield,
+            CancelCondition::OnHitOrShield => hit || shield,
+            CancelCondition::OnWhiff => false,
+        }
+    })
 }
 
 #[skyline::hook(replace = smash::app::lua_bind::CancelModule::is_enable_cancel)]
 unsafe fn custom_cancel(boma: *mut BattleObjectModuleAccessor) -> bool {
     let vanilla = original!()(boma);
-    vanilla || matching_rule(boma).is_some()
+    vanilla || matching_rule(boma, None)
 }
 
 #[skyline::hook(replace = smash::app::lua_bind::WorkModule::is_enable_transition_term)]
@@ -214,9 +243,7 @@ unsafe fn custom_transition(
     transition_term: i32,
 ) -> bool {
     let vanilla = original!()(boma, transition_term);
-    vanilla || matching_rule(boma).map_or(false, |target| {
-        target.matches_transition_term(transition_term)
-    })
+    vanilla || matching_rule(boma, Some(transition_term))
 }
 
 pub fn install() {

@@ -521,8 +521,12 @@ pub struct FighterMod {
     #[serde(default)]
     pub move_sources: HashMap<String, MoveSourceSnapshot>,
     /// Move name -> authored custom cancel rules, separate from vanilla behavior.
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub cancel_rules: HashMap<String, crate::cancel_rules::CancelRule>,
+    #[serde(
+        default,
+        skip_serializing_if = "HashMap::is_empty",
+        deserialize_with = "crate::cancel_rules::deserialize_rule_map"
+    )]
+    pub cancel_rules: HashMap<String, Vec<crate::cancel_rules::CancelRule>>,
     /// authored .eff edits for this fighter's effect file
     #[serde(default)]
     pub eff: Option<EffMod>,

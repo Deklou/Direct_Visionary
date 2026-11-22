@@ -452,6 +452,7 @@ enum PrimaryEditorTab {
     Collisions,
     Hurtboxes,
     MotionState,
+    Cancels,
     AudioFeedback,
     Effects,
 }
@@ -462,6 +463,7 @@ impl PrimaryEditorTab {
             Self::Collisions => "Collisions",
             Self::Hurtboxes => "Hurtboxes",
             Self::MotionState => "Motion & state",
+            Self::Cancels => "Cancels",
             Self::AudioFeedback => "Sound & feedback",
             Self::Effects => "Visual effects",
         }
@@ -477,6 +479,9 @@ impl PrimaryEditorTab {
             }
             Self::MotionState => {
                 "Facing, velocity, kinetic, animation-timing, ground/air, and stored script-state commands from the move's game_ script."
+            }
+            Self::Cancels => {
+                "Custom cancel windows, conditions, and target actions for the selected move."
             }
             Self::AudioFeedback => {
                 "Sounds plus camera shake, controller rumble, and the supported animation controls from the move's sound_ and expression_ scripts."
@@ -3321,7 +3326,7 @@ pub struct VisionaryApp {
     eff_editor: crate::eff_editor::EffEditor,
     /// TCP client to the slight_replica plugin (:7878).
     game_link: crate::game_link::GameLink,
-    cancel_rules_store: HashMap<String, HashMap<String, crate::cancel_rules::CancelRule>>,
+    cancel_rules_store: HashMap<String, HashMap<String, Vec<crate::cancel_rules::CancelRule>>>,
     /// Debounced live-pin push for an edited effect call (index, last edit time).
     /// Shared per-kind runtime overrides (Effects panel + Eff Editor game panel).
     live_overrides: crate::game_link::LiveOverrides,
@@ -10413,6 +10418,7 @@ impl VisionaryApp {
                 PrimaryEditorTab::Collisions,
                 PrimaryEditorTab::Hurtboxes,
                 PrimaryEditorTab::MotionState,
+                PrimaryEditorTab::Cancels,
                 PrimaryEditorTab::AudioFeedback,
                 PrimaryEditorTab::Effects,
             ] {
@@ -11494,12 +11500,14 @@ impl VisionaryApp {
             self.draw_kinetic_set_consider_ground_friction_section(ui);
             self.draw_set_air_section(ui);
             self.draw_work_flag_section(ui);
-            self.draw_cancel_rules_section(ui);
             self.draw_work_transition_term_section(ui);
             self.draw_work_module_inc_int_section(ui);
             self.draw_work_module_set_section(ui);
             self.draw_recovery_rate_section(ui);
             self.draw_motion_rate_section(ui);
+        }
+        if matches!(self.primary_tab, PrimaryEditorTab::Cancels) {
+            self.draw_cancel_rules_section(ui);
         }
         if matches!(self.primary_tab, PrimaryEditorTab::AudioFeedback) {
             self.draw_sound_section(ui);
