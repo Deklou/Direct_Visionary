@@ -237,7 +237,18 @@ mod tests {
 
     #[test]
     fn old_projects_keep_their_target_and_enabled_state() {
-        let json = r#"{"cancel_rules":{"attack_11":{"enabled":true,"target":"tilt_f","condition":"on_hit","start_frame":6,"end_frame":11,"sync_combo":false}}}"#;
+        let json = r#"{
+            "cancel_rules": {
+                "attack_11": {
+                    "enabled": true,
+                    "target": "tilt_f",
+                    "condition": "on_hit",
+                    "start_frame": 6,
+                    "end_frame": 11,
+                    "sync_combo": false
+                }
+            }
+        }"#;
         let project: Stored = serde_json::from_str(json).unwrap();
         let rule = &project.cancel_rules["attack_11"][0];
         assert_eq!(rule.targets, vec![CancelTarget::TiltF]);
