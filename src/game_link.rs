@@ -1316,6 +1316,7 @@ struct Shared {
 const FULL_REPLACE_MARKERS: &[&str] = &[
     "\"spawn_rules\":",
     "\"hitbox_rules\":",
+    "\"cancel_rules\":",
     "\"effect_control_rules\":",
     "\"effect_aliases\":",
     "\"donor_effs\":",
@@ -1521,6 +1522,21 @@ impl GameLink {
             .lock()
             .map(|s| s.kinds.contains_key(&id))
             .unwrap_or(false)
+    }
+
+    /// Replace all experimental custom cancels. Empty disables the override.
+    pub fn send_cancel_rules(&self, rules: &[crate::cancel_rules::CancelRuleWire]) {
+        if self.sends_suppressed() {
+            return;
+        }
+        let Ok(payload) = serde_json::to_string(&serde_json::json!({ "cancel_rules": rules })) else {
+            return;
+        };
+        let frame = format!("<TCP_MESSAGE>{payload}</TCP_MESSAGE>");
+        if let Ok(mut s) = self.shared.lock() {
+            queue_latest_full_replace(&mut s.outbox, frame);
+            s.edits_tx += 1;
+        }
     }
 
     /// Replace the plugin's live spawn-rule list (suppress/retime ACMD effect spawns).

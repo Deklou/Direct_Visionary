@@ -340,6 +340,15 @@ fn parse_tcp_payload(raw: &str) -> Option<ParsedEdit> {
         return None;
     }
 
+    // Experimental custom cancels: game-thread full-list replacement.
+    if let Some(value) = v.get("cancel_rules") {
+        match serde_json::from_value::<Vec<crate::slight::jab_cancel::CancelRule>>(value.clone()) {
+            Ok(rules) => crate::slight::jab_cancel::set_rules(rules),
+            Err(error) => crate::slight::diag::note(format!("cancel_rules parse error: {error}")),
+        }
+        return None;
+    }
+
     // Hitbox rules: full-list replace (modify/suppress/inject ATTACKs).
     if let Some(rules_v) = v.get("hitbox_rules") {
         match serde_json::from_value::<Vec<crate::slight::hitbox_viewer::HitboxRule>>(

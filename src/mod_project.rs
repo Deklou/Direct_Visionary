@@ -157,6 +157,8 @@ fn scoped_fighter(
     scoped.move_sources = scope_move_map(&fighter.move_sources, selected_move);
     scoped.capture_branch_warnings =
         scope_move_map(&fighter.capture_branch_warnings, selected_move);
+    // The source-only ACMD exporter cannot install live cancel hooks.
+    scoped.cancel_rules.clear();
     scoped.live_tweaks = fighter
         .live_tweaks
         .iter()
@@ -207,6 +209,7 @@ impl ModProjectFile {
                 && f.expression_scripts.is_empty()
                 && f.eff.as_ref().map(|e| e.is_empty()).unwrap_or(true)
                 && f.live_tweaks.is_empty()
+                && f.cancel_rules.is_empty()
                 && f.params.is_empty()
         }) && self.roster.is_empty()
     }
@@ -517,6 +520,13 @@ pub struct FighterMod {
     /// move name → the merged source body and optional typed live-capture payload used to load it
     #[serde(default)]
     pub move_sources: HashMap<String, MoveSourceSnapshot>,
+    /// Move name -> authored custom cancel rules, separate from vanilla behavior.
+    #[serde(
+        default,
+        skip_serializing_if = "HashMap::is_empty",
+        deserialize_with = "crate::cancel_rules::deserialize_rule_map"
+    )]
+    pub cancel_rules: HashMap<String, Vec<crate::cancel_rules::CancelRule>>,
     /// authored .eff edits for this fighter's effect file
     #[serde(default)]
     pub eff: Option<EffMod>,
