@@ -85,7 +85,7 @@ impl VisionaryApp {
 
                         ui.add_enabled(
                             false,
-                            egui::Label::new("Movement / Dash · Defense / Dodge, Roll · Character-specific (not yet available)"),
+                            egui::Label::new("Defense / Dodge, Roll · Character-specific (not yet available)"),
                         );
                         ui.horizontal(|ui| {
                             ui.label("Condition");
@@ -145,7 +145,7 @@ impl VisionaryApp {
         }
         ui.separator();
         ui.weak("Ground-only; the game's native transition checks choose priority when inputs overlap.");
-        ui.weak("Jump and Shield are experimental ground cancels. Dash, dodges, character-specific moves and On Whiff remain unavailable.");
+        ui.weak("Movement and Shield are experimental ground cancels. Dodges, character-specific moves and On Whiff remain unavailable.");
         ui.weak("Live plugin only; standalone Smashline export is not implemented.");
 
         if rules != original {
