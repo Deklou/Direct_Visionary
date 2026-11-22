@@ -1,58 +1,77 @@
-//! Prototype Mario jab 1 → grab, avec une trace temporaire bornée pour le diagnostic.
+//! Prototype Mario jab 1 → grab : autorisations temporaires sans mutation des transitions.
 
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use smash::app::lua_bind::{ControlModule, MotionModule, StatusModule, WorkModule};
+use smash::app::lua_bind::{ControlModule, MotionModule, StatusModule};
 use smash::app::BattleObjectModuleAccessor;
 use smash::lib::lua_const::{
-    BATTLE_OBJECT_CATEGORY_FIGHTER, CONTROL_PAD_BUTTON_CATCH, FIGHTER_KIND_MARIO,
-    FIGHTER_PAD_CMD_CAT1_FLAG_CATCH, FIGHTER_STATUS_KIND_ATTACK,
-    FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_CATCH,
+    BATTLE_OBJECT_CATEGORY_FIGHTER, FIGHTER_KIND_MARIO, FIGHTER_PAD_CMD_CAT1_FLAG_CATCH,
+    FIGHTER_STATUS_KIND_ATTACK, FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_CATCH,
 };
 use smash::phx::Hash40;
 
 const START_FRAME: f32 = 4.0;
 const END_FRAME: f32 = 10.0;
-static TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
+static CANCEL_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
+static CATCH_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
+
+unsafe fn is_mario_jab_grab_window(boma: *mut BattleObjectModuleAccessor) -> bool {
+    if boma.is_null()
+        || smash::app::utility::get_category(&mut *boma) != *BATTLE_OBJECT_CATEGORY_FIGHTER
+        || smash::app::utility::get_kind(&mut *boma) != *FIGHTER_KIND_MARIO
+        || StatusModule::status_kind(boma) != *FIGHTER_STATUS_KIND_ATTACK
+        || MotionModule::motion_kind(boma) != Hash40::new("attack_11").hash
+    {
+        return false;
+    }
+
+    let frame = MotionModule::frame(boma);
+    if !(START_FRAME..=END_FRAME).contains(&frame) {
+        return false;
+    }
+
+    let commands = ControlModule::get_command_flag_cat(boma, 0) as u32;
+    commands & (*FIGHTER_PAD_CMD_CAT1_FLAG_CATCH as u32) != 0
+}
 
 #[skyline::hook(replace = smash::app::lua_bind::CancelModule::is_enable_cancel)]
 unsafe fn mario_jab_grab_cancel(boma: *mut BattleObjectModuleAccessor) -> bool {
     let vanilla = original!()(boma);
-    if boma.is_null()
-        || smash::app::utility::get_category(&mut *boma) != *BATTLE_OBJECT_CATEGORY_FIGHTER
-        || smash::app::utility::get_kind(&mut *boma) != *FIGHTER_KIND_MARIO
+    if vanilla || !is_mario_jab_grab_window(boma) {
+        return vanilla;
+    }
+
+    if CANCEL_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < 16 {
+        skyline::println!(
+            "[jab-cancel] cancel_override frame={:.1}",
+            MotionModule::frame(boma)
+        );
+    }
+    true
+}
+
+#[skyline::hook(replace = smash::app::lua_bind::WorkModule::is_enable_transition_term)]
+unsafe fn mario_jab_grab_transition(
+    boma: *mut BattleObjectModuleAccessor,
+    transition_term: i32,
+) -> bool {
+    let vanilla = original!()(boma, transition_term);
+    if vanilla
+        || transition_term != *FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_CATCH
+        || !is_mario_jab_grab_window(boma)
     {
         return vanilla;
     }
 
-    let status = StatusModule::status_kind(boma);
-    if status != *FIGHTER_STATUS_KIND_ATTACK {
-        return vanilla;
-    }
-    let motion = MotionModule::motion_kind(boma);
-    let frame = MotionModule::frame(boma);
-    let is_jab1 = motion == Hash40::new("attack_11").hash;
-    let in_window = is_jab1 && (START_FRAME..=END_FRAME).contains(&frame);
-    let commands = ControlModule::get_command_flag_cat(boma, 0) as u32;
-    let cmd_catch = commands & (*FIGHTER_PAD_CMD_CAT1_FLAG_CATCH as u32) != 0;
-    let button_catch = ControlModule::check_button_on(boma, *CONTROL_PAD_BUTTON_CATCH);
-    let granted = in_window && cmd_catch;
-
-    if granted && TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < 32 {
-        let catch_term = WorkModule::is_enable_transition_term(
-            boma,
-            *FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_CATCH,
-        );
+    if CATCH_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < 16 {
         skyline::println!(
-            "[jab-cancel] frame={:.1} motion={:x} vanilla={} cmd_catch={} button_catch={} cat0={:x} catch_term={} granted={}",
-            frame, motion, vanilla, cmd_catch, button_catch, commands, catch_term, granted
+            "[jab-cancel] catch_term_override frame={:.1}",
+            MotionModule::frame(boma)
         );
     }
-
-    // Les cancels vanilla restent inchangés ; le prototype ne force aucun statut.
-    vanilla || granted
+    true
 }
 
 pub fn install() {
-    skyline::install_hooks!(mario_jab_grab_cancel);
+    skyline::install_hooks!(mario_jab_grab_cancel, mario_jab_grab_transition);
 }
