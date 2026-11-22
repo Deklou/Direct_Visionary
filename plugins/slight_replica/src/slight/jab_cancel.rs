@@ -15,6 +15,8 @@ use smash::lib::lua_const::{
     FIGHTER_PAD_CMD_CAT1_FLAG_SPECIAL_N, FIGHTER_PAD_CMD_CAT1_FLAG_SPECIAL_S,
     FIGHTER_PAD_CMD_CAT1_FLAG_SPECIAL_HI, FIGHTER_PAD_CMD_CAT1_FLAG_SPECIAL_LW,
     FIGHTER_PAD_CMD_CAT1_FLAG_JUMP, FIGHTER_PAD_CMD_CAT1_FLAG_JUMP_BUTTON,
+    FIGHTER_PAD_CMD_CAT1_FLAG_WALK, FIGHTER_PAD_CMD_CAT1_FLAG_DASH,
+    FIGHTER_PAD_CMD_CAT1_FLAG_TURN_DASH, FIGHTER_PAD_CMD_CAT1_FLAG_SQUAT,
     FIGHTER_STATUS_ATTACK_FLAG_ENABLE_COMBO, FIGHTER_STATUS_KIND_ATTACK,
     FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_CATCH,
     FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_ATTACK_S3,
@@ -30,6 +32,10 @@ use smash::lib::lua_const::{
     FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_JUMP_SQUAT,
     FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_JUMP_SQUAT_BUTTON,
     FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_GUARD_ON,
+    FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_WALK,
+    FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_DASH,
+    FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_TURN_DASH,
+    FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_SQUAT,
     SITUATION_KIND_GROUND,
 };
 
@@ -49,6 +55,9 @@ pub enum CancelTarget {
     SpecialHi,
     SpecialLw,
     Jump,
+    Walk,
+    Dash,
+    Crouch,
     Shield,
 }
 
@@ -68,6 +77,9 @@ impl CancelTarget {
             Self::SpecialHi => *FIGHTER_PAD_CMD_CAT1_FLAG_SPECIAL_HI,
             Self::SpecialLw => *FIGHTER_PAD_CMD_CAT1_FLAG_SPECIAL_LW,
             Self::Jump => *FIGHTER_PAD_CMD_CAT1_FLAG_JUMP | *FIGHTER_PAD_CMD_CAT1_FLAG_JUMP_BUTTON,
+            Self::Walk => *FIGHTER_PAD_CMD_CAT1_FLAG_WALK,
+            Self::Dash => *FIGHTER_PAD_CMD_CAT1_FLAG_DASH | *FIGHTER_PAD_CMD_CAT1_FLAG_TURN_DASH,
+            Self::Crouch => *FIGHTER_PAD_CMD_CAT1_FLAG_SQUAT,
             Self::Shield => 0, // Shield uses CONTROL_PAD_BUTTON_GUARD, not CAT1.
         }) as u32
     }
@@ -77,6 +89,10 @@ impl CancelTarget {
         if self == Self::Jump {
             return term == *FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_JUMP_SQUAT
                 || term == *FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_JUMP_SQUAT_BUTTON;
+        }
+        if self == Self::Dash {
+            return term == *FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_DASH
+                || term == *FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_TURN_DASH;
         }
         term == match self {
             Self::Grab => *FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_CATCH,
@@ -90,12 +106,28 @@ impl CancelTarget {
             Self::SpecialS => *FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_SPECIAL_S,
             Self::SpecialHi => *FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_SPECIAL_HI,
             Self::SpecialLw => *FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_SPECIAL_LW,
-            Self::Jump => return false, // Handled above (button and stick).
+            Self::Jump | Self::Dash => return false, // Handled above.
+            Self::Walk => *FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_WALK,
+            Self::Crouch => *FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_SQUAT,
             Self::Shield => *FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_GUARD_ON,
         }
     }
 
-    unsafe fn command_active(self, commands: u32, guard_pressed: bool) -> bool {
+    unsafe fn command_active(
+        self,
+        commands: u32,
+        guard_pressed: bool,
+        transition_term: Option<i32>,
+    ) -> bool {
+        if self == Self::Dash {
+            // Do not unlock the reverse dash when only the forward dash command is present.
+            if transition_term == Some(*FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_DASH) {
+                return commands & (*FIGHTER_PAD_CMD_CAT1_FLAG_DASH as u32) != 0;
+            }
+            if transition_term == Some(*FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_TURN_DASH) {
+                return commands & (*FIGHTER_PAD_CMD_CAT1_FLAG_TURN_DASH as u32) != 0;
+            }
+        }
         match self {
             Self::Shield => guard_pressed,
             _ => (commands & self.command_flag()) != 0,
@@ -235,7 +267,7 @@ unsafe fn matching_rule(
         if rule.motion != motion
             || rule.fighter != fighter
             || transition_term.map_or(false, |term| !rule.target.matches_transition_term(term))
-            || !rule.target.command_active(commands, guard_pressed)
+            || !rule.target.command_active(commands, guard_pressed, transition_term)
         {
             return false;
         }
