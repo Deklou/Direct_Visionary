@@ -2,11 +2,12 @@
 
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use smash::app::lua_bind::{ControlModule, MotionModule, StatusModule};
+use smash::app::lua_bind::{ControlModule, MotionModule, StatusModule, WorkModule};
 use smash::app::BattleObjectModuleAccessor;
 use smash::lib::lua_const::{
     BATTLE_OBJECT_CATEGORY_FIGHTER, CONTROL_PAD_BUTTON_CATCH, FIGHTER_KIND_MARIO,
     FIGHTER_PAD_CMD_CAT1_FLAG_CATCH, FIGHTER_STATUS_KIND_ATTACK,
+    FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_CATCH,
 };
 use smash::phx::Hash40;
 
@@ -37,10 +38,14 @@ unsafe fn mario_jab_grab_cancel(boma: *mut BattleObjectModuleAccessor) -> bool {
     let button_catch = ControlModule::check_button_on(boma, *CONTROL_PAD_BUTTON_CATCH);
     let granted = in_window && cmd_catch;
 
-    if (2.0..=14.0).contains(&frame) && TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < 64 {
+    if granted && TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < 32 {
+        let catch_term = WorkModule::is_enable_transition_term(
+            boma,
+            *FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_CATCH,
+        );
         skyline::println!(
-            "[jab-cancel] frame={:.1} motion={:x} jab1={} vanilla={} cmd_catch={} button_catch={} cat0={:x} granted={}",
-            frame, motion, is_jab1, vanilla, cmd_catch, button_catch, commands, granted
+            "[jab-cancel] frame={:.1} motion={:x} vanilla={} cmd_catch={} button_catch={} cat0={:x} catch_term={} granted={}",
+            frame, motion, vanilla, cmd_catch, button_catch, commands, catch_term, granted
         );
     }
 
