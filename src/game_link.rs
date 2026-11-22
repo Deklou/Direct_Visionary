@@ -1527,7 +1527,7 @@ impl GameLink {
     /// Replace the plugin's live spawn-rule list (suppress/retime ACMD effect spawns).
     /// Send the FULL current rule set every time — an empty slice clears all rules.
     /// Replace all experimental custom cancels. Empty disables the override.
-    pub fn send_cancel_rules(&self, rules: &[crate::cancel_rules::CancelRule]) {
+    pub fn send_cancel_rules(&self, rules: &[crate::cancel_rules::CancelRuleWire]) {
         if self.sends_suppressed() {
             return;
         }
