@@ -8,6 +8,7 @@ mod app_icon;
 mod asset_snapshots;
 mod carrier_motion;
 mod carrier_support;
+mod cancel_rules;
 mod credits;
 mod data;
 mod eff_attrs;

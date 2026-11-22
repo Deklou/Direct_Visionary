@@ -2,6 +2,7 @@ use crate::data::{fighter_display_name, AppState, Hitbox, MoveEntry};
 use crate::renderer::{HitboxRenderState, ViewportCallback};
 use egui::{Color32, RichText, ScrollArea, Ui};
 mod recovery_rate;
+mod cancels;
 mod hitbox_lifetime;
 /// Main egui application for Visionary.
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -3320,6 +3321,7 @@ pub struct VisionaryApp {
     eff_editor: crate::eff_editor::EffEditor,
     /// TCP client to the slight_replica plugin (:7878).
     game_link: crate::game_link::GameLink,
+    cancel_rules_store: HashMap<String, HashMap<String, crate::cancel_rules::CancelRule>>,
     /// Debounced live-pin push for an edited effect call (index, last edit time).
     /// Shared per-kind runtime overrides (Effects panel + Eff Editor game panel).
     live_overrides: crate::game_link::LiveOverrides,
@@ -3707,6 +3709,7 @@ impl VisionaryApp {
             acmd_src_view: SourceView::Source,
             eff_editor: crate::eff_editor::EffEditor::default(),
             game_link: crate::game_link::GameLink::default(),
+            cancel_rules_store: HashMap::new(),
             live_overrides: crate::game_link::LiveOverrides::default(),
             eff_mods: HashMap::new(),
             carrier_push_callers: Vec::new(),
@@ -11491,6 +11494,7 @@ impl VisionaryApp {
             self.draw_kinetic_set_consider_ground_friction_section(ui);
             self.draw_set_air_section(ui);
             self.draw_work_flag_section(ui);
+            self.draw_cancel_rules_section(ui);
             self.draw_work_transition_term_section(ui);
             self.draw_work_module_inc_int_section(ui);
             self.draw_work_module_set_section(ui);
@@ -18207,6 +18211,7 @@ If you step every basis for a                          type and NONE of them mat
         self.game_link.send_hitbox_rules(&hitboxes);
         self.game_link.send_spawn_rules(&effects);
         self.game_link.send_effect_control_rules(&controls);
+        self.publish_cancel_rules();
     }
 
     /// Rehydrate every move represented by a loaded project through the same source parser and
@@ -18874,6 +18879,9 @@ If you step every basis for a                          type and NONE of them mat
                 .map(|r| r.fighter_display.clone())
                 .unwrap_or_else(|| fighter.clone());
             fm.acmd = moves.clone();
+        }
+        for (fighter, moves) in &self.cancel_rules_store {
+            project.fighters.entry(fighter.clone()).or_default().cancel_rules = moves.clone();
         }
         // Scope every fighter's edits to the slot-add mod they were made against, if any. This
         // is recorded per fighter rather than derived at export time because the export runs
@@ -20779,6 +20787,9 @@ If you step every basis for a                          type and NONE of them mat
         let mut n_calls = 0;
         let mut n_eff = 0;
         for (fighter, mut fm) in project.fighters {
+            if !fm.cancel_rules.is_empty() {
+                self.cancel_rules_store.insert(fighter.clone(), std::mem::take(&mut fm.cancel_rules));
+            }
             for (move_name, snapshot) in &fm.move_sources {
                 self.move_source_cache
                     .insert(Self::move_key(&fighter, move_name), snapshot.clone());
@@ -21280,6 +21291,8 @@ If you step every basis for a                          type and NONE of them mat
         self.effect_rules_store.clear();
         self.effect_control_rules_store.clear();
         self.hitbox_rules_store.clear();
+        self.cancel_rules_store.clear();
+        self.game_link.send_cancel_rules(&[]);
         self.game_link.send_spawn_rules(&[]);
         self.game_link.send_effect_control_rules(&[]);
         self.game_link.send_hitbox_rules(&[]);
@@ -35950,6 +35963,7 @@ impl eframe::App for VisionaryApp {
                     self.game_link.send_hitbox_rules(&hit);
                 }
                 self.push_effect_aliases();
+                self.publish_cancel_rules();
                 self.live_overrides.resend_tweaks(&self.game_link);
             }
         }
