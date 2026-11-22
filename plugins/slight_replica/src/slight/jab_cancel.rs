@@ -48,7 +48,7 @@ pub enum CancelTarget {
 impl CancelTarget {
     /// Native CAT1 commands, not motion hashes or forced statuses.
     unsafe fn command_flag(self) -> u32 {
-        match self {
+        (match self {
             Self::Grab => *FIGHTER_PAD_CMD_CAT1_FLAG_CATCH,
             Self::TiltF => *FIGHTER_PAD_CMD_CAT1_FLAG_ATTACK_S3,
             Self::TiltU => *FIGHTER_PAD_CMD_CAT1_FLAG_ATTACK_HI3,
@@ -60,7 +60,7 @@ impl CancelTarget {
             Self::SpecialS => *FIGHTER_PAD_CMD_CAT1_FLAG_SPECIAL_S,
             Self::SpecialHi => *FIGHTER_PAD_CMD_CAT1_FLAG_SPECIAL_HI,
             Self::SpecialLw => *FIGHTER_PAD_CMD_CAT1_FLAG_SPECIAL_LW,
-        } as u32
+        }) as u32
     }
 
     /// Only unblock this target's specific native transition term.
