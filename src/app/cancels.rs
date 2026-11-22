@@ -85,7 +85,9 @@ impl VisionaryApp {
 
                         ui.add_enabled(
                             false,
-                            egui::Label::new("Defense / Dodge, Roll · Character-specific (not yet available)"),
+                            egui::Label::new(
+                                "Defense / Dodge, Roll · Character-specific (not yet available)",
+                            ),
                         );
                         ui.horizontal(|ui| {
                             ui.label("Condition");
@@ -107,7 +109,10 @@ impl VisionaryApp {
                         if has_native_combo {
                             ui.checkbox(&mut rule.sync_combo, "Follow native jab combo flag")
                                 .on_hover_text(
-                                    "Uses ENABLE_COMBO at runtime. The exact jab-2 input window has not been proven.",
+                                    concat!(
+                                        "Uses ENABLE_COMBO at runtime. ",
+                                        "The exact jab-2 input window has not been proven."
+                                    ),
                                 );
                             if rule.sync_combo {
                                 let events = self.state.script.to_work_flag_events();
@@ -145,7 +150,10 @@ impl VisionaryApp {
         }
         ui.separator();
         ui.weak("Ground-only; the game's native transition checks choose priority when inputs overlap.");
-        ui.weak("Movement and Shield are experimental ground cancels. Dodges, character-specific moves and On Whiff remain unavailable.");
+        ui.weak(concat!(
+            "Movement and Shield are experimental ground cancels. ",
+            "Dodges, character-specific moves and On Whiff remain unavailable."
+        ));
         ui.weak("Live plugin only; standalone Smashline export is not implemented.");
 
         if rules != original {
