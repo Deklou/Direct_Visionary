@@ -1,4 +1,4 @@
-//! Opt-in, per-fighter and per-motion Grab cancels. Mario Jab 1 is the reference test.
+//! Opt-in, per-fighter/motion cancels using native ground transition checks.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -7,8 +7,24 @@ use smash::app::lua_bind::{AttackModule, ControlModule, MotionModule, StatusModu
 use smash::app::BattleObjectModuleAccessor;
 use smash::lib::lua_const::{
     BATTLE_OBJECT_CATEGORY_FIGHTER, COLLISION_KIND_MASK_HIT, COLLISION_KIND_MASK_SHIELD,
-    FIGHTER_PAD_CMD_CAT1_FLAG_CATCH, FIGHTER_STATUS_ATTACK_FLAG_ENABLE_COMBO,
-    FIGHTER_STATUS_KIND_ATTACK, FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_CATCH,
+    FIGHTER_PAD_CMD_CAT1_FLAG_CATCH,
+    FIGHTER_PAD_CMD_CAT1_FLAG_ATTACK_S3, FIGHTER_PAD_CMD_CAT1_FLAG_ATTACK_HI3,
+    FIGHTER_PAD_CMD_CAT1_FLAG_ATTACK_LW3, FIGHTER_PAD_CMD_CAT1_FLAG_ATTACK_S4,
+    FIGHTER_PAD_CMD_CAT1_FLAG_ATTACK_HI4, FIGHTER_PAD_CMD_CAT1_FLAG_ATTACK_LW4,
+    FIGHTER_PAD_CMD_CAT1_FLAG_SPECIAL_N, FIGHTER_PAD_CMD_CAT1_FLAG_SPECIAL_S,
+    FIGHTER_PAD_CMD_CAT1_FLAG_SPECIAL_HI, FIGHTER_PAD_CMD_CAT1_FLAG_SPECIAL_LW,
+    FIGHTER_STATUS_ATTACK_FLAG_ENABLE_COMBO, FIGHTER_STATUS_KIND_ATTACK,
+    FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_CATCH,
+    FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_ATTACK_S3,
+    FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_ATTACK_HI3,
+    FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_ATTACK_LW3,
+    FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_ATTACK_S4_START,
+    FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_ATTACK_HI4_START,
+    FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_ATTACK_LW4_START,
+    FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_SPECIAL_N,
+    FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_SPECIAL_S,
+    FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_SPECIAL_HI,
+    FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_SPECIAL_LW,
     SITUATION_KIND_GROUND,
 };
 
@@ -17,6 +33,52 @@ use smash::lib::lua_const::{
 pub enum CancelTarget {
     #[default]
     Grab,
+    TiltF,
+    TiltU,
+    TiltD,
+    SmashF,
+    SmashU,
+    SmashD,
+    SpecialN,
+    SpecialS,
+    SpecialHi,
+    SpecialLw,
+}
+
+impl CancelTarget {
+    /// Native CAT1 commands, not motion hashes or forced statuses.
+    unsafe fn command_flag(self) -> u32 {
+        match self {
+            Self::Grab => *FIGHTER_PAD_CMD_CAT1_FLAG_CATCH,
+            Self::TiltF => *FIGHTER_PAD_CMD_CAT1_FLAG_ATTACK_S3,
+            Self::TiltU => *FIGHTER_PAD_CMD_CAT1_FLAG_ATTACK_HI3,
+            Self::TiltD => *FIGHTER_PAD_CMD_CAT1_FLAG_ATTACK_LW3,
+            Self::SmashF => *FIGHTER_PAD_CMD_CAT1_FLAG_ATTACK_S4,
+            Self::SmashU => *FIGHTER_PAD_CMD_CAT1_FLAG_ATTACK_HI4,
+            Self::SmashD => *FIGHTER_PAD_CMD_CAT1_FLAG_ATTACK_LW4,
+            Self::SpecialN => *FIGHTER_PAD_CMD_CAT1_FLAG_SPECIAL_N,
+            Self::SpecialS => *FIGHTER_PAD_CMD_CAT1_FLAG_SPECIAL_S,
+            Self::SpecialHi => *FIGHTER_PAD_CMD_CAT1_FLAG_SPECIAL_HI,
+            Self::SpecialLw => *FIGHTER_PAD_CMD_CAT1_FLAG_SPECIAL_LW,
+        } as u32
+    }
+
+    /// Only unblock this target's specific native transition term.
+    unsafe fn matches_transition_term(self, term: i32) -> bool {
+        term == match self {
+            Self::Grab => *FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_CATCH,
+            Self::TiltF => *FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_ATTACK_S3,
+            Self::TiltU => *FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_ATTACK_HI3,
+            Self::TiltD => *FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_ATTACK_LW3,
+            Self::SmashF => *FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_ATTACK_S4_START,
+            Self::SmashU => *FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_ATTACK_HI4_START,
+            Self::SmashD => *FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_ATTACK_LW4_START,
+            Self::SpecialN => *FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_SPECIAL_N,
+            Self::SpecialS => *FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_SPECIAL_S,
+            Self::SpecialHi => *FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_SPECIAL_HI,
+            Self::SpecialLw => *FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_SPECIAL_LW,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
@@ -66,7 +128,6 @@ impl CancelRule {
             && self.fighter.len() <= 40
             && self.fighter.bytes().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
             && self.motion != 0
-            && self.target == CancelTarget::Grab
             && self.condition != CancelCondition::OnWhiff
             && (1..=60).contains(&self.start_frame)
             && self.start_frame <= self.end_frame
@@ -88,29 +149,29 @@ pub fn set_rules(rules: Vec<CancelRule>) {
 }
 
 /// Copies tiny rule fields under try_read; native calls happen after the guard is dropped.
-unsafe fn matching_rule(boma: *mut BattleObjectModuleAccessor) -> bool {
+unsafe fn matching_rule(boma: *mut BattleObjectModuleAccessor) -> Option<CancelTarget> {
     if !HAS_RULES.load(Ordering::Acquire)
         || boma.is_null()
         || smash::app::utility::get_category(&mut *boma) != *BATTLE_OBJECT_CATEGORY_FIGHTER
         || StatusModule::situation_kind(boma) != *SITUATION_KIND_GROUND
     {
-        return false;
+        return None;
     }
     let kind = smash::app::utility::get_kind(&mut *boma);
     let Some(fighter) = crate::slight::slight_consts::fighters::game_kind_name(kind) else {
-        return false;
+        return None;
     };
     let motion = MotionModule::motion_kind(boma);
     let selected = {
         let Some(rules) = RULES.try_read() else {
-            return false;
+            return None;
         };
         rules.iter()
             .find(|rule| rule.motion == motion && rule.fighter == fighter)
-            .map(|rule| (rule.condition, rule.start_frame, rule.end_frame, rule.sync_combo))
+            .map(|rule| (rule.target, rule.condition, rule.start_frame, rule.end_frame, rule.sync_combo))
     };
-    let Some((condition, start, end, sync_combo)) = selected else {
-        return false;
+    let Some((target, condition, start, end, sync_combo)) = selected else {
+        return None;
     };
     let frame = MotionModule::frame(boma);
     let in_window = if sync_combo {
@@ -120,42 +181,44 @@ unsafe fn matching_rule(boma: *mut BattleObjectModuleAccessor) -> bool {
         frame >= f32::from(start) && frame <= f32::from(end)
     };
     if !in_window {
-        return false;
+        return None;
     }
     let commands = ControlModule::get_command_flag_cat(boma, 0) as u32;
-    if commands & (*FIGHTER_PAD_CMD_CAT1_FLAG_CATCH as u32) == 0 {
-        return false;
+    if commands & target.command_flag() == 0 {
+        return None;
     }
     if condition == CancelCondition::Anytime {
-        return true;
+        return Some(target);
     }
     let hit = AttackModule::is_infliction_status(boma, *COLLISION_KIND_MASK_HIT);
     let shield = AttackModule::is_infliction_status(boma, *COLLISION_KIND_MASK_SHIELD);
-    match condition {
+    let allowed = match condition {
         CancelCondition::Anytime => true,
         CancelCondition::OnHit => hit,
         CancelCondition::OnShield => shield,
         CancelCondition::OnHitOrShield => hit || shield,
         CancelCondition::OnWhiff => false,
-    }
+    };
+    allowed.then_some(target)
 }
 
 #[skyline::hook(replace = smash::app::lua_bind::CancelModule::is_enable_cancel)]
-unsafe fn custom_grab_cancel(boma: *mut BattleObjectModuleAccessor) -> bool {
+unsafe fn custom_cancel(boma: *mut BattleObjectModuleAccessor) -> bool {
     let vanilla = original!()(boma);
-    vanilla || matching_rule(boma)
+    vanilla || matching_rule(boma).is_some()
 }
 
 #[skyline::hook(replace = smash::app::lua_bind::WorkModule::is_enable_transition_term)]
-unsafe fn custom_grab_transition(
+unsafe fn custom_transition(
     boma: *mut BattleObjectModuleAccessor,
     transition_term: i32,
 ) -> bool {
     let vanilla = original!()(boma, transition_term);
-    vanilla || (transition_term == *FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_CATCH
-        && matching_rule(boma))
+    vanilla || matching_rule(boma).map_or(false, |target| {
+        target.matches_transition_term(transition_term)
+    })
 }
 
 pub fn install() {
-    skyline::install_hooks!(custom_grab_cancel, custom_grab_transition);
+    skyline::install_hooks!(custom_cancel, custom_transition);
 }

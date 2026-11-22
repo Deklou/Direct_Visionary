@@ -8,6 +8,39 @@ use std::collections::HashMap;
 pub enum CancelTarget {
     #[default]
     Grab,
+    TiltF,
+    TiltU,
+    TiltD,
+    SmashF,
+    SmashU,
+    SmashD,
+    SpecialN,
+    SpecialS,
+    SpecialHi,
+    SpecialLw,
+}
+
+impl CancelTarget {
+    pub const GRABS: [Self; 1] = [Self::Grab];
+    pub const TILTS: [Self; 3] = [Self::TiltF, Self::TiltU, Self::TiltD];
+    pub const SMASHES: [Self; 3] = [Self::SmashF, Self::SmashU, Self::SmashD];
+    pub const SPECIALS: [Self; 4] = [Self::SpecialN, Self::SpecialS, Self::SpecialHi, Self::SpecialLw];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Grab => "Standing Grab",
+            Self::TiltF => "Forward Tilt",
+            Self::TiltU => "Up Tilt",
+            Self::TiltD => "Down Tilt",
+            Self::SmashF => "Forward Smash",
+            Self::SmashU => "Up Smash",
+            Self::SmashD => "Down Smash",
+            Self::SpecialN => "Neutral Special",
+            Self::SpecialS => "Side Special",
+            Self::SpecialHi => "Up Special",
+            Self::SpecialLw => "Down Special",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -109,6 +142,20 @@ mod tests {
         assert!(!rule.enabled);
         let json = serde_json::to_string(&rule).unwrap();
         assert_eq!(serde_json::from_str::<CancelRule>(&json).unwrap(), rule);
+    }
+
+    #[test]
+    fn target_wire_names_stay_stable() {
+        for target in CancelTarget::GRABS.into_iter()
+            .chain(CancelTarget::TILTS)
+            .chain(CancelTarget::SMASHES)
+            .chain(CancelTarget::SPECIALS)
+        {
+            let json = serde_json::to_string(&target).unwrap();
+            assert_eq!(serde_json::from_str::<CancelTarget>(&json).unwrap(), target);
+        }
+        assert_eq!(serde_json::to_string(&CancelTarget::SpecialHi).unwrap(), "\"special_hi\"");
+        assert_eq!(serde_json::to_string(&CancelTarget::TiltF).unwrap(), "\"tilt_f\"");
     }
 
     #[test]

@@ -35,7 +35,7 @@ impl VisionaryApp {
         if is_reference {
             ui.weak("Mario / Jab 1: Grab has been observed working on Ryujinx.");
         } else {
-            ui.weak("Experimental on this move: only Mario / Jab 1 -> Grab has been tested in-game.");
+            ui.weak("Experimental on this move; transitions depend on the fighter and status.");
         }
         ui.checkbox(&mut rule.enabled, "Enable custom cancel")
             .on_hover_text("Disabled by default. Existing native cancels stay unchanged.");
@@ -44,21 +44,24 @@ impl VisionaryApp {
             ui.horizontal(|ui| {
                 ui.label("Target action");
                 egui::ComboBox::from_id_salt("cancel_target")
-                    .selected_text("Standing Grab")
+                    .selected_text(rule.target.label())
                     .show_ui(ui, |ui| {
-                        ui.label("Grabs");
-                        ui.selectable_value(&mut rule.target, CancelTarget::Grab, "Standing Grab");
-                        ui.separator();
-                        for family in [
-                            "Jabs / Tilts / Smashes",
-                            "Specials",
-                            "Movement",
-                            "Defense",
-                            "Character-specific",
+                        for (family, targets) in [
+                            ("Grabs", &CancelTarget::GRABS[..]),
+                            ("Tilts", &CancelTarget::TILTS[..]),
+                            ("Smashes", &CancelTarget::SMASHES[..]),
+                            ("Specials", &CancelTarget::SPECIALS[..]),
                         ] {
-                            ui.add_enabled(false, egui::Label::new(family));
+                            ui.label(egui::RichText::new(family).strong());
+                            for &target in targets {
+                                ui.selectable_value(&mut rule.target, target, target.label());
+                            }
+                            ui.separator();
                         }
-                        ui.weak("Other targets need engine validation.");
+                        ui.add_enabled(false, egui::Label::new("Movement / Jump"));
+                        ui.add_enabled(false, egui::Label::new("Defense / Shield"));
+                        ui.add_enabled(false, egui::Label::new("Character-specific"));
+                        ui.weak("These categories need separate native transition tests.");
                     });
             });
             ui.horizontal(|ui| {
@@ -108,7 +111,7 @@ impl VisionaryApp {
                 ));
             }
         });
-        ui.weak("Grab is only attempted while grounded. On Hit / Shield are unverified.");
+        ui.weak("All listed targets are ground-only. Tilts, Smashes, Specials and Hit / Shield conditions require Ryujinx tests.");
         ui.weak("Live plugin only: standalone Smashline export is not yet supported.");
         if rule != before {
             self.cancel_rules_store
