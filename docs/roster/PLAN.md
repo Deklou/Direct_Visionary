@@ -423,11 +423,11 @@ told which one — `R-66` and `R-31` own this.
 
 **Live.** Two different mechanisms, and conflating them is the trap:
 
-- *Traits* can go live. `fighter_param` values are read into the fighter's data
-  at load; a live param poke means sending the changed field to `slight_replica`
-  and having it write the runtime value. This is genuinely useful (tweak weight,
-  see it immediately) and is `R-64`/`R-65`. Until `R-88`, the shipped live path
-  is file-based next-load (`visionary_roster_live`), not a mid-match poke.
+- *Traits* also have a live path since PR #7 (23 November 2026): the editor
+  sends sparse, typed edits over TCP and the plugin updates the shared
+  `fighter_param` table in memory on Smash 13.0.5. Some values update immediately;
+  others are cached by the fighter instance. File export remains separate.
+  See [TRAITS_LIVE.md](TRAITS_LIVE.md) for verified offsets and limits.
 - *CSS layout and roster membership* today go live as: write the modified UI
   files into `visionary_roster_live`, then ask ARCropolis to reload them and
   return to the CSS. The plugin already resolves the ARCropolis API

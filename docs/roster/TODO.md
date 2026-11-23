@@ -523,7 +523,8 @@ is the workbench; `src/roster/` must not import half-verified offsets.
   row.
   Blocks on: —
   Test: yes — wrong offset affects every fighter.
-  Done: 2026-08-28 — `src/roster/live_param.rs` stub with `validate_poke`/`poke` that refuses until offsets measured, plus `R-40` notice preserved. Shipped live remains file-based next-load (R-64 rescoped), not claimed as mid-match.
+  Done: 2026-08-28 — `src/roster/live_param.rs` stub with `validate_poke`/`poke` that refuses until offsets measured, plus `R-40` notice preserved. Shipped live was file-based next-load at that time.
+  Update: 2026-11-23 — PR #7 added a separate in-memory table path for Smash 13.0.5. Six float fields were tested on Bowser; the other field types are mapped but not all individually verified in game. See [TRAITS_LIVE.md](TRAITS_LIVE.md).
 
 - [x] **R-89 — On-the-fly new entries (properly scoped)**
   Adding a character must work without a file picker or restart, and must not

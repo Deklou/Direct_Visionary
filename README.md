@@ -76,7 +76,7 @@ corresponding files are present in the export.
 
 ## Roster
 
-The **Roster** window (Windows → Roster, or File → Mod Library) covers everything about a
+The **Roster** window (View → Roster, or File → Mod Library) covers everything about a
 fighter that is not one move.
 
 ### Mod library
@@ -135,10 +135,15 @@ editor says so.
 
 ### Applying and exporting
 
-**Apply to game** writes the roster and value changes into the game's mod folder. They are read
-when the character select screen or a fighter loads, so back out to the select screen to see
-them; they do not change mid-match. Exporting a mod folder writes them alongside the ACMD and
-effect files, in one report — anything that could not be written is named rather than dropped.
+Trait edits are sent through the existing TCP connection to the Skyline plugin on Smash 13.0.5.
+Selecting a fighter in the main editor also preselects it in **Roster → Traits**.
+Some live changes take effect immediately; other values may be cached until a new fighter
+instance is created or the game restarts.
+
+**Apply to game** still writes roster and parameter files into the mod folder.
+Character-select changes take effect after returning to the character select screen.
+Exporting a mod folder writes parameters alongside ACMD and effect files.
+See [live fighter parameters](docs/roster/TRAITS_LIVE.md) for the runtime details.
 
 ## Desktop editor
 
