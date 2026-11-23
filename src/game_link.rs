@@ -1424,12 +1424,11 @@ impl Default for Shared {
     }
 }
 
-/// Experimental per-fighter overrides; only two float attributes are sent live.
+/// Sparse per-fighter scalar edits from fighter_param.prc, keeping their PRC value type.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TraitRuleWire {
     pub fighter: String,
-    pub weight: Option<f32>,
-    pub air_speed_x_stable: Option<f32>,
+    pub fields: std::collections::BTreeMap<String, crate::mod_project::ParamValue>,
 }
 
 pub struct GameLink {

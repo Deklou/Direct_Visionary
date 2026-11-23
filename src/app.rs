@@ -18197,39 +18197,17 @@ If you step every basis for a                          type and NONE of them mat
             .to_motion_module_set_rate_partial_events();
     }
 
-    /// Only two float fighter attributes have a runtime path in the test plugin.
-    /// Other trait edits continue to use the existing file export / next-load path.
+    /// Send the same sparse typed fighter_param edits as the existing PRC exporter.
+    /// The plugin matches them against its verified 13.0.5 scalar layout.
     fn live_trait_rules(&self) -> Vec<crate::game_link::TraitRuleWire> {
-        use crate::mod_project::ParamValue;
-
         self.roster
             .params
             .iter()
             .filter_map(|(fighter, params)| {
                 let fields = crate::roster::traits::edits_for(params);
-                let weight = match fields.get("weight") {
-                    Some(ParamValue::Float(value))
-                        if value.is_finite() && *value > 0.0 && *value <= 1000.0 =>
-                    {
-                        Some(*value)
-                    }
-                    _ => None,
-                };
-                let air_speed_x_stable = match fields.get("air_speed_x_stable") {
-                    Some(ParamValue::Float(value))
-                        if value.is_finite() && *value >= 0.0 && *value <= 20.0 =>
-                    {
-                        Some(*value)
-                    }
-                    _ => None,
-                };
-                if weight.is_none() && air_speed_x_stable.is_none() {
-                    return None;
-                }
-                Some(crate::game_link::TraitRuleWire {
+                (!fields.is_empty()).then(|| crate::game_link::TraitRuleWire {
                     fighter: fighter.clone(),
-                    weight,
-                    air_speed_x_stable,
+                    fields: fields.clone(),
                 })
             })
             .collect()

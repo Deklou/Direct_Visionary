@@ -1,24 +1,38 @@
-//! Live overrides of the shared fighter_param table (Smash 13.0.5 only).
-//! Addresses and row layout confirmed against main 13.0.5 in Ghidra.
-//! The game-thread driver owns all writes; no hook or PRC file is replaced.
+//! Live scalar edits of fighter/common/param/fighter_param.prc (Smash 13.0.5 only).
+//! All writes occur in the existing game-frame driver; no PRC reload or new hook.
 
+#[path = "fighter_trait_fields.rs"]
+mod fields;
+
+use fields::{lookup, ValueKind};
 use parking_lot::{Mutex, RwLock};
 use serde::Deserialize;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::LazyLock;
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+pub enum TraitValue {
+    Bool(bool),
+    I8(i8),
+    U8(u8),
+    I16(i16),
+    U16(u16),
+    I32(i32),
+    U32(u32),
+    Float(f32),
+    Hash(u64),
+}
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct TraitRule {
     pub fighter: String,
-    pub weight: Option<f32>,
-    pub air_speed_x_stable: Option<f32>,
+    pub fields: BTreeMap<String, TraitValue>,
 }
 
 const FIGHTER_TABLE_SINGLETON_13_0_5: usize = 0x52bc3b0;
 const ROW_COUNT: usize = 94;
 const ROW_SIZE: usize = 0x628;
-const WEIGHT_OFFSET: usize = 0x80;
-const AIR_SPEED_OFFSET: usize = 0x60;
 const HASH40_MASK: u64 = 0xffffffffff;
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
@@ -33,11 +47,37 @@ struct LiveState {
     frames: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Bits {
+    Float(u32),
+    Integer(i32),
+    Bool(u8),
+    Hash(u64),
+}
+
+impl TraitValue {
+    fn as_bits(self, kind: ValueKind) -> Option<Bits> {
+        match (self, kind) {
+            (Self::Float(v), ValueKind::Float) if v.is_finite() && v.abs() <= 1_000_000.0 =>
+                Some(Bits::Float(v.to_bits())),
+            (Self::Bool(v), ValueKind::Bool) => Some(Bits::Bool(u8::from(v))),
+            (Self::I8(v), ValueKind::Integer) => Some(Bits::Integer(i32::from(v))),
+            (Self::U8(v), ValueKind::Integer) => Some(Bits::Integer(i32::from(v))),
+            (Self::I16(v), ValueKind::Integer) => Some(Bits::Integer(i32::from(v))),
+            (Self::U16(v), ValueKind::Integer) => Some(Bits::Integer(i32::from(v))),
+            (Self::I32(v), ValueKind::Integer) => Some(Bits::Integer(v)),
+            (Self::U32(v), ValueKind::Integer) => i32::try_from(v).ok().map(Bits::Integer),
+            (Self::Hash(v), ValueKind::Hash) if v <= HASH40_MASK => Some(Bits::Hash(v)),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct AppliedValue {
     offset: usize,
-    original: f32,
-    written: f32,
+    original: Bits,
+    written: Bits,
 }
 
 #[derive(Clone, Copy)]
@@ -50,19 +90,14 @@ impl TraitRule {
     fn valid(&self) -> bool {
         !self.fighter.is_empty()
             && self.fighter.len() <= 40
-            && self
-                .fighter
-                .bytes()
-                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
-            && self.weight.is_none_or(|v| v.is_finite() && v > 0.0 && v <= 1000.0)
-            && self
-                .air_speed_x_stable
-                .is_none_or(|v| v.is_finite() && (0.0..=20.0).contains(&v))
-            && (self.weight.is_some() || self.air_speed_x_stable.is_some())
+            && self.fighter.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+            && !self.fields.is_empty()
+            && self.fields.len() <= 369
+            && self.fields.keys().all(|key| !key.is_empty() && key.len() <= 96)
     }
 }
 
-/// Full replacement from the editor. Empty rules restore the captured values.
+/// Full project snapshot. Invalid fields are skipped individually, not coerced.
 pub fn set_rules(rules: Vec<TraitRule>) {
     let mut accepted = Vec::new();
     for rule in rules {
@@ -73,30 +108,23 @@ pub fn set_rules(rules: Vec<TraitRule>) {
             accepted.push(rule);
         }
     }
-
-    let details = accepted
-        .iter()
-        .take(3)
-        .map(|r| format!("{} weight={:?} air={:?}", r.fighter, r.weight, r.air_speed_x_stable))
-        .collect::<Vec<_>>()
-        .join("; ");
     let count = accepted.len();
+    let field_count: usize = accepted.iter().map(|r| r.fields.len()).sum();
     *RULES.write() = accepted;
     STATE.lock().dirty = true;
-    crate::slight::diag::note(format!("trait rules applied: {count} {details}"));
+    crate::slight::diag::note(format!("trait rules applied: {count} fighters, {field_count} fields"));
 }
 
-/// Resolve only the version-verified global vector; never scan arbitrary heap memory.
+/// Ghidra 13.0.5: singleton -> object -> [begin,end] of 94 x 0x628-byte rows.
 unsafe fn read_table() -> Option<Table> {
     if !crate::slight::ver::is_13_0_5() {
         return None;
     }
-
     let text = skyline::hooks::getRegionAddress(skyline::hooks::Region::Text) as usize;
-    let slot = text.checked_add(FIGHTER_TABLE_SINGLETON_13_0_5)?;
     if text == 0 {
         return None;
     }
+    let slot = text.checked_add(FIGHTER_TABLE_SINGLETON_13_0_5)?;
     let owner = (slot as *const usize).read_volatile();
     if owner < 0x10000 || owner & 7 != 0 {
         return None;
@@ -105,19 +133,13 @@ unsafe fn read_table() -> Option<Table> {
     if vector < 0x10000 || vector & 7 != 0 {
         return None;
     }
-
-    // Ghidra: singleton -> param object -> vector [begin, end] at +8/+16.
     let start = ((vector + 8) as *const usize).read_volatile();
     let end = ((vector + 16) as *const usize).read_volatile();
-    if start < 0x10000 || start & 7 != 0 || end <= start {
+    if start < 0x10000 || start & 7 != 0 || end <= start
+        || end.checked_sub(start)? != ROW_COUNT * ROW_SIZE
+    {
         return None;
     }
-    let bytes = end.checked_sub(start)?;
-    if bytes != ROW_COUNT * ROW_SIZE {
-        return None;
-    }
-
-    // Ghidra and the game's fighter_param layout agree that Mario is row zero.
     if ((start as *const u64).read_volatile() & HASH40_MASK)
         != (smash::hash40("fighter_kind_mario") & HASH40_MASK)
     {
@@ -126,69 +148,85 @@ unsafe fn read_table() -> Option<Table> {
     Some(Table { start, end })
 }
 
-unsafe fn restore(table: Table, value: AppliedValue) -> bool {
-    let Some(end) = value.offset.checked_add(std::mem::size_of::<f32>()) else {
-        return false;
+unsafe fn read_bits(table: Table, offset: usize, kind: ValueKind) -> Option<Bits> {
+    let width = match kind { ValueKind::Hash => 8, ValueKind::Bool => 1, _ => 4 };
+    if offset < table.start || offset.checked_add(width)? > table.end {
+        return None;
+    }
+    match kind {
+        ValueKind::Float => {
+            let bits = (offset as *const u32).read_volatile();
+            f32::from_bits(bits).is_finite().then_some(Bits::Float(bits))
+        }
+        ValueKind::Integer => Some(Bits::Integer((offset as *const i32).read_volatile())),
+        ValueKind::Bool => {
+            let v = (offset as *const u8).read_volatile();
+            (v <= 1).then_some(Bits::Bool(v))
+        }
+        ValueKind::Hash => {
+            let v = (offset as *const u64).read_volatile();
+            (v <= HASH40_MASK).then_some(Bits::Hash(v))
+        }
+    }
+}
+
+unsafe fn write_bits(table: Table, offset: usize, value: Bits) -> bool {
+    let kind = match value {
+        Bits::Float(_) => ValueKind::Float,
+        Bits::Integer(_) => ValueKind::Integer,
+        Bits::Bool(_) => ValueKind::Bool,
+        Bits::Hash(_) => ValueKind::Hash,
     };
-    if value.offset < table.start || end > table.end {
+    if read_bits(table, offset, kind).is_none() {
         return false;
     }
-    let field = value.offset as *mut f32;
-    // Another plugin may have written to the same field in the meantime.
-    if field.read_volatile().to_bits() != value.written.to_bits() {
-        return false;
-    }
-    field.write_volatile(value.original);
+    match value {
+        Bits::Float(v) => (offset as *mut u32).write_volatile(v),
+        Bits::Integer(v) => (offset as *mut i32).write_volatile(v),
+        Bits::Bool(v) => (offset as *mut u8).write_volatile(v),
+        Bits::Hash(v) => (offset as *mut u64).write_volatile(v),
+    };
     true
 }
 
-unsafe fn override_field(table: Table, row: usize, field_offset: usize, desired: f32) -> Option<AppliedValue> {
-    let offset = row.checked_add(field_offset)?;
-    if offset < table.start || offset.checked_add(4)? > table.end {
-        return None;
-    }
-    let field = offset as *mut f32;
-    let original = field.read_volatile();
-    let plausible = if field_offset == WEIGHT_OFFSET {
-        original.is_finite() && original > 0.0 && original <= 1000.0
-    } else {
-        original.is_finite() && (0.0..=20.0).contains(&original)
+unsafe fn restore(table: Table, previous: AppliedValue) -> bool {
+    let kind = match previous.written {
+        Bits::Float(_) => ValueKind::Float,
+        Bits::Integer(_) => ValueKind::Integer,
+        Bits::Bool(_) => ValueKind::Bool,
+        Bits::Hash(_) => ValueKind::Hash,
     };
-    if !plausible || original.to_bits() == desired.to_bits() {
-        return None;
+    if read_bits(table, previous.offset, kind) != Some(previous.written) {
+        // Another plugin owns this value now: do not overwrite it.
+        return false;
     }
-    field.write_volatile(desired);
-    Some(AppliedValue { offset, original, written: desired })
+    write_bits(table, previous.offset, previous.original)
 }
 
-/// Called from the existing global game-thread facade, not from a socket thread.
+/// Game-thread application. Rechecks the table identity periodically after a reload.
 pub fn tick() {
     if !ENABLED.load(Ordering::Acquire) {
         return;
     }
     let mut state = STATE.lock();
     state.frames = state.frames.wrapping_add(1);
-
-    if !state.dirty && (state.applied.is_empty() || state.frames % 120 != 0) {
+    if !state.dirty && state.frames % 120 != 0 {
         return;
     }
-
     let rules = RULES.read().clone();
     if rules.is_empty() && state.applied.is_empty() {
         state.dirty = false;
         return;
     }
-
     let Some(table) = (unsafe { read_table() }) else {
         if state.dirty && state.frames % 240 == 0 {
             crate::slight::diag::note("TRAITS table not ready; no memory written");
         }
         return;
     };
-
     let identity = (table.start, table.end);
     if state.table != Some(identity) {
-        // Old addresses may have been freed by a reload: never restore through them.
+        // A reallocated table invalidates all old field pointers.
         state.applied.clear();
         state.table = Some(identity);
         state.dirty = true;
@@ -199,17 +237,18 @@ pub fn tick() {
     state.dirty = false;
 
     let mut restored = 0;
-    let mut conflicts = 0;
+    let mut conflicts = BTreeSet::new();
     for previous in std::mem::take(&mut state.applied) {
         if unsafe { restore(table, previous) } {
             restored += 1;
         } else {
-            conflicts += 1;
+            conflicts.insert(previous.offset);
         }
     }
 
-    let mut matched = 0;
-    let mut written = 0;
+    let mut matched = 0usize;
+    let mut written = 0usize;
+    let mut skipped = 0usize;
     for rule in &rules {
         let hash = smash::hash40(&format!("fighter_kind_{}", rule.fighter)) & HASH40_MASK;
         let row = (0..ROW_COUNT)
@@ -217,28 +256,52 @@ pub fn tick() {
             .find(|&addr| unsafe { (addr as *const u64).read_volatile() & HASH40_MASK } == hash);
         let Some(row) = row else {
             crate::slight::diag::note(format!("TRAITS fighter not found in table: {}", rule.fighter));
+            skipped += rule.fields.len();
             continue;
         };
         matched += 1;
-        for (field_offset, value) in [
-            (WEIGHT_OFFSET, rule.weight),
-            (AIR_SPEED_OFFSET, rule.air_speed_x_stable),
-        ] {
-            if let Some(desired) = value {
-                if let Some(applied) = unsafe { override_field(table, row, field_offset, desired) } {
-                    crate::slight::diag::note(format!(
-                        "TRAITS {} +{field_offset:#x}: {} -> {}",
-                        rule.fighter, applied.original, desired
-                    ));
-                    state.applied.push(applied);
-                    written += 1;
-                }
+        let mut per_fighter_offsets = BTreeSet::new();
+        for (key, value) in &rule.fields {
+            let Some(spec) = lookup(key) else {
+                skipped += 1;
+                continue;
+            };
+            let Some(wanted) = value.as_bits(spec.kind) else {
+                skipped += 1;
+                continue;
+            };
+            let Some(offset) = row.checked_add(spec.offset) else {
+                skipped += 1;
+                continue;
+            };
+            if !per_fighter_offsets.insert(offset) || conflicts.contains(&offset) {
+                skipped += 1;
+                continue;
             }
+            let Some(original) = (unsafe { read_bits(table, offset, spec.kind) }) else {
+                skipped += 1;
+                continue;
+            };
+            if original == wanted {
+                continue;
+            }
+            if !unsafe { write_bits(table, offset, wanted) } {
+                skipped += 1;
+                continue;
+            }
+            if written < 20 {
+                crate::slight::diag::note(format!(
+                    "TRAITS {} {} +{:#x}: {:?} -> {:?}",
+                    rule.fighter, key, spec.offset, original, wanted
+                ));
+            }
+            state.applied.push(AppliedValue { offset, original, written: wanted });
+            written += 1;
         }
     }
     crate::slight::diag::note(format!(
-        "TRAITS table snapshot: matched={matched}/{} written={written} restored={restored} changed_elsewhere={conflicts}",
-        rules.len()
+        "TRAITS table snapshot: matched={matched}/{} written={written} restored={restored} changed_elsewhere={} skipped={skipped}",
+        rules.len(), conflicts.len()
     ));
 }
 
@@ -249,4 +312,19 @@ pub fn install() {
     }
     ENABLED.store(true, Ordering::Release);
     skyline::println!("[SLight] Fighter trait table overrides enabled (experimental)");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn matching_variant_is_required() {
+        assert_eq!(TraitValue::Float(2.0).as_bits(ValueKind::Float), Some(Bits::Float(2.0_f32.to_bits())));
+        assert_eq!(TraitValue::Bool(true).as_bits(ValueKind::Bool), Some(Bits::Bool(1)));
+        assert_eq!(TraitValue::I16(7).as_bits(ValueKind::Integer), Some(Bits::Integer(7)));
+        assert_eq!(TraitValue::Hash(0xff).as_bits(ValueKind::Hash), Some(Bits::Hash(0xff)));
+        assert_eq!(TraitValue::Hash(4).as_bits(ValueKind::Float), None);
+        assert_eq!(TraitValue::U32(u32::MAX).as_bits(ValueKind::Integer), None);
+        assert_eq!(TraitValue::Float(f32::NAN).as_bits(ValueKind::Float), None);
+    }
 }
