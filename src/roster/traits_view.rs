@@ -43,6 +43,15 @@ impl TraitsView {
         self.drafts.clear();
     }
 
+    /// Preselect a fighter from the main editor without resetting a manual
+    /// choice or uncommitted field text on every frame.
+    pub fn select_entry(&mut self, key: RosterKey) {
+        if self.selected.as_ref() != Some(&key) {
+            self.selected = Some(key);
+            self.invalidate();
+        }
+    }
+
     pub fn ui(
         &mut self,
         ui: &mut Ui,
@@ -631,6 +640,20 @@ fn parse(text: &str, base: ParamValue) -> Option<ParamValue> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn external_selection_keeps_drafts_for_the_same_fighter() {
+        let mut view = TraitsView::default();
+        view.select_entry(RosterKey::fighter("koopa"));
+        view.drafts.insert("weight".to_string(), "pending".to_string());
+        view.select_entry(RosterKey::fighter("koopa"));
+        assert_eq!(view.selected, Some(RosterKey::fighter("koopa")));
+        assert_eq!(view.drafts.get("weight").map(String::as_str), Some("pending"));
+
+        view.select_entry(RosterKey::fighter("mario"));
+        assert_eq!(view.selected, Some(RosterKey::fighter("mario")));
+        assert!(view.drafts.is_empty());
+    }
 
     /// The typed text is interpreted as the field's own type, not guessed from the text. `3`
     /// in a decimal field is `3.0`; an integer there would have to be re-guessed on write.

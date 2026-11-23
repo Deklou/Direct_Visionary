@@ -166,6 +166,9 @@ pub struct RosterWindow {
     css: CssView,
     /// The trait tab.
     traits: TraitsView,
+    /// Previous main-editor selection, to avoid overriding a manual Traits choice every frame.
+    last_main_fighter: Option<String>,
+    was_open_last_frame: bool,
     /// The new-character tab.
     new_character: NewCharacterView,
     /// Moves the project has replaced for each character you added, supplied by `app.rs` from
@@ -212,6 +215,8 @@ impl Default for RosterWindow {
             index: RosterIndex::default(),
             css: CssView::default(),
             traits: TraitsView::default(),
+            last_main_fighter: None,
+            was_open_last_frame: false,
             new_character: NewCharacterView::default(),
             authored_moves: Default::default(),
             edit_target: None,
@@ -466,8 +471,10 @@ impl RosterWindow {
         fighters: &[FighterEntry],
         data_root: Option<&PathBuf>,
         labels: &std::collections::HashMap<u64, String>,
+        main_fighter: Option<&str>,
     ) {
         if !self.open {
+            self.was_open_last_frame = false;
             return;
         }
         // Labels arrive asynchronously and grow; clone when contents differ rather
@@ -480,6 +487,29 @@ impl RosterWindow {
         self.ensure_initialized(&[]);
         self.poll_import(ctx);
         self.refresh(fighters, data_root);
+
+        // Pick the main editor's fighter on open or when it changes. Do not
+        // reset a fighter chosen manually in Traits on every redraw.
+        if !self.was_open_last_frame || self.last_main_fighter.as_deref() != main_fighter {
+            if let Some(fighter) = main_fighter {
+                let key = super::RosterKey::fighter(fighter);
+                let target = self.index.by_key(&key)
+                    .filter(|entry| entry.fighter.as_deref() == Some(fighter))
+                    .or_else(|| self.index.entries.iter().find(|entry| {
+                        entry.fighter.as_deref() == Some(fighter)
+                            && !entry.backing.shares_engine_fighter()
+                    }))
+                    .or_else(|| self.index.entries.iter().find(|entry| {
+                        entry.fighter.as_deref() == Some(fighter)
+                    }))
+                    .map(|entry| entry.key.clone());
+                if let Some(target) = target {
+                    self.traits.select_entry(target);
+                }
+            }
+        }
+        self.last_main_fighter = main_fighter.map(str::to_owned);
+        self.was_open_last_frame = true;
 
         ctx.show_viewport_immediate(
             egui::ViewportId::from_hash_of("roster"),

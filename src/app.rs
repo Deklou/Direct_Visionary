@@ -35701,6 +35701,7 @@ impl eframe::App for VisionaryApp {
             &self.state.fighters,
             self.state.data_root.as_ref(),
             &self.state.labels,
+            current_fighter.as_deref(),
         );
         self.sync_live_traits();
         // Deploy stages from in-memory state, so flush the project alongside
