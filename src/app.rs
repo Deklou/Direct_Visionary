@@ -3157,6 +3157,8 @@ pub struct VisionaryApp {
     /// Session-only parameter-defined hurtboxes for the selected fighter. These never enter
     /// AppState, project serialization, or edit history.
     hurtbox_volumes: Vec<crate::data::HurtboxVolume>,
+    hurtbox_original_volumes: Vec<crate::data::HurtboxVolume>,
+    hurtbox_geometry_rules: BTreeMap<(i32, u32), crate::game_link::HurtboxGeometryWire>,
     hurtbox_warnings: Vec<crate::data::HurtboxLoadWarning>,
     /// Persistent viewport preference; it remains true across fighters even when a fighter has
     /// no parameter data, while the checkbox itself is disabled for that fighter.
@@ -3634,6 +3636,8 @@ impl VisionaryApp {
             pending_project_script: None,
             bone_names: Vec::new(),
             hurtbox_volumes: Vec::new(),
+            hurtbox_original_volumes: Vec::new(),
+            hurtbox_geometry_rules: BTreeMap::new(),
             hurtbox_warnings: Vec::new(),
             show_hurtboxes: load_hurtbox_visibility(),
             show_debug: false,
@@ -4906,8 +4910,18 @@ impl VisionaryApp {
         };
         let hurtbox_result =
             crate::data::load_hurtbox_volumes(&fighter.param_path, &loaded_bone_names);
+        self.hurtbox_original_volumes = hurtbox_result.volumes.clone();
         self.hurtbox_volumes = hurtbox_result.volumes;
         self.hurtbox_warnings = hurtbox_result.warnings;
+        if let Some(kind) = fighter_kind_id(&name) {
+            for volume in &mut self.hurtbox_volumes {
+                if let Some(rule) = self.hurtbox_geometry_rules.get(&(kind, volume.index as u32)) {
+                    volume.endpoint1 = rule.endpoint1;
+                    volume.endpoint2 = rule.endpoint2;
+                    volume.radius = rule.radius;
+                }
+            }
+        }
         self.add_bone = self.add_bone.to_ascii_lowercase();
         self.current_model_dir = Some(model_dir.clone());
         self.articles.set_fighter(
@@ -14974,6 +14988,81 @@ impl VisionaryApp {
             self.selected_hurtbox = None;
             return;
         };
+
+        // Geometry is intentionally session-only until the native call is tested on Ryujinx.
+        // It does not change the fighter's PRC or the authored HIT_NO range.
+        let mut geometry_action: Option<bool> = None; // true: restore vanilla values
+        ui.group(|ui| {
+            ui.label("Live capsule geometry (experimental)");
+            ui.small("One-shot live preview on Smash 13.0.5. No project/export changes.");
+            if let Some(edit) = self.hurtbox_volumes.get_mut(index) {
+                ui.horizontal(|ui| {
+                    ui.label("Radius");
+                    ui.add(egui::DragValue::new(&mut edit.radius).speed(0.1).range(0.1..=50.0));
+                });
+                for axis in 0..3 {
+                    ui.horizontal(|ui| {
+                        ui.label(["X", "Y", "Z"][axis]);
+                        ui.label("Start");
+                        ui.add(egui::DragValue::new(&mut edit.endpoint1[axis]).speed(0.1).range(-200.0..=200.0));
+                        ui.label("End");
+                        ui.add(egui::DragValue::new(&mut edit.endpoint2[axis]).speed(0.1).range(-200.0..=200.0));
+                    });
+                }
+            }
+            ui.horizontal(|ui| {
+                if ui.button("Apply geometry live").clicked() {
+                    geometry_action = Some(false);
+                }
+                if ui.button("Restore original geometry").clicked() {
+                    geometry_action = Some(true);
+                }
+            });
+        });
+        if let Some(restore) = geometry_action {
+            if let Some(kind) = self.state.selected_fighter
+                .and_then(|i| self.state.fighters.get(i))
+                .and_then(|fighter| fighter_kind_id(&fighter.name))
+            {
+                if restore {
+                    if let Some(original) = self.hurtbox_original_volumes.iter()
+                        .find(|v| v.index == volume.index).cloned()
+                    {
+                        self.hurtbox_volumes[index] = original;
+                    }
+                }
+                let edited = &self.hurtbox_volumes[index];
+                let default_status = match edited.default_status {
+                    crate::data::HurtboxStatus::Normal => Some(0),
+                    crate::data::HurtboxStatus::Invincible => Some(1),
+                    crate::data::HurtboxStatus::Xlu => Some(2),
+                    crate::data::HurtboxStatus::Off => Some(3),
+                    crate::data::HurtboxStatus::Unknown(_) => None,
+                };
+                if let Some(status) = default_status {
+                    let rule = crate::game_link::HurtboxGeometryWire {
+                        fighter_kind: kind,
+                        index: edited.index as u32,
+                        bone: edited.bone_hash,
+                        endpoint1: edited.endpoint1,
+                        endpoint2: edited.endpoint2,
+                        radius: edited.radius,
+                        status,
+                    };
+                    self.hurtbox_geometry_rules.insert((kind, rule.index), rule);
+                    let all: Vec<_> = self.hurtbox_geometry_rules.values().cloned().collect();
+                    self.game_link.send_hurtbox_geometry_rules(&all);
+                    self.state.status = if restore {
+                        "Original hurtbox geometry queued for live preview.".into()
+                    } else {
+                        "Experimental hurtbox geometry queued; verify the result in Ryujinx.".into()
+                    };
+                } else {
+                    self.state.status =
+                        "Unknown default hurtbox status: geometry not sent.".into();
+                }
+            }
+        }
 
         ui.group(|ui| {
             ui.label(format!(
