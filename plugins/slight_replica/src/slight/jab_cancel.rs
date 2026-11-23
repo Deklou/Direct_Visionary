@@ -19,6 +19,7 @@ use smash::lib::lua_const::{
     FIGHTER_PAD_CMD_CAT1_FLAG_TURN_DASH, FIGHTER_PAD_CMD_CAT1_FLAG_SQUAT,
     FIGHTER_STATUS_ATTACK_FLAG_ENABLE_COMBO, FIGHTER_STATUS_KIND_ATTACK,
     FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_CATCH,
+    FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_ATTACK_100,
     FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_ATTACK_S3,
     FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_ATTACK_HI3,
     FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_ATTACK_LW3,
@@ -303,6 +304,18 @@ unsafe fn custom_transition(
     transition_term: i32,
 ) -> bool {
     let vanilla = original!()(boma, transition_term);
+
+    // A valid custom action takes precedence over the native rapid-jab transition.
+    // Keep Attack100 untouched when no active custom command matches this frame.
+    if vanilla
+        && transition_term == *FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_ATTACK_100
+        && !boma.is_null()
+        && StatusModule::status_kind(boma) == *FIGHTER_STATUS_KIND_ATTACK
+        && matching_rule(boma, None)
+    {
+        return false;
+    }
+
     vanilla || matching_rule(boma, Some(transition_term))
 }
 
