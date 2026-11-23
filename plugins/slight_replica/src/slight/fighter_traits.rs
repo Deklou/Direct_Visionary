@@ -189,15 +189,38 @@ unsafe fn write_bits(table: Table, offset: usize, value: Bits) -> bool {
     true
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FieldOwnership {
+    Ours,
+    BackToBase,
+    Foreign,
+}
+
+impl AppliedValue {
+    fn kind(self) -> ValueKind {
+        match self.written {
+            Bits::Float(_) => ValueKind::Float,
+            Bits::Integer(_) => ValueKind::Integer,
+            Bits::Bool(_) => ValueKind::Bool,
+            Bits::Hash(_) => ValueKind::Hash,
+        }
+    }
+}
+
+/// A match transition can reload the same table in place. Its pointer stays unchanged,
+/// but our written values return to their captured base values.
+fn ownership(previous: AppliedValue, current: Option<Bits>) -> FieldOwnership {
+    match current {
+        Some(value) if value == previous.written => FieldOwnership::Ours,
+        Some(value) if value == previous.original => FieldOwnership::BackToBase,
+        _ => FieldOwnership::Foreign,
+    }
+}
+
 unsafe fn restore(table: Table, previous: AppliedValue) -> bool {
-    let kind = match previous.written {
-        Bits::Float(_) => ValueKind::Float,
-        Bits::Integer(_) => ValueKind::Integer,
-        Bits::Bool(_) => ValueKind::Bool,
-        Bits::Hash(_) => ValueKind::Hash,
-    };
-    if read_bits(table, previous.offset, kind) != Some(previous.written) {
-        // Another plugin owns this value now: do not overwrite it.
+    if ownership(previous, read_bits(table, previous.offset, previous.kind()))
+        != FieldOwnership::Ours
+    {
         return false;
     }
     write_bits(table, previous.offset, previous.original)
@@ -210,7 +233,9 @@ pub fn tick() {
     }
     let mut state = STATE.lock();
     state.frames = state.frames.wrapping_add(1);
-    if !state.dirty && state.frames % 120 != 0 {
+    // With active edits, inspect a bounded number of fields every frame.
+    // The game can rebuild the same table in place during a match transition.
+    if !state.dirty && state.applied.is_empty() && state.frames % 120 != 0 {
         return;
     }
     let rules = RULES.read().clone();
@@ -231,18 +256,35 @@ pub fn tick() {
         state.table = Some(identity);
         state.dirty = true;
     }
+    if !state.dirty && !state.applied.is_empty() {
+        // A maximum of eight volatile reads per frame prevents costly full-table scans
+        // while still detecting a simultaneous reset of all edited fields immediately.
+        let len = state.applied.len();
+        let start = (state.frames as usize).wrapping_mul(8) % len;
+        let reset = (0..len.min(8)).any(|i| {
+            let previous = state.applied[(start + i) % len];
+            let current = unsafe { read_bits(table, previous.offset, previous.kind()) };
+            ownership(previous, current) == FieldOwnership::BackToBase
+        });
+        if reset {
+            state.dirty = true;
+            crate::slight::diag::note("TRAITS table restored its base values in place; reapplying edits");
+        }
+    }
     if !state.dirty {
         return;
     }
     state.dirty = false;
 
     let mut restored = 0;
+    let mut back_to_base = 0;
     let mut conflicts = BTreeSet::new();
     for previous in std::mem::take(&mut state.applied) {
-        if unsafe { restore(table, previous) } {
-            restored += 1;
-        } else {
-            conflicts.insert(previous.offset);
+        let current = unsafe { read_bits(table, previous.offset, previous.kind()) };
+        match ownership(previous, current) {
+            FieldOwnership::Ours if unsafe { restore(table, previous) } => restored += 1,
+            FieldOwnership::BackToBase => back_to_base += 1,
+            _ => { conflicts.insert(previous.offset); }
         }
     }
 
@@ -300,7 +342,7 @@ pub fn tick() {
         }
     }
     crate::slight::diag::note(format!(
-        "TRAITS table snapshot: matched={matched}/{} written={written} restored={restored} changed_elsewhere={} skipped={skipped}",
+        "TRAITS table snapshot: matched={matched}/{} written={written} restored={restored} back_to_base={back_to_base} changed_elsewhere={} skipped={skipped}",
         rules.len(), conflicts.len()
     ));
 }
@@ -317,6 +359,19 @@ pub fn install() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn restored_base_is_not_a_foreign_write() {
+        let previous = AppliedValue {
+            offset: 0x80,
+            original: Bits::Float(135.0_f32.to_bits()),
+            written: Bits::Float(1.0_f32.to_bits()),
+        };
+        assert_eq!(ownership(previous, Some(previous.written)), FieldOwnership::Ours);
+        assert_eq!(ownership(previous, Some(previous.original)), FieldOwnership::BackToBase);
+        assert_eq!(ownership(previous, Some(Bits::Float(25.0_f32.to_bits()))), FieldOwnership::Foreign);
+        assert_eq!(ownership(previous, None), FieldOwnership::Foreign);
+    }
+
     #[test]
     fn matching_variant_is_required() {
         assert_eq!(TraitValue::Float(2.0).as_bits(ValueKind::Float), Some(Bits::Float(2.0_f32.to_bits())));

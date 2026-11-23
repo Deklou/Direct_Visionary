@@ -187,7 +187,7 @@ impl TraitsView {
             ui.colored_label(Color32::from_rgb(120, 185, 235), "ⓘ");
             ui.label(
                 RichText::new(
-                    "Edits are saved and exported as before. Scalar fighter parameters are also sent as experimental live overrides on Enter (except fighter_kind); some changes may require a fighter reload.",
+                    "Edits are saved and exported as before. Live overrides are experimental and can be reset when entering a match. For reliable results, use Deploy and restart Smash; some traits are cached when the fighter is created.",
                 )
                 .small()
                 .weak(),
