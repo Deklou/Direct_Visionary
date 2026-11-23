@@ -37,7 +37,7 @@ impl Facade for DebuggableServerFacade {
         crate::slight::effect_viewer::apply::enforce_pinned();
 
         let n = FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        crate::slight::fighter_traits::report();
+        crate::slight::fighter_traits::tick();
         if n % NOTIFY_EVERY == 0 {
             for (eff_hash, _name, _data) in
                 crate::slight::effect_viewer::kinds::take_dirty(MAX_NOTIFY_PER_TICK)
