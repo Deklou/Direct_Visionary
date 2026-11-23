@@ -187,7 +187,7 @@ impl TraitsView {
             ui.colored_label(Color32::from_rgb(120, 185, 235), "ⓘ");
             ui.label(
                 RichText::new(
-                    "Edits are saved with your project and included when you export — no separate apply step.",
+                    "Changes are saved in the project and exported as before. Weight and Air speed also send experimental live overrides on Enter; other values take effect at next fighter load.",
                 )
                 .small()
                 .weak(),

@@ -3209,6 +3209,8 @@ pub struct VisionaryApp {
     pin_sync_wait: Option<std::time::Instant>,
     /// Untracked in-game pins awaiting the user's Import / Reset / Ignore choice.
     pin_sync_prompt: Option<Vec<(u64, crate::game_link::LiveKind)>>,
+    /// Last complete fighter-trait snapshot sent to the plugin; only weight and air speed.
+    last_live_trait_rules: Vec<crate::game_link::TraitRuleWire>,
     /// Live hitbox rules per "fighter/move" (the plugin gets the flattened union).
     hitbox_rules_store: HashMap<String, Vec<crate::game_link::HitboxRuleWire>>,
     /// Live effect spawn rules per "fighter/move" (suppress + per-spawn transform); the
@@ -3715,6 +3717,7 @@ impl VisionaryApp {
             eff_editor: crate::eff_editor::EffEditor::default(),
             game_link: crate::game_link::GameLink::default(),
             cancel_rules_store: HashMap::new(),
+            last_live_trait_rules: Vec::new(),
             live_overrides: crate::game_link::LiveOverrides::default(),
             eff_mods: HashMap::new(),
             carrier_push_callers: Vec::new(),
@@ -18194,6 +18197,52 @@ If you step every basis for a                          type and NONE of them mat
             .to_motion_module_set_rate_partial_events();
     }
 
+    /// Only two float fighter attributes have a runtime path in the test plugin.
+    /// Other trait edits continue to use the existing file export / next-load path.
+    fn live_trait_rules(&self) -> Vec<crate::game_link::TraitRuleWire> {
+        use crate::mod_project::ParamValue;
+
+        self.roster
+            .params
+            .iter()
+            .filter_map(|(fighter, params)| {
+                let fields = crate::roster::traits::edits_for(params);
+                let weight = match fields.get("weight") {
+                    Some(ParamValue::Float(value))
+                        if value.is_finite() && *value > 0.0 && *value <= 1000.0 =>
+                    {
+                        Some(*value)
+                    }
+                    _ => None,
+                };
+                let air_speed_x_stable = match fields.get("air_speed_x_stable") {
+                    Some(ParamValue::Float(value))
+                        if value.is_finite() && *value >= 0.0 && *value <= 20.0 =>
+                    {
+                        Some(*value)
+                    }
+                    _ => None,
+                };
+                if weight.is_none() && air_speed_x_stable.is_none() {
+                    return None;
+                }
+                Some(crate::game_link::TraitRuleWire {
+                    fighter: fighter.clone(),
+                    weight,
+                    air_speed_x_stable,
+                })
+            })
+            .collect()
+    }
+
+    fn sync_live_traits(&mut self) {
+        let rules = self.live_trait_rules();
+        if self.last_live_trait_rules != rules {
+            self.game_link.send_trait_rules(&rules);
+            self.last_live_trait_rules = rules;
+        }
+    }
+
     /// Publish the complete flattened ACMD live-rule union currently staged in the keyed stores.
     /// Project loading calls this only after its all-family send barrier is lifted; ordinary
     /// rebuilds use it after their narrower rule batch ends.
@@ -21301,6 +21350,7 @@ If you step every basis for a                          type and NONE of them mat
         self.hitbox_rules_store.clear();
         self.cancel_rules_store.clear();
         self.game_link.send_cancel_rules(&[]);
+        self.game_link.send_trait_rules(&[]);
         self.game_link.send_spawn_rules(&[]);
         self.game_link.send_effect_control_rules(&[]);
         self.game_link.send_hitbox_rules(&[]);
@@ -35674,6 +35724,7 @@ impl eframe::App for VisionaryApp {
             self.state.data_root.as_ref(),
             &self.state.labels,
         );
+        self.sync_live_traits();
         // Deploy stages from in-memory state, so flush the project alongside
         // it — `build_project` carries the roster edits (order, names, new
         // characters, traits), keeping the file on disk level with the SD.
@@ -35972,6 +36023,7 @@ impl eframe::App for VisionaryApp {
                 }
                 self.push_effect_aliases();
                 self.publish_cancel_rules();
+                self.game_link.send_trait_rules(&self.live_trait_rules());
                 self.live_overrides.resend_tweaks(&self.game_link);
             }
         }

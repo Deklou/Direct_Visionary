@@ -1314,6 +1314,7 @@ struct Shared {
 /// the plugin's entire list for its family, so only the newest per marker matters;
 /// intermediate states replay stale edits and churn per-playback injection identity.
 const FULL_REPLACE_MARKERS: &[&str] = &[
+    "\"trait_rules\":",
     "\"spawn_rules\":",
     "\"hitbox_rules\":",
     "\"cancel_rules\":",
@@ -1423,6 +1424,14 @@ impl Default for Shared {
     }
 }
 
+/// Experimental per-fighter overrides; only two float attributes are sent live.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TraitRuleWire {
+    pub fighter: String,
+    pub weight: Option<f32>,
+    pub air_speed_x_stable: Option<f32>,
+}
+
 pub struct GameLink {
     shared: Arc<Mutex<Shared>>,
     started: AtomicBool,
@@ -1522,6 +1531,21 @@ impl GameLink {
             .lock()
             .map(|s| s.kinds.contains_key(&id))
             .unwrap_or(false)
+    }
+
+    /// Replace the complete live fighter-trait snapshot. An empty list restores vanilla reads.
+    pub fn send_trait_rules(&self, rules: &[TraitRuleWire]) {
+        if self.sends_suppressed() {
+            return;
+        }
+        let Ok(payload) = serde_json::to_string(&serde_json::json!({ "trait_rules": rules })) else {
+            return;
+        };
+        let frame = format!("<TCP_MESSAGE>{payload}</TCP_MESSAGE>");
+        if let Ok(mut s) = self.shared.lock() {
+            queue_latest_full_replace(&mut s.outbox, frame);
+            s.edits_tx += 1;
+        }
     }
 
     /// Replace all experimental custom cancels. Empty disables the override.
