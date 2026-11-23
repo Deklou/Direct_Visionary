@@ -358,6 +358,15 @@ fn parse_tcp_payload(raw: &str) -> Option<ParsedEdit> {
         return None;
     }
 
+    // Experimental fighter hurtbox geometry. Socket thread stages data only.
+    if let Some(value) = v.get("hurtbox_geometry_rules") {
+        match serde_json::from_value::<Vec<crate::slight::hurtbox_geometry::GeometryRule>>(value.clone()) {
+            Ok(rules) => crate::slight::hurtbox_geometry::set_rules(rules),
+            Err(error) => crate::slight::diag::note(format!("hurtbox geometry parse error: {error}")),
+        }
+        return None;
+    }
+
     // Hitbox rules: full-list replace (modify/suppress/inject ATTACKs).
     if let Some(rules_v) = v.get("hitbox_rules") {
         match serde_json::from_value::<Vec<crate::slight::hitbox_viewer::HitboxRule>>(
