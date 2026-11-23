@@ -21,6 +21,17 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
+#[derive(Clone, Debug, Serialize, PartialEq)]
+pub struct HurtboxGeometryWire {
+    pub fighter_kind: i32,
+    pub index: u32,
+    pub bone: u64,
+    pub endpoint1: [f32; 3],
+    pub endpoint2: [f32; 3],
+    pub radius: f32,
+    pub status: i32,
+}
+
 pub const PLUGIN_ADDR: &str = "127.0.0.1:7878";
 const DEFAULT_PLUGIN_PORT: u16 = 7878;
 /// How long a `connect()` may take before the attempt is abandoned. The emulator's
@@ -1317,6 +1328,7 @@ const FULL_REPLACE_MARKERS: &[&str] = &[
     "\"trait_rules\":",
     "\"spawn_rules\":",
     "\"hitbox_rules\":",
+    "\"hurtbox_geometry_rules\":",
     "\"cancel_rules\":",
     "\"effect_control_rules\":",
     "\"effect_aliases\":",
@@ -1530,6 +1542,23 @@ impl GameLink {
             .lock()
             .map(|s| s.kinds.contains_key(&id))
             .unwrap_or(false)
+    }
+
+    /// Replace the session-only fighter hurtbox geometry preview.
+    pub fn send_hurtbox_geometry_rules(&self, rules: &[HurtboxGeometryWire]) {
+        if self.sends_suppressed() {
+            return;
+        }
+        let Ok(payload) = serde_json::to_string(
+            &serde_json::json!({ "hurtbox_geometry_rules": rules })
+        ) else {
+            return;
+        };
+        let frame = format!("<TCP_MESSAGE>{payload}</TCP_MESSAGE>");
+        if let Ok(mut s) = self.shared.lock() {
+            queue_latest_full_replace(&mut s.outbox, frame);
+            s.edits_tx += 1;
+        }
     }
 
     /// Replace the complete live fighter-trait snapshot. An empty list restores vanilla reads.
