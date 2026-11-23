@@ -5,6 +5,7 @@ pub mod diag;
 pub mod effect_viewer;
 pub mod extras;
 pub mod frame_context;
+pub mod fighter_traits;
 pub mod hitbox_viewer;
 pub mod jab_cancel;
 pub mod main_smash;

@@ -33,6 +33,9 @@ pub fn smashline_install() {
     if !slight::smash_utils::subsystem_disabled("systems") {
         slight::main_smash::install_all();
         slight::jab_cancel::install();
+        if !slight::smash_utils::subsystem_disabled("traits") {
+            slight::fighter_traits::install();
+        }
     }
 
     skyline::println!(
