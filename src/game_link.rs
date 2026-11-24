@@ -2071,7 +2071,29 @@ fn link_thread(shared: Arc<Mutex<Shared>>) {
     }
 }
 
+// Opt-in desktop trace; no payload contents or game data are written.
+fn tcp_trace(file: &mut Option<std::fs::File>, message: std::fmt::Arguments<'_>) {
+    if let Some(file) = file {
+        let ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let _ = writeln!(file, "{ms} {message}");
+    }
+}
+
 fn serve_connection(shared: &Arc<Mutex<Shared>>, mut stream: TcpStream) -> Option<String> {
+    let mut trace = std::env::var_os("VISIONARY_TCP_DIAG").and_then(|path| {
+        std::fs::OpenOptions::new().create(true).append(true).open(path).ok()
+    });
+    tcp_trace(&mut trace, format_args!("connected"));
+    let mut report_at = Instant::now();
+    let mut rx_bytes = 0u64;
+    let mut rx_frames = 0u64;
+    let mut rx_handle_max = Duration::ZERO;
+    let mut tx_bytes = 0u64;
+    let mut tx_frames = 0u64;
+    let mut loop_max = Duration::ZERO;
     let _ = stream.set_read_timeout(Some(READ_TIMEOUT));
     let _ = stream.set_write_timeout(Some(WRITE_TIMEOUT));
     let _ = stream.set_nodelay(true);
@@ -2097,6 +2119,7 @@ fn serve_connection(shared: &Arc<Mutex<Shared>>, mut stream: TcpStream) -> Optio
     };
 
     loop {
+        let loop_start = Instant::now();
         // Outbound edits first — they're latency-sensitive.
         let pending: Vec<String> = {
             let mut s = shared.lock().unwrap();
@@ -2106,10 +2129,17 @@ fn serve_connection(shared: &Arc<Mutex<Shared>>, mut stream: TcpStream) -> Optio
         retain_latest_full_replace(&mut pending);
         let mut failed_at: Option<(usize, String)> = None;
         for (index, msg) in pending.iter().enumerate() {
-            if let Err(e) = stream.write_all(msg.as_bytes()) {
+            let start = Instant::now();
+            let result = stream.write_all(msg.as_bytes());
+            tcp_trace(&mut trace, format_args!(
+                "tx bytes={} elapsed_ms={:.2} ok={}", msg.len(), start.elapsed().as_secs_f64() * 1000.0, result.is_ok()
+            ));
+            if let Err(e) = result {
                 failed_at = Some((index, format!("send: {e}")));
                 break;
             }
+            tx_bytes += msg.len() as u64;
+            tx_frames += 1;
         }
         if let Some((index, reason)) = failed_at {
             // `index` failed; it and everything after it never hit the wire.
@@ -2125,24 +2155,45 @@ fn serve_connection(shared: &Arc<Mutex<Shared>>, mut stream: TcpStream) -> Optio
             ping_seq = ping_seq.wrapping_add(1);
             let ping =
                 format!("<TCP_MESSAGE>{{\"command\":\"ping\",\"echo\":{ping_seq}}}</TCP_MESSAGE>");
-            if let Err(e) = stream.write_all(ping.as_bytes()) {
+            let start = Instant::now();
+            let result = stream.write_all(ping.as_bytes());
+            tcp_trace(&mut trace, format_args!("ping seq={ping_seq} elapsed_ms={:.2} ok={}", start.elapsed().as_secs_f64() * 1000.0, result.is_ok()));
+            if let Err(e) = result {
                 return Some(format!("send ping: {e}"));
             }
+            tx_bytes += ping.len() as u64;
+            tx_frames += 1;
             last_ping = Instant::now();
         }
 
         match stream.read(&mut chunk) {
             Ok(0) => return Some("closed by plugin".into()),
             Ok(n) => {
+                let start = Instant::now();
+                rx_bytes += n as u64;
                 buf.push_str(&String::from_utf8_lossy(&chunk[..n]));
                 for payload in extract_frames(&mut buf) {
                     handle_frame(shared, &payload);
+                    rx_frames += 1;
                 }
+                rx_handle_max = rx_handle_max.max(start.elapsed());
             }
             Err(e)
                 if e.kind() == std::io::ErrorKind::WouldBlock
                     || e.kind() == std::io::ErrorKind::TimedOut => {}
             Err(e) => return Some(format!("recv: {e}")),
+        }
+
+        loop_max = loop_max.max(loop_start.elapsed());
+        if report_at.elapsed() >= Duration::from_secs(1) {
+            tcp_trace(&mut trace, format_args!("stats interval_ms={:.1} tx_frames={tx_frames} tx_bytes={tx_bytes} rx_frames={rx_frames} rx_bytes={rx_bytes} rx_handle_max_ms={:.2} loop_max_ms={:.2}", report_at.elapsed().as_secs_f64() * 1000.0, rx_handle_max.as_secs_f64() * 1000.0, loop_max.as_secs_f64() * 1000.0));
+            report_at = Instant::now();
+            rx_bytes = 0;
+            rx_frames = 0;
+            rx_handle_max = Duration::ZERO;
+            tx_bytes = 0;
+            tx_frames = 0;
+            loop_max = Duration::ZERO;
         }
 
         // Half-open detector: pings guarantee regular traffic, and the plugin emits a

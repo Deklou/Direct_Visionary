@@ -1,6 +1,6 @@
 //! Jorge rust_extender TCP simple_server — :7878, `<TCP_MESSAGE>` framing.
 
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::thread;
 
 use parking_lot::Mutex;
@@ -12,7 +12,7 @@ static CLIENT_FD: AtomicI32 = AtomicI32::new(-1);
 static CLIENT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static STARTED: AtomicBool = AtomicBool::new(false);
 static OUTBOX: Mutex<Vec<String>> = Mutex::new(Vec::new());
-static INBOUND: Mutex<Vec<String>> = Mutex::new(Vec::new());
+static INBOUND: Mutex<Vec<(String, u64)>> = Mutex::new(Vec::new());
 static RECV_BUF: Mutex<String> = Mutex::new(String::new());
 // `handshake` runs on the accept thread while `drain` runs on the sender thread.  Both write
 // to the same stream, so a reconnect with queued frames could otherwise interleave bytes from
@@ -30,6 +30,94 @@ const SEND_BATCH_CAP: usize = 256;
 const FRAME_OPEN: &str = "<TCP_MESSAGE>";
 const FRAME_CLOSE: &str = "</TCP_MESSAGE>";
 const PONG_INNER: &str = r#"{"header":"Pong","body":"{}"}"#;
+
+// Temporary transport diagnostics. All counters are cumulative since boot.
+const FAMILIES: [&str; 12] = [
+    "AcmdCapture", "AcmdCaptureEnd", "AcmdCaptureDebug", "Notify",
+    "CarrierStatus", "AssetBundleStatus", "Pong", "Remove", "RemoveAll",
+    "AgentInfo", "Multipliers", "Other",
+];
+
+struct Traffic {
+    queued: AtomicU64,
+    bytes: AtomicU64,
+    sent: AtomicU64,
+    sent_bytes: AtomicU64,
+    dropped: AtomicU64,
+}
+
+impl Traffic {
+    const fn new() -> Self {
+        Self {
+            queued: AtomicU64::new(0),
+            bytes: AtomicU64::new(0),
+            sent: AtomicU64::new(0),
+            sent_bytes: AtomicU64::new(0),
+            dropped: AtomicU64::new(0),
+        }
+    }
+}
+
+static TRAFFIC: [Traffic; FAMILIES.len()] = [const { Traffic::new() }; FAMILIES.len()];
+static SENDER_STAGE: AtomicU64 = AtomicU64::new(0);
+static SENDER_TICK: AtomicU64 = AtomicU64::new(0);
+static SEND_STARTED: AtomicU64 = AtomicU64::new(0);
+static SEND_CALLS: AtomicU64 = AtomicU64::new(0);
+static SEND_MAX: AtomicU64 = AtomicU64::new(0);
+static SEND_ERRORS: AtomicU64 = AtomicU64::new(0);
+static SEND_BYTES: AtomicU64 = AtomicU64::new(0);
+static IN_FLIGHT: AtomicU64 = AtomicU64::new(0);
+static RX_BYTES: AtomicU64 = AtomicU64::new(0);
+static RX_MESSAGES: AtomicU64 = AtomicU64::new(0);
+static RX_MAX_WAIT: AtomicU64 = AtomicU64::new(0);
+static RX_DISPATCHED: AtomicU64 = AtomicU64::new(0);
+static RX_FAST: AtomicU64 = AtomicU64::new(0);
+static REQUEUED: AtomicU64 = AtomicU64::new(0);
+
+fn traffic(inner: &str) -> &'static Traffic {
+    let header = inner.strip_prefix("{\"header\":\"")
+        .and_then(|rest| rest.split_once('"'))
+        .map(|(header, _)| header);
+    let index = FAMILIES.iter().position(|name| Some(*name) == header)
+        .unwrap_or(FAMILIES.len() - 1);
+    &TRAFFIC[index]
+}
+
+pub fn tick_now() -> u64 {
+    unsafe { nnsdk::nn::os::GetSystemTick() as u64 }
+}
+
+fn elapsed_ms(ticks: u64) -> f64 {
+    ticks as f64 / 19_200.0
+}
+
+fn sender_stage(stage: u64) {
+    SENDER_TICK.store(tick_now(), Ordering::Relaxed);
+    SENDER_STAGE.store(stage, Ordering::Relaxed);
+}
+
+pub fn note_network_stats(frame: u64) {
+    let load = |v: &AtomicU64| v.load(Ordering::Relaxed);
+    let now = tick_now();
+    let started = load(&SEND_STARTED);
+    let stage_tick = load(&SENDER_TICK);
+    let outbox = OUTBOX.try_lock().map(|q| q.len());
+    let inbound = INBOUND.try_lock().map(|q| q.len());
+    crate::slight::diag::note(format!(
+        "TCP frame={frame} tick={now} client={} outbox={outbox:?} inbound={inbound:?} stage={} stage_ms={:.1} in_flight={} send_active_ms={:.1} send_calls={} send_max_ms={:.1} send_errors={} wire_tx_bytes={} rx_bytes={} rx_msgs={} rx_dispatched={} rx_fast={} rx_max_wait_ms={:.1} requeued={}",
+        client_id(), load(&SENDER_STAGE), if stage_tick == 0 { 0.0 } else { elapsed_ms(now.saturating_sub(stage_tick)) },
+        load(&IN_FLIGHT), if started == 0 { 0.0 } else { elapsed_ms(now.saturating_sub(started)) },
+        load(&SEND_CALLS), elapsed_ms(load(&SEND_MAX)), load(&SEND_ERRORS), load(&SEND_BYTES),
+        load(&RX_BYTES), load(&RX_MESSAGES), load(&RX_DISPATCHED), load(&RX_FAST), elapsed_ms(load(&RX_MAX_WAIT)), load(&REQUEUED),
+    ));
+    let mut row = format!("TCP families frame={frame} queued/bytes/sent/bytes/dropped");
+    for (name, stats) in FAMILIES.iter().zip(TRAFFIC.iter()) {
+        use std::fmt::Write;
+        let _ = write!(row, " {name}={}/{}/{}/{}/{}", load(&stats.queued),
+            load(&stats.bytes), load(&stats.sent), load(&stats.sent_bytes), load(&stats.dropped));
+    }
+    crate::slight::diag::note(row);
+}
 
 extern "C" {
     #[link_name = "\u{1}_ZN2nn6socket4RecvEiPvmi"]
@@ -65,6 +153,7 @@ fn sleep_ms(ms: u64) {
 fn sender_loop() {
     crate::slight::diag::note("SND thread entered");
     loop {
+        sender_stage(0);
         let fd = CLIENT_FD.load(Ordering::Acquire);
         if fd >= 0 {
             unsafe { drain(fd) };
@@ -269,13 +358,24 @@ unsafe fn send_frame_unlocked(client: i32, inner: &str) -> i64 {
     let mut sent = 0usize;
     while sent < bytes.len() {
         let remaining = bytes.len() - sent;
+        let start = tick_now();
+        SEND_STARTED.store(start, Ordering::Relaxed);
         let n =
             nnsdk::nn::socket::Send(client, bytes.as_ptr().add(sent), remaining as u64, 0) as i64;
+        SEND_STARTED.store(0, Ordering::Relaxed);
+        SEND_CALLS.fetch_add(1, Ordering::Relaxed);
+        SEND_MAX.fetch_max(tick_now().saturating_sub(start), Ordering::Relaxed);
         if n <= 0 || n as usize > remaining {
+            SEND_ERRORS.fetch_add(1, Ordering::Relaxed);
+            crate::slight::diag::note(format!("TCP send rc={n} remaining={remaining}"));
             return -1;
         }
+        SEND_BYTES.fetch_add(n as u64, Ordering::Relaxed);
         sent += n as usize;
     }
+    let stats = traffic(inner);
+    stats.sent.fetch_add(1, Ordering::Relaxed);
+    stats.sent_bytes.fetch_add(sent as u64, Ordering::Relaxed);
     sent as i64
 }
 
@@ -289,6 +389,7 @@ unsafe fn recv_once(client: i32) {
         crate::slight::diag::note(format!("SRV recv fd={client} rc={n} — client disconnected"));
         return;
     }
+    RX_BYTES.fetch_add(n as u64, Ordering::Relaxed);
     let text = String::from_utf8_lossy(&chunk[..n as usize]);
     let mut buf = RECV_BUF.lock();
     buf.push_str(&text);
@@ -357,21 +458,27 @@ fn extract_payloads(buf: &mut String) -> Vec<String> {
 /// Server thread → INBOUND. try_lock + SleepThread retry — never parks (parked waiters
 /// never wake in this environment).
 fn inbound_push(payload: String) {
+    let received = tick_now();
+    RX_MESSAGES.fetch_add(1, Ordering::Relaxed);
+    crate::slight::diag::note(format!("TCP rx tick={received} bytes={}", payload.len()));
     // Heartbeats belong to the transport rather than the game-frame pump. Answer here so a
     // paused or heavily loaded game still proves that its socket thread is alive.
     if is_ping(&payload) {
         queue_pong();
+        RX_FAST.fetch_add(1, Ordering::Relaxed);
         return;
     }
     // Timing rules are pure shared state. Install them on receipt so the next ACMD coroutine
     // boundary can see a frame-0 edit; the general parser below remains responsible for all
     // commands and game-thread-only updates.
     if crate::rust_extender::debuggable_server::apply_timing_rules_from_network(&payload) {
+        RX_FAST.fetch_add(1, Ordering::Relaxed);
+        crate::slight::diag::note(format!("TCP fast dispatch tick={} bytes={} elapsed_ms={:.2}", tick_now(), payload.len(), elapsed_ms(tick_now().saturating_sub(received))));
         return;
     }
     loop {
         if let Some(mut q) = INBOUND.try_lock() {
-            q.push(payload);
+            q.push((payload, received));
             return;
         }
         sleep_ms(1);
@@ -387,6 +494,9 @@ fn is_ping(payload: &str) -> bool {
 }
 
 pub fn queue(inner: String) {
+    let stats = traffic(&inner);
+    stats.queued.fetch_add(1, Ordering::Relaxed);
+    stats.bytes.fetch_add(inner.len() as u64, Ordering::Relaxed);
     // Push only — the sender thread does the (blocking) Send. Never send from here: this is
     // called on the game thread, and a blocking Send while RPM is slow would stall the frame.
     // try_lock + short spin — NEVER park the game thread (parked waiters never wake here).
@@ -396,16 +506,20 @@ pub fn queue(inner: String) {
             // Bound growth if RPM is stuck; drop newest.
             if out.len() < OUTBOX_CAP {
                 out.push(inner);
+            } else {
+                stats.dropped.fetch_add(1, Ordering::Relaxed);
             }
             return;
         }
         core::hint::spin_loop();
     }
+    stats.dropped.fetch_add(1, Ordering::Relaxed);
 }
 
 unsafe fn drain(client: i32) {
     // Take the batch out under the lock, then release before the blocking sends so `queue`
     // (game thread) never waits on the socket via the OUTBOX lock. Sender thread may sleep.
+    sender_stage(1);
     let msgs: Vec<String> = loop {
         if let Some(mut out) = OUTBOX.try_lock() {
             let count = out.len().min(SEND_BATCH_CAP);
@@ -416,17 +530,23 @@ unsafe fn drain(client: i32) {
     if !msgs.is_empty() {
         crate::slight::diag::note(format!("SND drain {} msgs", msgs.len()));
     }
+    IN_FLIGHT.store(msgs.len() as u64, Ordering::Relaxed);
+    sender_stage(2);
     let _send_guard = send_guard();
+    sender_stage(3);
     for (index, msg) in msgs.iter().enumerate() {
         let rc = send_frame_unlocked(client, msg);
         if rc < 0 {
             crate::slight::diag::note(format!("SND send failed rc={rc}"));
             // The current frame may have been partially written, so it must be retried only on
             // a fresh TCP connection. Requeue it and every later frame in their original order.
+            sender_stage(4);
             requeue_front(msgs.into_iter().skip(index).collect());
+            IN_FLIGHT.store(0, Ordering::Relaxed);
             mark_client_disconnected(client);
             return;
         }
+        IN_FLIGHT.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -434,12 +554,16 @@ fn requeue_front(unsent: Vec<String>) {
     if unsent.is_empty() {
         return;
     }
+    REQUEUED.fetch_add(unsent.len() as u64, Ordering::Relaxed);
     loop {
         if let Some(mut out) = OUTBOX.try_lock() {
             let mut combined = unsent;
             combined.extend(out.drain(..));
             // Keep the same oldest-first/drop-newest policy as `queue` while preserving all
             // frames that were already in flight ahead of newer edits.
+            for message in combined.iter().skip(OUTBOX_CAP) {
+                traffic(message).dropped.fetch_add(1, Ordering::Relaxed);
+            }
             combined.truncate(OUTBOX_CAP);
             *out = combined;
             return;
@@ -474,7 +598,13 @@ fn queue_pong() {
     loop {
         if let Some(mut out) = OUTBOX.try_lock() {
             if !out.iter().any(|message| message == PONG_INNER) {
+                let stats = traffic(PONG_INNER);
+                stats.queued.fetch_add(1, Ordering::Relaxed);
+                stats.bytes.fetch_add(PONG_INNER.len() as u64, Ordering::Relaxed);
                 out.insert(0, PONG_INNER.to_owned());
+                for message in out.iter().skip(OUTBOX_CAP) {
+                    traffic(message).dropped.fetch_add(1, Ordering::Relaxed);
+                }
                 out.truncate(OUTBOX_CAP);
             }
             return;
@@ -495,7 +625,17 @@ pub fn client_id() -> u64 {
 /// instead of parking (parked waiters never wake here).
 pub fn take_inbound() -> Vec<String> {
     match INBOUND.try_lock() {
-        Some(mut q) => q.drain(..).collect(),
+        Some(mut q) => {
+            let batch = std::mem::take(&mut *q);
+            drop(q);
+            let now = tick_now();
+            batch.into_iter().map(|(payload, received)| {
+                RX_DISPATCHED.fetch_add(1, Ordering::Relaxed);
+                RX_MAX_WAIT.fetch_max(now.saturating_sub(received), Ordering::Relaxed);
+                crate::slight::diag::note(format!("TCP dispatch tick={now} bytes={} wait_ms={:.2}", payload.len(), elapsed_ms(now.saturating_sub(received))));
+                payload
+            }).collect()
+        },
         None => Vec::new(),
     }
 }

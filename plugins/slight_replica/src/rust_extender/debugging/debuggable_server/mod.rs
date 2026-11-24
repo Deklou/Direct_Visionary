@@ -246,9 +246,12 @@ struct IncomingEdit {
 pub fn poll_tcp_edits() -> Vec<ParsedEdit> {
     let mut out = Vec::new();
     for raw in crate::rust_extender::net::simple_server::take_inbound() {
+        let start = crate::rust_extender::net::simple_server::tick_now();
         if let Some(edit) = parse_tcp_payload(&raw) {
             out.push(edit);
         }
+        let end = crate::rust_extender::net::simple_server::tick_now();
+        crate::slight::diag::note(format!("TCP parsed tick={end} bytes={} elapsed_ms={:.2}", raw.len(), end.saturating_sub(start) as f64 / 19_200.0));
     }
     out
 }

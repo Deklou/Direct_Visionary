@@ -37,6 +37,8 @@ function Start-Visionary {
         throw "Dossier Visionary introuvable : $sdDir"
     }
     $env:VISIONARY_SD_DIR = $sdDir
+    $env:VISIONARY_TCP_DIAG = Join-Path $sdDir ("tcp-visionary-" + (Get-Date -Format 'yyyyMMdd-HHmmss-fff') + '.log')
+    Write-Host "Diagnostic TCP : $env:VISIONARY_TCP_DIAG"
     Write-Host 'Lancement de Visionary...'
     & $gui
 }
@@ -54,8 +56,8 @@ Push-Location $repo
 try {
     $branch = (& git branch --show-current).Trim()
     Test-LastExit 'git branch'
-    if ($branch -ne 'dev') {
-        throw "Branche '$branch' : compilation de test autorisee uniquement sur dev."
+    if ($branch -notin @('dev', 'test/tcp-communication')) {
+        throw "Branche '$branch' : compilation de test autorisee uniquement sur dev ou test/tcp-communication."
     }
     if (Get-Process -Name visionary -ErrorAction SilentlyContinue) {
         throw 'Ferme Visionary avant de compiler.'
