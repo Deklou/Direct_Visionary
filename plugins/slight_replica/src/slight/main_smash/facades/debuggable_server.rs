@@ -7,6 +7,7 @@ use std::sync::atomic::AtomicU64;
 const NOTIFY_EVERY: u64 = 10;
 const MAX_NOTIFY_PER_TICK: usize = 32;
 const CAPTURE_DEBUG_EVERY: u64 = 60;
+const BACKLOG_STATS_EVERY: u64 = 600;
 
 static FRAME: AtomicU64 = AtomicU64::new(0);
 
@@ -73,7 +74,9 @@ impl Facade for DebuggableServerFacade {
                         crate::rust_extender::debuggable_server::notify_acmd_capture_debug(&snapshot);
                     }
                 }
-                crate::slight::hitbox_viewer::note_capture_backlog(n);
+                if n % BACKLOG_STATS_EVERY == 0 {
+                    crate::slight::hitbox_viewer::note_capture_backlog(n);
+                }
             }
         }
         crate::slight::pending::process();

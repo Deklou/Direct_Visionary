@@ -183,7 +183,7 @@ pub fn note_stats(
     live_weapons: usize,
 ) {
     let (fmin, favg, fmax) = take_frame_ms();
-    if frame % 60 == 0 {
+    if frame % 600 == 0 {
         crate::rust_extender::net::simple_server::note_network_stats(frame);
     }
     push(format!(

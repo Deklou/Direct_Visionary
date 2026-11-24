@@ -37,8 +37,6 @@ function Start-Visionary {
         throw "Dossier Visionary introuvable : $sdDir"
     }
     $env:VISIONARY_SD_DIR = $sdDir
-    $env:VISIONARY_TCP_DIAG = Join-Path $sdDir ("tcp-visionary-" + (Get-Date -Format 'yyyyMMdd-HHmmss-fff') + '.log')
-    Write-Host "Diagnostic TCP : $env:VISIONARY_TCP_DIAG"
     Write-Host 'Lancement de Visionary...'
     & $gui
 }

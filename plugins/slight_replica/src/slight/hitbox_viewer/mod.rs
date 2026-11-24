@@ -980,7 +980,7 @@ fn clear_captures_if_requested() {
     crate::slight::diag::note("live ACMD captures cleared");
 }
 
-/// Expose source backlog as well as transport depth: throttling must not hide accumulation.
+/// Report the capture backlog separately from the transport queue.
 pub fn note_capture_backlog(frame: u64) {
     let depths = CAPTURE_STATE.try_lock().map(|state| (state.pending.len(), state.ends.len()));
     crate::slight::diag::note(format!(
