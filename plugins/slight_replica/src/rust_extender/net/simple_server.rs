@@ -18,6 +18,9 @@ static RECV_BUF: Mutex<String> = Mutex::new(String::new());
 // to the same stream, so a reconnect with queued frames could otherwise interleave bytes from
 // the handshake and the first queued message and make the XML-like framing unrecoverable.
 static SEND_LOCK: Mutex<()> = Mutex::new(());
+// Serialize individual SDK calls, not entire batches. Some BSD implementations
+// temporarily change socket blocking mode for MSG_DONTWAIT.
+static IO_LOCK: Mutex<()> = Mutex::new(());
 static mut SOCKET_POOL: [u8; 0x40000] = [0; 0x40000];
 
 const AF_INET: i32 = 2;
@@ -25,6 +28,13 @@ const SOCK_STREAM: i32 = 1;
 const IPPROTO_TCP: i32 = 6;
 const SOL_SOCKET: i32 = 0xffff;
 const SO_REUSEADDR: i32 = 4;
+// Switch BSD message flags (libnx sys/socket.h), not Linux host flags.
+// Nintendo's BSD service uses Linux errno values (Switchbrew Sockets services).
+const MSG_DONTWAIT: i32 = 0x80;
+const EINTR: u32 = 4;
+const EAGAIN: u32 = 11;
+const SEND_STALL_MS: f64 = 10_000.0;
+const CAPTURE_HIGH_WATER: usize = 512;
 const OUTBOX_CAP: usize = 8192;
 const SEND_BATCH_CAP: usize = 256;
 const SEND_BATCH_BYTES: usize = 16 * 1024;
@@ -74,6 +84,13 @@ static RX_MAX_WAIT: AtomicU64 = AtomicU64::new(0);
 static RX_DISPATCHED: AtomicU64 = AtomicU64::new(0);
 static RX_FAST: AtomicU64 = AtomicU64::new(0);
 static REQUEUED: AtomicU64 = AtomicU64::new(0);
+static SEND_RETRIES: AtomicU64 = AtomicU64::new(0);
+static RECV_RETRIES: AtomicU64 = AtomicU64::new(0);
+static COALESCED: AtomicU64 = AtomicU64::new(0);
+
+fn retryable_socket_error(errno: u32) -> bool {
+    matches!(errno, EINTR | EAGAIN)
+}
 
 fn traffic(inner: &str) -> &'static Traffic {
     let header = inner.strip_prefix("{\"header\":\"")
@@ -111,6 +128,10 @@ pub fn note_network_stats(frame: u64) {
         load(&SEND_CALLS), elapsed_ms(load(&SEND_MAX)), load(&SEND_ERRORS), load(&SEND_BYTES),
         load(&RX_BYTES), load(&RX_MESSAGES), load(&RX_DISPATCHED), load(&RX_FAST), elapsed_ms(load(&RX_MAX_WAIT)), load(&REQUEUED),
     ));
+    crate::slight::diag::note(format!(
+        "TCP flow frame={frame} send_retries={} recv_retries={} coalesced={}",
+        load(&SEND_RETRIES), load(&RECV_RETRIES), load(&COALESCED),
+    ));
     let mut row = format!("TCP families frame={frame} queued/bytes/sent/bytes/dropped");
     for (name, stats) in FAMILIES.iter().zip(TRAFFIC.iter()) {
         use std::fmt::Write;
@@ -135,8 +156,7 @@ pub fn start(port: u16) {
     }
     crate::slight::diag::note(format!("SRV start(:{port}) — spawning server_loop"));
     thread::spawn(move || server_loop(port));
-    // Dedicated sender: the ONLY place blocking Send() runs. Keeps it off the game thread so a
-    // slow RPM can never stall a frame (it just backs up in OUTBOX). See `queue`.
+    // Keep socket writes and retries off the game thread.
     thread::spawn(sender_loop);
 }
 
@@ -152,7 +172,7 @@ fn sleep_ms(ms: u64) {
 }
 
 fn sender_loop() {
-    crate::slight::diag::note(format!("SND thread entered — batch v1 max={SEND_BATCH_BYTES} bytes/{SEND_BATCH_CAP} frames"));
+    crate::slight::diag::note(format!("SND thread entered — batch v2 nonblocking max={SEND_BATCH_BYTES} bytes/{SEND_BATCH_CAP} frames"));
     loop {
         sender_stage(0);
         let cid = client_id();
@@ -167,6 +187,18 @@ fn sender_loop() {
 /// Messages queued and not yet sent (diagnostic — growth = sender thread dead/stuck).
 pub fn outbox_depth() -> usize {
     OUTBOX.try_lock().map(|out| out.len()).unwrap_or_default()
+}
+
+/// Budget only for streaming captures. Other events keep their existing queue capacity.
+/// On lock contention, leave records in their source rather than draining them.
+pub fn capture_budget(max: usize) -> usize {
+    if !has_client() {
+        return max;
+    }
+    OUTBOX.try_lock().map_or(0, |out| {
+        let queued = out.len().saturating_add(IN_FLIGHT.load(Ordering::Relaxed) as usize);
+        max.min(CAPTURE_HIGH_WATER.saturating_sub(queued))
+    })
 }
 
 fn server_loop(port: u16) {
@@ -247,6 +279,7 @@ fn server_loop(port: u16) {
                 &mut len,
             ) as i32;
             if client < 0 {
+                sleep_ms(20);
                 continue;
             }
             RECV_BUF.lock().clear();
@@ -262,7 +295,7 @@ fn server_loop(port: u16) {
             };
             CLIENT_FD.store(client, Ordering::Release);
             crate::rust_extender::debuggable_server::on_rpm_client_connected(cid);
-            // Inbound only. Recv blocks until data/disconnect; outbound is the sender thread's job.
+            // Poll nonblocking receive so an idle desktop cannot monopolize the BSD service.
             while CLIENT_FD.load(Ordering::Acquire) == client {
                 recv_once(client);
             }
@@ -346,6 +379,15 @@ fn send_guard() -> parking_lot::MutexGuard<'static, ()> {
     }
 }
 
+fn io_guard() -> parking_lot::MutexGuard<'static, ()> {
+    loop {
+        if let Some(guard) = IO_LOCK.try_lock() {
+            return guard;
+        }
+        sleep_ms(1);
+    }
+}
+
 fn frame_len(inner: &str) -> usize {
     FRAME_OPEN.len() + inner.len() + FRAME_CLOSE.len()
 }
@@ -389,23 +431,42 @@ unsafe fn send_batch_unlocked(
     let (bytes, ends) = encode_batch(messages);
     let mut sent = 0usize;
     let mut completed = 0usize;
+    let mut last_progress = tick_now();
     while sent < bytes.len() {
         let remaining = bytes.len() - sent;
-        let start = tick_now();
-        SEND_STARTED.store(start, Ordering::Relaxed);
-        let n =
-            nnsdk::nn::socket::Send(client, bytes.as_ptr().add(sent), remaining as u64, 0) as i64;
-        SEND_STARTED.store(0, Ordering::Relaxed);
-        SEND_CALLS.fetch_add(1, Ordering::Relaxed);
-        SEND_MAX.fetch_max(tick_now().saturating_sub(start), Ordering::Relaxed);
+        if track_in_flight && CLIENT_FD.load(Ordering::Acquire) != client {
+            return Err(completed);
+        }
+        let (n, errno) = {
+            let _io = io_guard();
+            let start = tick_now();
+            SEND_STARTED.store(start, Ordering::Relaxed);
+            let n = nnsdk::nn::socket::Send(
+                client, bytes.as_ptr().add(sent), remaining as u64, MSG_DONTWAIT
+            ) as i64;
+            let errno = if n < 0 { nnsdk::nn::socket::GetLastError() } else { 0 };
+            SEND_STARTED.store(0, Ordering::Relaxed);
+            SEND_CALLS.fetch_add(1, Ordering::Relaxed);
+            SEND_MAX.fetch_max(tick_now().saturating_sub(start), Ordering::Relaxed);
+            (n, errno)
+        };
+        if n < 0 && retryable_socket_error(errno) {
+            SEND_RETRIES.fetch_add(1, Ordering::Relaxed);
+            if elapsed_ms(tick_now().saturating_sub(last_progress)) < SEND_STALL_MS {
+                // Keep the byte offset; the receiver can run while we wait for buffer space.
+                sleep_ms(4);
+                continue;
+            }
+        }
         if n <= 0 || n as usize > remaining {
             SEND_ERRORS.fetch_add(1, Ordering::Relaxed);
             crate::slight::diag::note(format!(
-                "TCP send rc={n} remaining={remaining} completed={completed}/{}",
+                "TCP send rc={n} errno={errno} remaining={remaining} completed={completed}/{}",
                 messages.len()
             ));
             return Err(completed);
         }
+        last_progress = tick_now();
         SEND_BYTES.fetch_add(n as u64, Ordering::Relaxed);
         sent += n as usize;
         let next = ends.partition_point(|&end| end <= sent);
@@ -424,12 +485,22 @@ unsafe fn send_batch_unlocked(
 
 unsafe fn recv_once(client: i32) {
     let mut chunk = [0u8; 4096];
-    let n = Recv(client, chunk.as_mut_ptr(), chunk.len() as u64, 0);
-    if n <= 0 {
+    let (n, errno) = {
+        let _io = io_guard();
+        let n = Recv(client, chunk.as_mut_ptr(), chunk.len() as u64, MSG_DONTWAIT);
+        let errno = if n < 0 { nnsdk::nn::socket::GetLastError() } else { 0 };
+        (n, errno)
+    };
+    if n < 0 && retryable_socket_error(errno) {
+        RECV_RETRIES.fetch_add(1, Ordering::Relaxed);
+        sleep_ms(4);
+        return;
+    }
+    if n <= 0 || n as usize > chunk.len() {
         // A reset/error is just as terminal as EOF.  Leaving the fd live strands the accept
         // loop in this dead client forever, so the editor's reconnect attempts all fail.
         mark_client_disconnected(client);
-        crate::slight::diag::note(format!("SRV recv fd={client} rc={n} — client disconnected"));
+        crate::slight::diag::note(format!("SRV recv fd={client} rc={n} errno={errno} — client disconnected"));
         return;
     }
     RX_BYTES.fetch_add(n as u64, Ordering::Relaxed);
@@ -536,6 +607,31 @@ fn is_ping(payload: &str) -> bool {
         })
 }
 
+// Only identical pending snapshots are redundant. Preserve transitions, errors,
+// and all capture lines/end markers; never replace an earlier distinct state.
+fn redundant_snapshot(out: &[String], inner: &str) -> bool {
+    let Some(header) = inner.strip_prefix("{\"header\":\"")
+        .and_then(|rest| rest.split_once('"')).map(|(header, _)| header) else {
+        return false;
+    };
+    let (prefix, barrier) = match header {
+        "Multipliers" => ("{\"header\":\"Multipliers\"", ""),
+        "CarrierStatus" => ("{\"header\":\"CarrierStatus\"", "{\"header\":\"CarrierError\""),
+        "AssetBundleStatus" => ("{\"header\":\"AssetBundleStatus\"", "{\"header\":\"AssetBundleError\""),
+        _ => return false,
+    };
+    for previous in out.iter().rev() {
+        if previous.starts_with("{\"header\":\"RemoveAll\"")
+            || (!barrier.is_empty() && previous.starts_with(barrier)) {
+            return false;
+        }
+        if previous.starts_with(prefix) {
+            return previous == inner;
+        }
+    }
+    false
+}
+
 pub fn queue(inner: String) {
     let stats = traffic(&inner);
     stats.queued.fetch_add(1, Ordering::Relaxed);
@@ -546,6 +642,10 @@ pub fn queue(inner: String) {
     // Worst case the message is dropped; RPM gets a full re-sync on reconnect anyway.
     for _ in 0..1000 {
         if let Some(mut out) = OUTBOX.try_lock() {
+            if redundant_snapshot(&out, &inner) {
+                COALESCED.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
             // Bound growth if RPM is stuck; drop newest.
             if out.len() < OUTBOX_CAP {
                 out.push(inner);
@@ -626,6 +726,7 @@ fn mark_client_disconnected(client: i32) {
         // Wake the accept thread if it is blocked in Recv while the sender discovered the
         // failure. The accept thread closes the descriptor after its receive loop exits.
         unsafe {
+            let _io = io_guard();
             let _ = Shutdown(client, 2);
         }
     }
@@ -635,6 +736,7 @@ fn close_client(client: i32) {
     // Do not recycle the descriptor while the sender still has a write in progress.
     let _send_guard = send_guard();
     unsafe {
+        let _io = io_guard();
         let _ = Close(client);
     }
 }
@@ -740,6 +842,26 @@ mod tests {
         let large = "x".repeat(SEND_BATCH_BYTES + 1);
         assert_eq!(batch_count(&[large, "next".to_owned()]), 1);
         assert_eq!(batch_count(&[]), 0);
+    }
+
+    #[test]
+    fn only_temporary_socket_errors_are_retried() {
+        assert!(retryable_socket_error(4));
+        assert!(retryable_socket_error(11));
+        assert!(!retryable_socket_error(0));
+        assert!(!retryable_socket_error(104));
+    }
+
+    #[test]
+    fn duplicate_snapshots_do_not_erase_transitions_or_errors() {
+        let a = r#"{"header":"CarrierStatus","body":"a"}"#.to_owned();
+        let b = r#"{"header":"CarrierStatus","body":"b"}"#.to_owned();
+        let err = r#"{"header":"CarrierError","body":"error"}"#.to_owned();
+        let line = r#"{"header":"AcmdCapture","body":"line"}"#.to_owned();
+        assert!(redundant_snapshot(&[a.clone(), line.clone()], &a));
+        assert!(!redundant_snapshot(&[a.clone(), b], &a));
+        assert!(!redundant_snapshot(&[a.clone(), err], &a));
+        assert!(!redundant_snapshot(&[line.clone()], &line));
     }
 
     #[test]

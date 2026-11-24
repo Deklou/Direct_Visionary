@@ -6,6 +6,7 @@ use std::sync::atomic::AtomicU64;
 /// flooding the socket when rainbows animate every frame.
 const NOTIFY_EVERY: u64 = 10;
 const MAX_NOTIFY_PER_TICK: usize = 32;
+const CAPTURE_DEBUG_EVERY: u64 = 60;
 
 static FRAME: AtomicU64 = AtomicU64::new(0);
 
@@ -46,21 +47,33 @@ impl Facade for DebuggableServerFacade {
             }
             // Live-ACMD capture stream. The first battle object to execute each fighter-kind +
             // motion owns its one immutable snapshot until the editor explicitly clears it.
-            for record in crate::slight::hitbox_viewer::take_archive_replay(MAX_NOTIFY_PER_TICK) {
-                crate::rust_extender::debuggable_server::notify_acmd_capture_archive_record(
-                    &record,
-                );
+            // Leave captures in their original buffers when the transport is backed up.
+            // Keep a shared budget across replay, live lines and completion markers.
+            let budget = crate::rust_extender::net::simple_server::capture_budget(3 * MAX_NOTIFY_PER_TICK);
+            let replay = crate::slight::hitbox_viewer::take_archive_replay(budget.min(MAX_NOTIFY_PER_TICK));
+            let remaining = budget.saturating_sub(replay.len());
+            for record in replay {
+                crate::rust_extender::debuggable_server::notify_acmd_capture_archive_record(&record);
             }
-            for line in crate::slight::hitbox_viewer::take_pending(MAX_NOTIFY_PER_TICK) {
+            // Call even with zero budget: this also services clear-capture requests.
+            let lines = crate::slight::hitbox_viewer::take_pending(remaining.min(MAX_NOTIFY_PER_TICK));
+            let remaining = remaining.saturating_sub(lines.len());
+            for line in lines {
                 crate::rust_extender::debuggable_server::notify_acmd_capture(&line);
             }
-            // End-of-motion markers ride the same socket, but only once the backlog above
-            // is empty — the editor treats one as "this move's script is fully streamed".
-            for end in crate::slight::hitbox_viewer::take_pending_ends(MAX_NOTIFY_PER_TICK) {
+            for end in crate::slight::hitbox_viewer::take_pending_ends(remaining.min(MAX_NOTIFY_PER_TICK)) {
                 crate::rust_extender::debuggable_server::notify_acmd_capture_end(&end);
             }
-            for snapshot in crate::slight::hitbox_viewer::take_capture_debug(MAX_NOTIFY_PER_TICK) {
-                crate::rust_extender::debuggable_server::notify_acmd_capture_debug(&snapshot);
+            // Diagnostic rows are cumulative. Do not mark them sent while the queue
+            // is congested; the next snapshot will contain the newer counters.
+            if n % CAPTURE_DEBUG_EVERY == 0 {
+                let available = crate::rust_extender::net::simple_server::capture_budget(MAX_NOTIFY_PER_TICK);
+                if available == MAX_NOTIFY_PER_TICK {
+                    for snapshot in crate::slight::hitbox_viewer::take_capture_debug(available) {
+                        crate::rust_extender::debuggable_server::notify_acmd_capture_debug(&snapshot);
+                    }
+                }
+                crate::slight::hitbox_viewer::note_capture_backlog(n);
             }
         }
         crate::slight::pending::process();
