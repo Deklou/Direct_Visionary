@@ -1546,11 +1546,10 @@ impl GameLink {
     pub fn send_collision_view(
         &self,
         flags: [bool; 4],
-        fighter_kind: Option<i32>,
-        volumes: &[CollisionReferenceWire],
-    ) {
+        roster: &BTreeMap<i32, Vec<CollisionReferenceWire>>,
+    ) -> bool {
         if self.sends_suppressed() || self.status() != LinkStatus::Connected {
-            return;
+            return false;
         }
         let Ok(payload) = serde_json::to_string(&serde_json::json!({
             "collision_view": {
@@ -1558,15 +1557,17 @@ impl GameLink {
                 "hurtboxes": flags[1],
                 "intangible": flags[2],
                 "invincible": flags[3],
-                "fighter_kind": fighter_kind,
-                "volumes": volumes,
+                "roster": roster,
             }
         })) else {
-            return;
+            return false;
         };
         let frame = format!("<TCP_MESSAGE>{payload}</TCP_MESSAGE>");
         if let Ok(mut s) = self.shared.lock() {
             queue_latest_full_replace(&mut s.outbox, frame);
+            true
+        } else {
+            false
         }
     }
 

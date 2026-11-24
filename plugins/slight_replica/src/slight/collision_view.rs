@@ -7,7 +7,7 @@ use smash::app::{
 use smash::lib::lua_const::*;
 use smash::phx::{Hash40, Vector3f};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::LazyLock;
 
 const MAX_MARKERS: usize = 96;
@@ -32,8 +32,7 @@ pub struct Config {
     hurtboxes: bool,
     intangible: bool,
     invincible: bool,
-    fighter_kind: Option<i32>,
-    volumes: Vec<ReferenceVolume>,
+    roster: HashMap<i32, Vec<ReferenceVolume>>,
 }
 
 impl Config {
@@ -46,6 +45,7 @@ static CONFIG: Mutex<Option<(u64, Config)>> = Mutex::new(None);
 static MARKERS: LazyLock<Mutex<HashMap<u32, ObjectMarkers>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static SPAWNING: AtomicUsize = AtomicUsize::new(0);
+static HIT_VTABLE_REPORTED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Sphere {
@@ -72,9 +72,12 @@ fn valid_geometry(bone: u64, a: [f32; 3], b: [f32; 3], radius: f32) -> bool {
 }
 
 pub fn set_config(mut config: Config) {
-    config.volumes.truncate(128);
-    config.volumes.retain(|v| v.index < 128
-        && valid_geometry(v.bone, v.endpoint1, v.endpoint2, v.radius));
+    config.roster.retain(|kind, volumes| {
+        volumes.truncate(128);
+        volumes.retain(|v| v.index < 128
+            && valid_geometry(v.bone, v.endpoint1, v.endpoint2, v.radius));
+        (0..128).contains(kind) && !volumes.is_empty()
+    });
     let client = crate::rust_extender::net::simple_server::client_id();
     *CONFIG.lock() = Some((client, config));
 }
@@ -112,6 +115,47 @@ fn append_capsule(out: &mut Vec<Sphere>, bone: u64, a: [f32; 3], b: [f32; 3],
     }
 }
 
+// All offsets here are the verified HitModule dispatch slots in main 13.0.5.
+// Log their resolved targets once, to locate the concrete native layout in Ghidra.
+unsafe fn report_hit_vtable(boma: *mut BattleObjectModuleAccessor) {
+    if HIT_VTABLE_REPORTED.load(Ordering::Relaxed) {
+        return;
+    }
+    let module = *boma.cast::<u8>().add(0xb0).cast::<*const usize>();
+    if module.is_null() {
+        return;
+    }
+    let vtable = *module as *const usize;
+    if vtable.is_null() {
+        return;
+    }
+    let text = skyline::hooks::getRegionAddress(skyline::hooks::Region::Text) as usize;
+    let rodata = skyline::hooks::getRegionAddress(skyline::hooks::Region::Rodata) as usize;
+    let mut targets = Vec::new();
+    for slot in [0x90, 0x98, 0xd8, 0x148, 0x150, 0x170, 0x200] {
+        let addr = *vtable.add(slot / core::mem::size_of::<usize>());
+        if !(text..rodata).contains(&addr) {
+            return;
+        }
+        targets.push(format!("{slot:#x}=main+{:#x}", addr - text));
+    }
+    if !HIT_VTABLE_REPORTED.swap(true, Ordering::Relaxed) {
+        crate::slight::diag::note(format!("COLLISION HitModule dispatch: {}", targets.join(" ")));
+    }
+}
+
+fn effective_status(local: i32, whole: i32, off: i32, xlu: i32, invincible: i32) -> i32 {
+    if local == off || whole == off {
+        off
+    } else if local == xlu || whole == xlu {
+        xlu
+    } else if local == invincible || whole == invincible {
+        invincible
+    } else {
+        local
+    }
+}
+
 unsafe fn desired(boma: *mut BattleObjectModuleAccessor, config: &Config) -> Vec<Sphere> {
     let mut out = Vec::new();
     if config.attacks {
@@ -131,22 +175,28 @@ unsafe fn desired(boma: *mut BattleObjectModuleAccessor, config: &Config) -> Vec
             append_capsule(&mut out, data.node, a, b, data.size, RED);
         }
     }
-    if !(config.hurtboxes || config.intangible || config.invincible)
-        || config.fighter_kind != Some(app::utility::get_kind(&mut *boma))
-    {
+    if !(config.hurtboxes || config.intangible || config.invincible) {
         return out;
     }
-    // PRC shapes are references, not native geometry readback. The part count and
-    // status selector still need a controlled Ryujinx test before trusting the result.
-    let parts = HitModule::get_part_size(boma, 0);
-    if parts == 0 || parts > 128 {
+    report_hit_vtable(boma);
+    let kind = app::utility::get_kind(&mut *boma);
+    let Some(volumes) = config.roster.get(&kind) else {
+        return out;
+    };
+    // PRC shapes are references, not native geometry readback.
+    let parts = HitModule::get_part_size(boma, 0) as i32;
+    if !(1..=128).contains(&parts) {
         return out;
     }
-    for v in &config.volumes {
-        if u64::from(v.index) >= parts {
+    let whole = HitModule::get_whole(boma, 0);
+    for v in volumes {
+        if v.index as i32 >= parts {
             continue;
         }
-        let status = HitModule::get_status(boma, v.index as i32, 0);
+        let local = HitModule::get_status(boma, v.index as i32, 0);
+        let status = effective_status(
+            local, whole, *HIT_STATUS_OFF, *HIT_STATUS_XLU, *HIT_STATUS_INVINCIBLE,
+        );
         let color = if status == *HIT_STATUS_NORMAL && config.hurtboxes {
             GRAY
         } else if status == *HIT_STATUS_XLU && config.intangible {
@@ -253,6 +303,15 @@ pub fn forget_match() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn global_and_local_status_are_combined() {
+        let (normal, invincible, xlu, off) = (0, 1, 2, 3);
+        assert_eq!(effective_status(normal, invincible, off, xlu, invincible), invincible);
+        assert_eq!(effective_status(normal, xlu, off, xlu, invincible), xlu);
+        assert_eq!(effective_status(xlu, normal, off, xlu, invincible), xlu);
+        assert_eq!(effective_status(off, invincible, off, xlu, invincible), off);
+    }
 
     #[test]
     fn capsule_keeps_both_ends() {
