@@ -21,6 +21,15 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
+#[derive(Clone, Debug, Serialize)]
+pub struct CollisionReferenceWire {
+    pub index: u32,
+    pub bone: u64,
+    pub endpoint1: [f32; 3],
+    pub endpoint2: [f32; 3],
+    pub radius: f32,
+}
+
 pub const PLUGIN_ADDR: &str = "127.0.0.1:7878";
 const DEFAULT_PLUGIN_PORT: u16 = 7878;
 /// How long a `connect()` may take before the attempt is abandoned. The emulator's
@@ -1254,6 +1263,7 @@ struct Shared {
     status: LinkStatus,
     client_id: Option<u64>,
     connection_epoch: u64,
+    collision_requests: BTreeMap<i32, u64>,
     kinds: BTreeMap<u64, LiveKind>,
     /// Live ACMD capture log, keyed by motion hash (deduped; survives reconnects).
     captures: BTreeMap<u64, Vec<CaptureLine>>,
@@ -1314,6 +1324,7 @@ struct Shared {
 /// the plugin's entire list for its family, so only the newest per marker matters;
 /// intermediate states replay stale edits and churn per-playback injection identity.
 const FULL_REPLACE_MARKERS: &[&str] = &[
+    "\"collision_view\":",
     "\"trait_rules\":",
     "\"spawn_rules\":",
     "\"hitbox_rules\":",
@@ -1354,6 +1365,19 @@ fn retain_latest_full_replace(messages: &mut Vec<String>) {
     }
 }
 
+// Keep flags ahead of geometry for the same session, then preserve the order of all other edits.
+fn prioritize_collision_messages(messages: &mut [String]) {
+    messages.sort_by_key(|message| {
+        if message.starts_with("<TCP_MESSAGE>{\"collision_view\":") {
+            0
+        } else if message.starts_with("<TCP_MESSAGE>{\"collision_roster\":") {
+            1
+        } else {
+            2
+        }
+    });
+}
+
 fn retain_latest_idempotent_commands(messages: &mut Vec<String>) {
     for marker in IDEMPOTENT_COMMAND_MARKERS {
         retain_latest_for_marker(messages, marker);
@@ -1392,6 +1416,7 @@ impl Default for Shared {
             status: LinkStatus::Disconnected,
             client_id: None,
             connection_epoch: 0,
+            collision_requests: BTreeMap::new(),
             kinds: BTreeMap::new(),
             captures: BTreeMap::new(),
             capture_claimed_runs: BTreeMap::new(),
@@ -1530,6 +1555,68 @@ impl GameLink {
             .lock()
             .map(|s| s.kinds.contains_key(&id))
             .unwrap_or(false)
+    }
+
+    /// Small session-only flags, independent of the hurtbox reference geometry.
+    pub fn send_collision_view(&self, epoch: u64, flags: [bool; 4], revision: u64) -> bool {
+        if self.sends_suppressed() {
+            return false;
+        }
+        let Ok(mut s) = self.shared.lock() else { return false; };
+        let Some(client_id) = s.client_id else { return false; };
+        if s.status != LinkStatus::Connected || s.connection_epoch != epoch {
+            return false;
+        }
+        let payload = serde_json::json!({
+            "collision_view": {
+                "client_id": client_id,
+                "revision": revision,
+                "attacks": flags[0],
+                "hurtboxes": flags[1],
+                "intangible": flags[2],
+                "invincible": flags[3],
+            }
+        });
+        queue_latest_full_replace(&mut s.outbox, format!("<TCP_MESSAGE>{payload}</TCP_MESSAGE>"));
+        true
+    }
+
+    pub fn take_collision_requests(&self, epoch: u64) -> BTreeMap<i32, u64> {
+        if self.sends_suppressed() {
+            return BTreeMap::new();
+        }
+        let Ok(mut s) = self.shared.lock() else { return BTreeMap::new(); };
+        if s.client_id.is_none() || s.connection_epoch != epoch {
+            return BTreeMap::new();
+        }
+        std::mem::take(&mut s.collision_requests)
+    }
+
+    /// Answer one fighter request with compact tuples, not the entire roster.
+    pub fn send_collision_roster(
+        &self,
+        epoch: u64,
+        revision: u64,
+        kind: i32,
+        volumes: &[CollisionReferenceWire],
+    ) -> bool {
+        if self.sends_suppressed() {
+            return false;
+        }
+        let Ok(mut s) = self.shared.lock() else { return false; };
+        let Some(client_id) = s.client_id else { return false; };
+        if s.status != LinkStatus::Connected || s.connection_epoch != epoch {
+            return false;
+        }
+        let compact: Vec<_> = volumes.iter().take(128)
+            .map(|v| (v.index, v.bone, v.endpoint1, v.endpoint2, v.radius))
+            .collect();
+        let Ok(geometry) = serde_json::to_string(&compact) else { return false; };
+        let prefix = format!("<TCP_MESSAGE>{{\"collision_roster\":{{\"kind\":{kind},");
+        let frame = format!("{prefix}\"client_id\":{client_id},\"revision\":{revision},\"volumes\":{geometry}}}}}</TCP_MESSAGE>");
+        s.outbox.retain(|message| !message.starts_with(&prefix));
+        push_outbox_capped(&mut s.outbox, frame);
+        true
     }
 
     /// Replace the complete live fighter-trait snapshot. An empty list restores vanilla reads.
@@ -2105,6 +2192,7 @@ fn serve_connection(shared: &Arc<Mutex<Shared>>, mut stream: TcpStream) -> Optio
         };
         let mut pending = pending;
         retain_latest_full_replace(&mut pending);
+        prioritize_collision_messages(&mut pending);
         let mut failed_at: Option<(usize, String)> = None;
         for (index, msg) in pending.iter().enumerate() {
             if let Err(e) = stream.write_all(msg.as_bytes()) {
@@ -2507,7 +2595,18 @@ fn handle_frame(shared: &Arc<Mutex<Shared>>, payload: &str) {
             }
         }
         "RemoveAll" => s.kinds.clear(),
+        "CollisionRosterRequest" => {
+            let client = body.get("client_id").and_then(|v| v.as_u64());
+            let kind = body.get("kind").and_then(|v| v.as_i64());
+            let revision = body.get("revision").and_then(|v| v.as_u64());
+            if let (Some(client), Some(kind), Some(revision)) = (client, kind, revision) {
+                if s.client_id == Some(client) && (0..128).contains(&kind) {
+                    s.collision_requests.insert(kind as i32, revision);
+                }
+            }
+        }
         "GiveClientId" => {
+            s.collision_requests.clear();
             let client_id = body
                 .get("GiveClientId")
                 .and_then(|g| g.get("client_id"))
@@ -2530,6 +2629,18 @@ mod tests {
         let body_str = serde_json::to_string(body).unwrap();
         let body_esc = serde_json::to_string(&body_str).unwrap();
         format!("<TCP_MESSAGE>{{\"header\":\"{header}\",\"body\":{body_esc}}}</TCP_MESSAGE>")
+    }
+
+    #[test]
+    fn collision_flags_precede_geometry_without_reordering_other_edits() {
+        let frame = |key: &str| format!("<TCP_MESSAGE>{{\"{key}\":{{}}}}</TCP_MESSAGE>");
+        let a = frame("donor_bytes");
+        let b = frame("hitbox_rules");
+        let flags = frame("collision_view");
+        let roster = frame("collision_roster");
+        let mut messages = vec![a.clone(), roster.clone(), b.clone(), flags.clone()];
+        prioritize_collision_messages(&mut messages);
+        assert_eq!(messages, vec![flags, roster, a, b]);
     }
 
     #[test]

@@ -516,6 +516,11 @@ fn hook_req_follow(
     a13: bool,
     a14: bool,
 ) -> u64 {
+    if crate::slight::collision_view::is_marker_request(module_accessor, eff_hash.hash) {
+        return original!()(
+            module_accessor, eff_hash, bone_hash, pos, rot, size, a7, a8, a9, a10, a11, a12, a13, a14,
+        );
+    }
     if suppress_carrier_request(module_accessor) {
         return 0;
     }

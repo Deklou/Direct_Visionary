@@ -1359,6 +1359,19 @@ pub(crate) fn load_hurtbox_volumes(
     param_path: &std::path::Path,
     skeleton_bones: &[String],
 ) -> HurtboxLoadResult {
+    load_hurtbox_volumes_inner(param_path, skeleton_bones, false)
+}
+
+/// In-game effects use the parameter's raw bone hash; no desktop skeleton is required.
+pub(crate) fn load_live_hurtbox_volumes(param_path: &std::path::Path) -> HurtboxLoadResult {
+    load_hurtbox_volumes_inner(param_path, &[], true)
+}
+
+fn load_hurtbox_volumes_inner(
+    param_path: &std::path::Path,
+    skeleton_bones: &[String],
+    live: bool,
+) -> HurtboxLoadResult {
     let mut result = HurtboxLoadResult::default();
     let param = match prc::open(param_path) {
         Ok(param) => param,
@@ -1415,13 +1428,24 @@ pub(crate) fn load_hurtbox_volumes(
             });
             continue;
         };
-        let Some(bone_name) = bones_by_hash.get(&node_id).cloned() else {
-            result.warnings.push(HurtboxLoadWarning {
-                index: Some(index),
-                reason: format!("unresolved bone hash {node_id:#x}"),
-            });
-            continue;
+        let bone_name = match bones_by_hash.get(&node_id).cloned() {
+            Some(name) => name,
+            None if live && node_id > 0 && node_id <= 0xff_ffff_ffff => {
+                format!("{node_id:#x}")
+            }
+            None => {
+                result.warnings.push(HurtboxLoadWarning {
+                    index: Some(index),
+                    reason: format!("unresolved bone hash {node_id:#x}"),
+                });
+                continue;
+            }
         };
+        let live_sphere = live && field("check_type").and_then(param_raw_u64)
+            .is_some_and(|shape| [
+                param_hash("sphere"),
+                param_hash("collision_shape_type_sphere"),
+            ].contains(&shape));
 
         let names = [
             "offset1_x",
@@ -1432,8 +1456,9 @@ pub(crate) fn load_hurtbox_volumes(
             "offset2_z",
         ];
         let Some(values) = names
+            .iter()
+            .take(if live_sphere { 3 } else { 6 })
             .map(|name| field(name).and_then(param_number))
-            .into_iter()
             .collect::<Option<Vec<_>>>()
         else {
             result.warnings.push(HurtboxLoadWarning {
@@ -1470,7 +1495,7 @@ pub(crate) fn load_hurtbox_volumes(
             });
             continue;
         };
-        let shape = if [
+        let shape = if live_sphere || [
             param_hash("collision_shape_type_capsule"),
             param_hash("capsule"),
         ]
@@ -1500,7 +1525,11 @@ pub(crate) fn load_hurtbox_volumes(
             bone_name,
             bone_hash: node_id,
             endpoint1: [values[0], values[1], values[2]],
-            endpoint2: [values[3], values[4], values[5]],
+            endpoint2: if live_sphere {
+                [values[0], values[1], values[2]]
+            } else {
+                [values[3], values[4], values[5]]
+            },
             radius,
             default_status,
             shape,
