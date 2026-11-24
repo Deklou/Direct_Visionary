@@ -27,6 +27,7 @@ const SOL_SOCKET: i32 = 0xffff;
 const SO_REUSEADDR: i32 = 4;
 const OUTBOX_CAP: usize = 8192;
 const SEND_BATCH_CAP: usize = 256;
+const SEND_BATCH_BYTES: usize = 16 * 1024;
 const FRAME_OPEN: &str = "<TCP_MESSAGE>";
 const FRAME_CLOSE: &str = "</TCP_MESSAGE>";
 const PONG_INNER: &str = r#"{"header":"Pong","body":"{}"}"#;
@@ -151,12 +152,13 @@ fn sleep_ms(ms: u64) {
 }
 
 fn sender_loop() {
-    crate::slight::diag::note("SND thread entered");
+    crate::slight::diag::note(format!("SND thread entered — batch v1 max={SEND_BATCH_BYTES} bytes/{SEND_BATCH_CAP} frames"));
     loop {
         sender_stage(0);
+        let cid = client_id();
         let fd = CLIENT_FD.load(Ordering::Acquire);
         if fd >= 0 {
-            unsafe { drain(fd) };
+            unsafe { drain(fd, cid) };
         }
         sleep_ms(4);
     }
@@ -324,18 +326,13 @@ unsafe fn handshake(client: i32) -> Option<u64> {
     // Keep both handshake frames together with respect to the dedicated sender.  This matters
     // after a reconnect, when a failed send may have left frames waiting in OUTBOX.
     let _send_guard = send_guard();
-    if send_frame_unlocked(client, r#"{"header":"RemoveAll","body":"{}"}"#) < 0 {
-        return None;
-    }
-    if send_frame_unlocked(
-        client,
-        &format!(
+    let frames = [
+        r#"{"header":"RemoveAll","body":"{}"}"#.to_owned(),
+        format!(
             r#"{{"header":"GiveClientId","body":"{{\"GiveClientId\":{{\"client_id\":{cid}}}}}"}}"#
         ),
-    ) < 0
-    {
-        return None;
-    }
+    ];
+    send_batch_unlocked(client, &frames, false).ok()?;
     Some(cid)
 }
 
@@ -349,13 +346,49 @@ fn send_guard() -> parking_lot::MutexGuard<'static, ()> {
     }
 }
 
-/// Write one complete framed message.  TCP `Send` is allowed to return a short write; treating
-/// the first return value as the whole frame corrupts the next frame when a large donor payload
-/// or a congested emulator splits it.
-unsafe fn send_frame_unlocked(client: i32, inner: &str) -> i64 {
-    let msg = format!("{FRAME_OPEN}{inner}{FRAME_CLOSE}");
-    let bytes = msg.as_bytes();
+fn frame_len(inner: &str) -> usize {
+    FRAME_OPEN.len() + inner.len() + FRAME_CLOSE.len()
+}
+
+// Keep the queue lock independent of socket writes. A single large frame may exceed
+// the byte budget, but must not block the rest of the queue permanently.
+fn batch_count(messages: &[String]) -> usize {
+    let mut bytes = 0usize;
+    let mut count = 0usize;
+    for message in messages.iter().take(SEND_BATCH_CAP) {
+        let next = bytes.saturating_add(frame_len(message));
+        if count > 0 && next > SEND_BATCH_BYTES {
+            break;
+        }
+        bytes = next;
+        count += 1;
+    }
+    count
+}
+
+fn encode_batch(messages: &[String]) -> (Vec<u8>, Vec<usize>) {
+    let mut bytes = Vec::new();
+    let mut ends = Vec::with_capacity(messages.len());
+    for message in messages {
+        bytes.extend_from_slice(FRAME_OPEN.as_bytes());
+        bytes.extend_from_slice(message.as_bytes());
+        bytes.extend_from_slice(FRAME_CLOSE.as_bytes());
+        ends.push(bytes.len());
+    }
+    (bytes, ends)
+}
+
+/// Send consecutive frames as one byte stream. On error, return the first frame
+/// not fully written; its prefix belongs to the old connection and must be retried
+/// from the beginning on a fresh socket. Successfully written frames are not ACKed.
+unsafe fn send_batch_unlocked(
+    client: i32,
+    messages: &[String],
+    track_in_flight: bool,
+) -> Result<(), usize> {
+    let (bytes, ends) = encode_batch(messages);
     let mut sent = 0usize;
+    let mut completed = 0usize;
     while sent < bytes.len() {
         let remaining = bytes.len() - sent;
         let start = tick_now();
@@ -367,16 +400,26 @@ unsafe fn send_frame_unlocked(client: i32, inner: &str) -> i64 {
         SEND_MAX.fetch_max(tick_now().saturating_sub(start), Ordering::Relaxed);
         if n <= 0 || n as usize > remaining {
             SEND_ERRORS.fetch_add(1, Ordering::Relaxed);
-            crate::slight::diag::note(format!("TCP send rc={n} remaining={remaining}"));
-            return -1;
+            crate::slight::diag::note(format!(
+                "TCP send rc={n} remaining={remaining} completed={completed}/{}",
+                messages.len()
+            ));
+            return Err(completed);
         }
         SEND_BYTES.fetch_add(n as u64, Ordering::Relaxed);
         sent += n as usize;
+        let next = ends.partition_point(|&end| end <= sent);
+        for message in &messages[completed..next] {
+            let stats = traffic(message);
+            stats.sent.fetch_add(1, Ordering::Relaxed);
+            stats.sent_bytes.fetch_add(frame_len(message) as u64, Ordering::Relaxed);
+        }
+        completed = next;
+        if track_in_flight {
+            IN_FLIGHT.store((messages.len() - completed) as u64, Ordering::Relaxed);
+        }
     }
-    let stats = traffic(inner);
-    stats.sent.fetch_add(1, Ordering::Relaxed);
-    stats.sent_bytes.fetch_add(sent as u64, Ordering::Relaxed);
-    sent as i64
+    Ok(())
 }
 
 unsafe fn recv_once(client: i32) {
@@ -516,37 +559,40 @@ pub fn queue(inner: String) {
     stats.dropped.fetch_add(1, Ordering::Relaxed);
 }
 
-unsafe fn drain(client: i32) {
+unsafe fn drain(client: i32, cid: u64) {
     // Take the batch out under the lock, then release before the blocking sends so `queue`
     // (game thread) never waits on the socket via the OUTBOX lock. Sender thread may sleep.
     sender_stage(1);
     let msgs: Vec<String> = loop {
         if let Some(mut out) = OUTBOX.try_lock() {
-            let count = out.len().min(SEND_BATCH_CAP);
+            let count = batch_count(&out);
             break out.drain(..count).collect();
         }
         sleep_ms(1);
     };
-    if !msgs.is_empty() {
-        crate::slight::diag::note(format!("SND drain {} msgs", msgs.len()));
+    if msgs.is_empty() {
+        return;
     }
+    let bytes: usize = msgs.iter().map(|msg| frame_len(msg)).sum();
+    crate::slight::diag::note(format!("SND drain {} msgs bytes={bytes}", msgs.len()));
     IN_FLIGHT.store(msgs.len() as u64, Ordering::Relaxed);
     sender_stage(2);
     let _send_guard = send_guard();
+    // The accept thread may have closed and reused the numeric descriptor while
+    // this sender was waiting for the lock. Never write into the wrong session.
+    if CLIENT_FD.load(Ordering::Acquire) != client || client_id() != cid {
+        sender_stage(4);
+        requeue_front(msgs);
+        IN_FLIGHT.store(0, Ordering::Relaxed);
+        return;
+    }
     sender_stage(3);
-    for (index, msg) in msgs.iter().enumerate() {
-        let rc = send_frame_unlocked(client, msg);
-        if rc < 0 {
-            crate::slight::diag::note(format!("SND send failed rc={rc}"));
-            // The current frame may have been partially written, so it must be retried only on
-            // a fresh TCP connection. Requeue it and every later frame in their original order.
-            sender_stage(4);
-            requeue_front(msgs.into_iter().skip(index).collect());
-            IN_FLIGHT.store(0, Ordering::Relaxed);
-            mark_client_disconnected(client);
-            return;
-        }
-        IN_FLIGHT.fetch_sub(1, Ordering::Relaxed);
+    if let Err(index) = send_batch_unlocked(client, &msgs, true) {
+        crate::slight::diag::note(format!("SND send failed first_unsent={index}"));
+        sender_stage(4);
+        requeue_front(msgs.into_iter().skip(index).collect());
+        IN_FLIGHT.store(0, Ordering::Relaxed);
+        mark_client_disconnected(client);
     }
 }
 
@@ -670,6 +716,30 @@ mod tests {
         let mut buf = format!("{FRAME_OPEN}one{FRAME_CLOSE}{FRAME_OPEN}two{FRAME_CLOSE}");
         assert_eq!(extract_payloads(&mut buf), vec!["one", "two"]);
         assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn batch_preserves_frame_order_and_boundaries() {
+        let messages = vec!["one".to_owned(), "deux é".to_owned(), "three".to_owned()];
+        let (bytes, ends) = encode_batch(&messages);
+        let mut buf = String::from_utf8(bytes).unwrap();
+        assert_eq!(extract_payloads(&mut buf), messages);
+        assert!(buf.is_empty());
+        assert_eq!(ends[0], frame_len("one"));
+        assert_eq!(ends.partition_point(|&end| end <= ends[1] - 1), 1);
+        assert_eq!(ends.partition_point(|&end| end <= ends[1]), 2);
+        assert_eq!(ends.partition_point(|&end| end <= ends[2]), 3);
+    }
+
+    #[test]
+    fn batch_limits_count_and_bytes_but_allows_large_first_frame() {
+        let small = vec!["x".to_owned(); SEND_BATCH_CAP + 1];
+        assert_eq!(batch_count(&small), SEND_BATCH_CAP);
+        let half = "x".repeat(SEND_BATCH_BYTES / 2);
+        assert_eq!(batch_count(&[half.clone(), half]), 1);
+        let large = "x".repeat(SEND_BATCH_BYTES + 1);
+        assert_eq!(batch_count(&[large, "next".to_owned()]), 1);
+        assert_eq!(batch_count(&[]), 0);
     }
 
     #[test]
