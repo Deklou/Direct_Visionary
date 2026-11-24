@@ -2076,6 +2076,7 @@ fn serve_connection(shared: &Arc<Mutex<Shared>>, mut stream: TcpStream) -> Optio
     let _ = stream.set_write_timeout(Some(WRITE_TIMEOUT));
     let _ = stream.set_nodelay(true);
     let mut buf = String::new();
+    let mut utf8_tail = Vec::new();
     let mut chunk = [0u8; 8192];
     let mut last_ping = Instant::now();
     let mut ping_seq: u64 = 0;
@@ -2134,7 +2135,7 @@ fn serve_connection(shared: &Arc<Mutex<Shared>>, mut stream: TcpStream) -> Optio
         match stream.read(&mut chunk) {
             Ok(0) => return Some("closed by plugin".into()),
             Ok(n) => {
-                buf.push_str(&String::from_utf8_lossy(&chunk[..n]));
+                append_tcp_utf8(&mut buf, &mut utf8_tail, &chunk[..n]);
                 for payload in extract_frames(&mut buf) {
                     handle_frame(shared, &payload);
                 }
@@ -2160,6 +2161,53 @@ fn serve_connection(shared: &Arc<Mutex<Shared>>, mut stream: TcpStream) -> Optio
                     .into(),
             );
         }
+    }
+}
+
+// TCP may split a UTF-8 code point across reads. Keep the incomplete suffix
+// rather than replacing valid text with U+FFFD before the frame is assembled.
+fn append_tcp_utf8(buf: &mut String, tail: &mut Vec<u8>, chunk: &[u8]) {
+    tail.extend_from_slice(chunk);
+    let mut rest = tail.as_slice();
+    loop {
+        match std::str::from_utf8(rest) {
+            Ok(valid) => {
+                buf.push_str(valid);
+                rest = &[];
+                break;
+            }
+            Err(error) => {
+                let valid = error.valid_up_to();
+                buf.push_str(std::str::from_utf8(&rest[..valid]).unwrap());
+                rest = &rest[valid..];
+                if let Some(invalid) = error.error_len() {
+                    buf.push('\u{fffd}');
+                    rest = &rest[invalid..];
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+    let remaining = rest.len();
+    let consumed = tail.len() - remaining;
+    tail.drain(..consumed);
+}
+
+#[cfg(test)]
+#[test]
+fn tcp_utf8_survives_every_split_in_a_batched_stream() {
+    let wire = "<TCP_MESSAGE>é漢🙂</TCP_MESSAGE><TCP_MESSAGE>second</TCP_MESSAGE>";
+    for split in 0..=wire.len() {
+        let mut buf = String::new();
+        let mut tail = Vec::new();
+        let mut frames = Vec::new();
+        append_tcp_utf8(&mut buf, &mut tail, &wire.as_bytes()[..split]);
+        frames.extend(extract_frames(&mut buf));
+        append_tcp_utf8(&mut buf, &mut tail, &wire.as_bytes()[split..]);
+        frames.extend(extract_frames(&mut buf));
+        assert_eq!(frames, vec!["é漢🙂", "second"]);
+        assert!(tail.is_empty());
     }
 }
 

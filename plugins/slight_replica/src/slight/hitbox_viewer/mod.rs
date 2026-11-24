@@ -980,9 +980,21 @@ fn clear_captures_if_requested() {
     crate::slight::diag::note("live ACMD captures cleared");
 }
 
+/// Report the capture backlog separately from the transport queue.
+pub fn note_capture_backlog(frame: u64) {
+    let depths = CAPTURE_STATE.try_lock().map(|state| (state.pending.len(), state.ends.len()));
+    crate::slight::diag::note(format!(
+        "TCP capture_backlog frame={frame} pending_ends={depths:?} archive_drops={}",
+        capture_archive::dropped()
+    ));
+}
+
 /// Drain up to `max` unsent capture lines (game thread, per-frame flush).
 pub fn take_pending(max: usize) -> Vec<CaptureLine> {
     clear_captures_if_requested();
+    if max == 0 {
+        return Vec::new();
+    }
     let Some(mut state) = try_capture_state() else {
         return Vec::new();
     };
@@ -1003,7 +1015,7 @@ pub fn take_pending(max: usize) -> Vec<CaptureLine> {
 /// has already been handed out, so the editor never sees "motion finished" ahead of the
 /// lines that motion produced (the facade drains at most 32 lines per notify tick).
 pub fn take_pending_ends(max: usize) -> Vec<CaptureEnd> {
-    if capture_archive::replay_active() {
+    if max == 0 || capture_archive::replay_active() {
         return Vec::new();
     }
     let Some(mut state) = try_capture_state() else {
@@ -1025,6 +1037,9 @@ pub fn requeue_all() {
 /// Drain a small archive replay batch for the facade. Keeping this separate from the live typed
 /// queue means reconnecting never loads the complete history into plugin memory.
 pub fn take_archive_replay(max: usize) -> Vec<String> {
+    if max == 0 {
+        return Vec::new();
+    }
     capture_archive::take_replay(max)
 }
 
