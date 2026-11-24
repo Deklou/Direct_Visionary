@@ -21,6 +21,15 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
+#[derive(Clone, Debug, Serialize)]
+pub struct CollisionReferenceWire {
+    pub index: u32,
+    pub bone: u64,
+    pub endpoint1: [f32; 3],
+    pub endpoint2: [f32; 3],
+    pub radius: f32,
+}
+
 pub const PLUGIN_ADDR: &str = "127.0.0.1:7878";
 const DEFAULT_PLUGIN_PORT: u16 = 7878;
 /// How long a `connect()` may take before the attempt is abandoned. The emulator's
@@ -1314,6 +1323,7 @@ struct Shared {
 /// the plugin's entire list for its family, so only the newest per marker matters;
 /// intermediate states replay stale edits and churn per-playback injection identity.
 const FULL_REPLACE_MARKERS: &[&str] = &[
+    "\"collision_view\":",
     "\"trait_rules\":",
     "\"spawn_rules\":",
     "\"hitbox_rules\":",
@@ -1530,6 +1540,34 @@ impl GameLink {
             .lock()
             .map(|s| s.kinds.contains_key(&id))
             .unwrap_or(false)
+    }
+
+    /// Session-only visualizer settings. Never changes authored collision rules.
+    pub fn send_collision_view(
+        &self,
+        flags: [bool; 4],
+        fighter_kind: Option<i32>,
+        volumes: &[CollisionReferenceWire],
+    ) {
+        if self.sends_suppressed() || self.status() != LinkStatus::Connected {
+            return;
+        }
+        let Ok(payload) = serde_json::to_string(&serde_json::json!({
+            "collision_view": {
+                "attacks": flags[0],
+                "hurtboxes": flags[1],
+                "intangible": flags[2],
+                "invincible": flags[3],
+                "fighter_kind": fighter_kind,
+                "volumes": volumes,
+            }
+        })) else {
+            return;
+        };
+        let frame = format!("<TCP_MESSAGE>{payload}</TCP_MESSAGE>");
+        if let Ok(mut s) = self.shared.lock() {
+            queue_latest_full_replace(&mut s.outbox, frame);
+        }
     }
 
     /// Replace the complete live fighter-trait snapshot. An empty list restores vanilla reads.

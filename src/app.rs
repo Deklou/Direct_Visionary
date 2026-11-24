@@ -3161,6 +3161,8 @@ pub struct VisionaryApp {
     /// Persistent viewport preference; it remains true across fighters even when a fighter has
     /// no parameter data, while the checkbox itself is disabled for that fighter.
     show_hurtboxes: bool,
+    live_collision_flags: [bool; 4],
+    live_collision_sent_at: Option<std::time::Instant>,
     show_debug: bool,
     show_capture_debug: bool,
     capture_debug_kind: Option<i32>,
@@ -3636,6 +3638,8 @@ impl VisionaryApp {
             hurtbox_volumes: Vec::new(),
             hurtbox_warnings: Vec::new(),
             show_hurtboxes: load_hurtbox_visibility(),
+            live_collision_flags: [false; 4],
+            live_collision_sent_at: None,
             show_debug: false,
             show_capture_debug: false,
             capture_debug_kind: None,
@@ -4522,7 +4526,44 @@ impl VisionaryApp {
         }
     }
 
+    fn send_live_collision_view(&mut self) {
+        let kind = self.state.selected_fighter
+            .and_then(|index| self.state.fighters.get(index))
+            .and_then(|fighter| fighter_kind_id(&fighter.name));
+        let volumes: Vec<_> = if self.live_collision_flags[1..].iter().any(|&v| v) {
+            self.hurtbox_volumes.iter()
+                .filter(|v| matches!(v.shape, crate::data::HurtboxShape::Capsule))
+                .filter(|v| v.index < 128 && v.radius > 0.0 && v.radius.is_finite())
+                .map(|v| crate::game_link::CollisionReferenceWire {
+                    index: v.index as u32,
+                    bone: v.bone_hash,
+                    endpoint1: v.endpoint1,
+                    endpoint2: v.endpoint2,
+                    radius: v.radius,
+                })
+                .take(128)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        self.game_link.send_collision_view(self.live_collision_flags, kind, &volumes);
+        self.live_collision_sent_at = Some(std::time::Instant::now());
+    }
+
     fn game_menu(&mut self, ui: &mut Ui) {
+        ui.menu_button("Live collision display (Training)", |ui| {
+            ui.small("In-game markers; hurtbox shapes are parameter references, not runtime readback.");
+            let old = self.live_collision_flags;
+            ui.checkbox(&mut self.live_collision_flags[0], "Hitboxes — red");
+            ui.checkbox(&mut self.live_collision_flags[1], "Normal hurtboxes — gray");
+            ui.checkbox(&mut self.live_collision_flags[2], "Intangible — blue");
+            ui.checkbox(&mut self.live_collision_flags[3], "Invincible — green");
+            ui.small("Hurtboxes use the selected fighter's parameter geometry and experimental live status.");
+            if self.live_collision_flags != old {
+                self.send_live_collision_view();
+            }
+        });
+        ui.separator();
         // Was "Deploy live eff to Eden", which rebuilt the FIGHTER's own eff and asked the
         // plugin to reparse it. That path is a dead end: the reparse rebuilds from the resident
         // buffer and never re-requests the file, so the edited bytes were never read
@@ -35083,6 +35124,11 @@ impl eframe::App for VisionaryApp {
         // ACMD capture, the reconnect modal, and the Transplant pool all need it, not just
         // the Eff Editor window (which used to be the only thing that started it).
         self.game_link.ensure_started();
+        if self.live_collision_flags.iter().any(|&v| v)
+            && self.live_collision_sent_at.is_none_or(|t| t.elapsed().as_secs_f32() >= 1.0)
+        {
+            self.send_live_collision_view();
+        }
         // VISIONARY_PREVIEW_TEST_MOVE=<motion name>,<script frame> (tests): with the effects previewed here, that move and
         // frame once the fighter's moves are listed; stderr says which effects are live on it
         if !self.project_hub.show

@@ -54,8 +54,8 @@ Push-Location $repo
 try {
     $branch = (& git branch --show-current).Trim()
     Test-LastExit 'git branch'
-    if ($branch -ne 'dev') {
-        throw "Branche '$branch' : compilation de test autorisee uniquement sur dev."
+    if ($branch -notin @('dev', 'test/visualisation-collisions')) {
+        throw "Branche '$branch' : compilation de test non autorisee."
     }
     if (Get-Process -Name visionary -ErrorAction SilentlyContinue) {
         throw 'Ferme Visionary avant de compiler.'

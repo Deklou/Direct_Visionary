@@ -85,6 +85,9 @@ unsafe extern "C" fn fighter_line_main(agent: &mut L2CFighterBase) {
     // dispatched from the effect ACMD's call/frame/wait boundaries in acmd_hooks, not from this
     // status callback.
     crate::slight::hitbox_viewer::inject_tick(lua_state);
+    if let Some(boma) = boma_from_lua(lua_state) {
+        crate::slight::collision_view::tick(boma);
+    }
     // End-of-motion watch: tells the editor when a captured move's script has finished, so
     // its auto "live fetch" adopts the WHOLE script instead of the first few frames.
     crate::slight::hitbox_viewer::capture_tick(lua_state);
@@ -240,6 +243,7 @@ pub fn driver_has_ticked() -> bool {
 }
 
 fn teardown_match() {
+    crate::slight::collision_view::forget_match();
     FIGHT_STARTED.store(false, Ordering::Relaxed);
     crate::slight::pending::process();
     crate::rust_extender::debuggable_server::remove_all();

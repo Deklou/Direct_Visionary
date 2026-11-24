@@ -340,6 +340,13 @@ fn parse_tcp_payload(raw: &str) -> Option<ParsedEdit> {
         return None;
     }
 
+    if let Some(value) = v.get("collision_view") {
+        if let Ok(settings) = serde_json::from_value(value.clone()) {
+            crate::slight::collision_view::set_config(settings);
+        }
+        return None;
+    }
+
     // Experimental fighter parameters: replace only the two supported float attributes.
     if let Some(value) = v.get("trait_rules") {
         match serde_json::from_value::<Vec<crate::slight::fighter_traits::TraitRule>>(value.clone()) {
