@@ -1365,6 +1365,19 @@ fn retain_latest_full_replace(messages: &mut Vec<String>) {
     }
 }
 
+// Keep flags ahead of geometry for the same session, then preserve the order of all other edits.
+fn prioritize_collision_messages(messages: &mut [String]) {
+    messages.sort_by_key(|message| {
+        if message.starts_with("<TCP_MESSAGE>{\"collision_view\":") {
+            0
+        } else if message.starts_with("<TCP_MESSAGE>{\"collision_roster\":") {
+            1
+        } else {
+            2
+        }
+    });
+}
+
 fn retain_latest_idempotent_commands(messages: &mut Vec<String>) {
     for marker in IDEMPOTENT_COMMAND_MARKERS {
         retain_latest_for_marker(messages, marker);
@@ -2179,6 +2192,7 @@ fn serve_connection(shared: &Arc<Mutex<Shared>>, mut stream: TcpStream) -> Optio
         };
         let mut pending = pending;
         retain_latest_full_replace(&mut pending);
+        prioritize_collision_messages(&mut pending);
         let mut failed_at: Option<(usize, String)> = None;
         for (index, msg) in pending.iter().enumerate() {
             if let Err(e) = stream.write_all(msg.as_bytes()) {
@@ -2615,6 +2629,18 @@ mod tests {
         let body_str = serde_json::to_string(body).unwrap();
         let body_esc = serde_json::to_string(&body_str).unwrap();
         format!("<TCP_MESSAGE>{{\"header\":\"{header}\",\"body\":{body_esc}}}</TCP_MESSAGE>")
+    }
+
+    #[test]
+    fn collision_flags_precede_geometry_without_reordering_other_edits() {
+        let frame = |key: &str| format!("<TCP_MESSAGE>{{\"{key}\":{{}}}}</TCP_MESSAGE>");
+        let a = frame("donor_bytes");
+        let b = frame("hitbox_rules");
+        let flags = frame("collision_view");
+        let roster = frame("collision_roster");
+        let mut messages = vec![a.clone(), roster.clone(), b.clone(), flags.clone()];
+        prioritize_collision_messages(&mut messages);
+        assert_eq!(messages, vec![flags, roster, a, b]);
     }
 
     #[test]

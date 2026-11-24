@@ -4537,21 +4537,16 @@ impl VisionaryApp {
             return;
         };
         let flags = self.live_collision_flags;
-        if self.live_collision_sent.is_none() && !flags.iter().any(|&enabled| enabled) {
-            return;
-        }
-        let wants_hurtboxes = flags[1..].iter().any(|&enabled| enabled);
-        if wants_hurtboxes {
-            let paths: BTreeMap<_, _> = self.state.fighters.iter()
-                .filter_map(|fighter| {
-                    Some((fighter_kind_id(&fighter.name)?, fighter.param_path.clone()))
-                })
-                .collect();
-            if paths != self.live_collision_paths {
-                self.live_collision_catalog.clear();
-                self.live_collision_paths = paths;
-                self.live_collision_revision = self.live_collision_revision.wrapping_add(1);
-            }
+        // The plugin prefetches only the fighters present in training, even with the overlay off.
+        let paths: BTreeMap<_, _> = self.state.fighters.iter()
+            .filter_map(|fighter| {
+                Some((fighter_kind_id(&fighter.name)?, fighter.param_path.clone()))
+            })
+            .collect();
+        if paths != self.live_collision_paths {
+            self.live_collision_catalog.clear();
+            self.live_collision_paths = paths;
+            self.live_collision_revision = self.live_collision_revision.wrapping_add(1);
         }
         let revision = self.live_collision_revision;
         if self.live_collision_sent != Some((epoch, flags, revision)) {
@@ -4561,9 +4556,6 @@ impl VisionaryApp {
             self.live_collision_sent = Some((epoch, flags, revision));
         }
         let requests = self.game_link.take_collision_requests(epoch);
-        if !wants_hurtboxes {
-            return;
-        }
         for (kind, requested_revision) in requests {
             if requested_revision != revision {
                 continue;
@@ -4601,7 +4593,7 @@ impl VisionaryApp {
             ui.checkbox(&mut self.live_collision_flags[2], "Intangible — blue");
             ui.checkbox(&mut self.live_collision_flags[3], "Invincible — green");
             ui.small("All loaded fighters use parameter geometry and experimental live status.");
-            ui.small(format!("Hurtbox references loaded on demand: {} fighters.", self.live_collision_catalog.values().filter(|v| !v.is_empty()).count()));
+            ui.small(format!("Hurtbox references cached: {} fighters.", self.live_collision_catalog.values().filter(|v| !v.is_empty()).count()));
             if self.live_collision_flags != old {
                 self.send_live_collision_view();
             }

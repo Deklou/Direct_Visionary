@@ -16,6 +16,9 @@ const RED: [f32; 3] = [1.0, 0.05, 0.05];
 const GRAY: [f32; 3] = [0.75, 0.75, 0.75];
 const BLUE: [f32; 3] = [0.1, 0.45, 1.0];
 const GREEN: [f32; 3] = [0.15, 1.0, 0.25];
+const ATTACK_ALPHA: f32 = 0.55;
+// Overlapping spheres compound opacity; use a lower alpha for body volumes.
+const HURTBOX_ALPHA: f32 = 0.25;
 
 #[derive(Clone, Debug, Deserialize)]
 struct ReferenceVolume {
@@ -224,7 +227,7 @@ fn effective_status(local: i32, whole: i32, off: i32, xlu: i32, invincible: i32)
     }
 }
 
-unsafe fn desired(boma: *mut BattleObjectModuleAccessor, config: &mut Config) -> Vec<Sphere> {
+unsafe fn desired(boma: *mut BattleObjectModuleAccessor, config: &Config) -> Vec<Sphere> {
     let mut out = Vec::new();
     if config.attacks {
         for id in 0..8 {
@@ -248,10 +251,6 @@ unsafe fn desired(boma: *mut BattleObjectModuleAccessor, config: &mut Config) ->
     }
     report_hit_vtable(boma);
     let kind = app::utility::get_kind(&mut *boma);
-    if !config.roster.contains_key(&kind) {
-        request_roster(config, kind);
-        return out;
-    }
     let Some(volumes) = config.roster.get(&kind) else { return out; };
     // PRC shapes are references, not native geometry readback.
     let parts = HitModule::get_part_size(boma, 0) as i32;
@@ -307,7 +306,8 @@ unsafe fn spawn(boma: *mut BattleObjectModuleAccessor, sphere: Sphere) -> Option
         return None;
     }
     EffectModule::set_rgb(boma, handle, sphere.color[0], sphere.color[1], sphere.color[2]);
-    EffectModule::set_alpha(boma, handle, 0.55);
+    let alpha = if sphere.color == RED { ATTACK_ALPHA } else { HURTBOX_ALPHA };
+    EffectModule::set_alpha(boma, handle, alpha);
     EffectModule::set_rate(boma, handle, 8.0);
     Some(Marker { sphere, handle })
 }
@@ -327,16 +327,24 @@ pub unsafe fn tick(boma: *mut BattleObjectModuleAccessor) {
     }
     let Some(mut config) = CONFIG.try_lock() else { return; };
     let server = crate::rust_extender::net::simple_server::has_client();
-    let active = config.as_mut().filter(|(client, c)| {
+    let session = config.as_mut().filter(|(client, _)| {
         server && *client == crate::rust_extender::net::simple_server::client_id()
-            && c.enabled() && app::smashball::is_training_mode()
+            && app::smashball::is_training_mode()
+    });
+    let active = session.and_then(|(_, c)| {
+        // Geometry is warmed up before the first checkbox click.
+        let kind = app::utility::get_kind(&mut *boma);
+        if !c.roster.contains_key(&kind) {
+            request_roster(c, kind);
+        }
+        c.enabled().then_some(c)
     });
     let id = (*boma).battle_object_id;
     let Some(mut objects) = MARKERS.try_lock() else { return; };
     if active.is_none() && !objects.contains_key(&id) {
         return;
     }
-    let want = active.map(|(_, c)| desired(boma, c)).unwrap_or_default();
+    let want = active.map(|c| desired(boma, c)).unwrap_or_default();
     drop(config);
     let previous = objects.remove(&id);
     let mut old = previous.filter(|o| o.accessor == boma as usize)
