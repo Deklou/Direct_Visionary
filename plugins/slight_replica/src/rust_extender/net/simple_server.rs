@@ -23,6 +23,12 @@ const SO_REUSEADDR: i32 = 4;
 // Switch BSD message flags (libnx sys/socket.h), not Linux host flags.
 // Nintendo's BSD service uses Linux errno values (Switchbrew Sockets services).
 const MSG_DONTWAIT: i32 = 0x80;
+const F_GETFL: i32 = 3;
+const F_SETFL: i32 = 4;
+// The Ryujinx BSD service recognizes 0x800. The SDK may translate the
+// FreeBSD O_NONBLOCK (0x4), so verify the mode by reading it back.
+const O_NONBLOCK_BSD: i32 = 0x4;
+const O_NONBLOCK_SERVICE: i32 = 0x800;
 const EINTR: u32 = 4;
 const EAGAIN: u32 = 11;
 const SEND_STALL_MS: f64 = 10_000.0;
@@ -81,7 +87,17 @@ static RECV_RETRIES: AtomicU64 = AtomicU64::new(0);
 static RECV_CALLS: AtomicU64 = AtomicU64::new(0);
 static RECV_MAX: AtomicU64 = AtomicU64::new(0);
 static RECV_STARTED: AtomicU64 = AtomicU64::new(0);
+static ERRNO_MAX: AtomicU64 = AtomicU64::new(0);
+static ERRNO_CALLS: AtomicU64 = AtomicU64::new(0);
 static COALESCED: AtomicU64 = AtomicU64::new(0);
+
+unsafe fn socket_errno() -> u32 {
+    let start = tick_now();
+    let errno = nnsdk::nn::socket::GetLastError();
+    ERRNO_CALLS.fetch_add(1, Ordering::Relaxed);
+    ERRNO_MAX.fetch_max(tick_now().saturating_sub(start), Ordering::Relaxed);
+    errno
+}
 
 fn retryable_socket_error(errno: u32) -> bool {
     matches!(errno, EINTR | EAGAIN)
@@ -124,12 +140,12 @@ pub fn note_network_stats(frame: u64) {
         load(&RX_BYTES), load(&RX_MESSAGES), load(&RX_DISPATCHED), load(&RX_FAST), elapsed_ms(load(&RX_MAX_WAIT)), load(&REQUEUED),
     ));
     crate::slight::diag::note(format!(
-        "TCP flow frame={frame} send_retries={} recv_retries={} coalesced={} recv_calls={} recv_max_ms={:.1} recv_active_ms={:.1}",
+        "TCP flow frame={frame} send_retries={} recv_retries={} coalesced={} recv_calls={} recv_max_ms={:.1} recv_active_ms={:.1} errno_calls={} errno_max_ms={:.1}",
         load(&SEND_RETRIES), load(&RECV_RETRIES), load(&COALESCED), load(&RECV_CALLS),
         elapsed_ms(load(&RECV_MAX)), match load(&RECV_STARTED) {
             0 => 0.0,
             start => elapsed_ms(now.saturating_sub(start)),
-        },
+        }, load(&ERRNO_CALLS), elapsed_ms(load(&ERRNO_MAX)),
     ));
     let mut row = format!("TCP families frame={frame} queued/bytes/sent/bytes/dropped");
     for (name, stats) in FAMILIES.iter().zip(TRAFFIC.iter()) {
@@ -141,6 +157,9 @@ pub fn note_network_stats(frame: u64) {
 }
 
 extern "C" {
+    // Exact variadic SDK import confirmed in Smash 13.0.5's main.
+    #[link_name = "\u{1}_ZN2nn6socket5FcntlEiiz"]
+    fn Fcntl(socket: i32, command: i32, ...) -> i32;
     #[link_name = "\u{1}_ZN2nn6socket4RecvEiPvmi"]
     fn Recv(socket: i32, buffer: *mut u8, bufferLength: u64, flags: i32) -> i64;
     #[link_name = "\u{1}_ZN2nn6socket8ShutdownEii"]
@@ -188,7 +207,7 @@ pub fn capture_budget(max: usize) -> usize {
 fn server_loop(port: u16) {
     unsafe {
         crate::slight::diag::note("SRV thread entered — waiting for first game frame");
-        crate::slight::diag::note(format!("SRV batch v3 single worker max={SEND_BATCH_BYTES} bytes/{SEND_BATCH_CAP} frames"));
+        crate::slight::diag::note(format!("SRV batch v4 persistent nonblocking max={SEND_BATCH_BYTES} bytes/{SEND_BATCH_CAP} frames"));
         // Touching nn::socket BEFORE it is initialized crashes/hangs this thread, and whether
         // skyline's logger has initialized it yet is a boot-order race (lost on some boots).
         // The per-frame driver ticking means boot init — including skyline's socket init — is
@@ -268,7 +287,8 @@ fn server_loop(port: u16) {
                 continue;
             }
             // The same worker owns accept, handshake, receive, send and close.
-            let Some(cid) = handshake(client) else {
+            let flags = configure_client(client);
+            let Some(cid) = handshake(client, flags) else {
                 crate::slight::diag::note(format!(
                     "SRV handshake failed fd={client} — waiting for the next client"
                 ));
@@ -277,7 +297,7 @@ fn server_loop(port: u16) {
             };
             CLIENT_FD.store(client, Ordering::Release);
             crate::rust_extender::debuggable_server::on_rpm_client_connected(cid);
-            serve_client(client);
+            serve_client(client, flags);
             close_client(client);
         }
     }
@@ -333,7 +353,33 @@ fn report_bind_failure(port: u16, rc: u32) {
     skyline::println!("[SLight] bind :{port} failed rc={rc} — second plugin copy? build={build}");
 }
 
-unsafe fn handshake(client: i32) -> Option<u64> {
+// Only touch the accepted Visionary socket. If the SDK/service does not
+// support persistent nonblocking, preserve the tested v3 call flags.
+unsafe fn configure_client(client: i32) -> i32 {
+    let before = Fcntl(client, F_GETFL);
+    let before_errno = if before < 0 { nnsdk::nn::socket::GetLastError() } else { 0 };
+    crate::slight::diag::note(format!("TCP fcntl fd={client} get={before:#x} errno={before_errno}"));
+    if before < 0 {
+        return MSG_DONTWAIT;
+    }
+    // Try the native flag first, then the value accepted by Ryujinx's BSD service.
+    for bit in [O_NONBLOCK_BSD, O_NONBLOCK_SERVICE] {
+        let rc = Fcntl(client, F_SETFL, before | bit);
+        let errno = if rc < 0 { nnsdk::nn::socket::GetLastError() } else { 0 };
+        let after = if rc == 0 { Fcntl(client, F_GETFL) } else { -1 };
+        crate::slight::diag::note(format!(
+            "TCP fcntl fd={client} set={bit:#x} rc={rc} errno={errno} readback={after:#x}"
+        ));
+        if rc == 0 && after >= 0 && after & bit != 0 {
+            crate::slight::diag::note("TCP mode=persistent_nonblocking");
+            return 0;
+        }
+    }
+    crate::slight::diag::note("TCP mode=per_call_nonblocking fallback");
+    MSG_DONTWAIT
+}
+
+unsafe fn handshake(client: i32, flags: i32) -> Option<u64> {
     let cid = CLIENT_ID.fetch_add(1, Ordering::SeqCst) + 1;
     let frames = vec![
         r#"{"header":"RemoveAll","body":"{}"}"#.to_owned(),
@@ -344,7 +390,7 @@ unsafe fn handshake(client: i32) -> Option<u64> {
     let mut batch = TxBatch::new(frames);
     sender_stage(3);
     loop {
-        match batch.write_step(client, false) {
+        match batch.write_step(client, false, flags) {
             Ok(true) => return Some(cid),
             Ok(false) => sleep_ms(4),
             Err(()) => return None,
@@ -401,7 +447,7 @@ impl TxBatch {
     }
 
     /// At most one SDK Send per turn. Keep offsets on short writes and EAGAIN.
-    unsafe fn write_step(&mut self, client: i32, track: bool) -> Result<bool, ()> {
+    unsafe fn write_step(&mut self, client: i32, track: bool, flags: i32) -> Result<bool, ()> {
         let remaining = self.bytes.len() - self.sent;
         if remaining == 0 {
             return Ok(true);
@@ -409,12 +455,13 @@ impl TxBatch {
         let start = tick_now();
         SEND_STARTED.store(start, Ordering::Relaxed);
         let n = nnsdk::nn::socket::Send(
-            client, self.bytes.as_ptr().add(self.sent), remaining as u64, MSG_DONTWAIT
+            client, self.bytes.as_ptr().add(self.sent), remaining as u64, flags
         ) as i64;
-        let errno = if n < 0 { nnsdk::nn::socket::GetLastError() } else { 0 };
+        let duration = tick_now().saturating_sub(start);
         SEND_STARTED.store(0, Ordering::Relaxed);
         SEND_CALLS.fetch_add(1, Ordering::Relaxed);
-        SEND_MAX.fetch_max(tick_now().saturating_sub(start), Ordering::Relaxed);
+        SEND_MAX.fetch_max(duration, Ordering::Relaxed);
+        let errno = if n < 0 { socket_errno() } else { 0 };
         if n < 0 && retryable_socket_error(errno) {
             SEND_RETRIES.fetch_add(1, Ordering::Relaxed);
             if elapsed_ms(tick_now().saturating_sub(self.last_progress)) < SEND_STALL_MS {
@@ -451,14 +498,14 @@ impl TxBatch {
     }
 }
 
-unsafe fn serve_client(client: i32) {
+unsafe fn serve_client(client: i32, flags: i32) {
     let mut batch: Option<TxBatch> = None;
     let mut buf = String::new();
     let mut utf8_tail = Vec::new();
     loop {
         // Alternate one receive and one send. No lock is held during SDK calls.
         sender_stage(5);
-        let received = match recv_once(client, &mut buf, &mut utf8_tail) {
+        let received = match recv_once(client, &mut buf, &mut utf8_tail, flags) {
             Ok(received) => received,
             Err(()) => break,
         };
@@ -469,7 +516,7 @@ unsafe fn serve_client(client: i32) {
         let mut sent = false;
         if let Some(tx) = batch.as_mut() {
             sender_stage(3);
-            match tx.write_step(client, true) {
+            match tx.write_step(client, true, flags) {
                 Ok(true) => {
                     batch = None;
                     sent = true;
@@ -493,15 +540,16 @@ unsafe fn serve_client(client: i32) {
     sender_stage(0);
 }
 
-unsafe fn recv_once(client: i32, buf: &mut String, tail: &mut Vec<u8>) -> Result<bool, ()> {
+unsafe fn recv_once(client: i32, buf: &mut String, tail: &mut Vec<u8>, flags: i32) -> Result<bool, ()> {
     let mut chunk = [0u8; 4096];
     let start = tick_now();
     RECV_STARTED.store(start, Ordering::Relaxed);
-    let n = Recv(client, chunk.as_mut_ptr(), chunk.len() as u64, MSG_DONTWAIT);
-    let errno = if n < 0 { nnsdk::nn::socket::GetLastError() } else { 0 };
+    let n = Recv(client, chunk.as_mut_ptr(), chunk.len() as u64, flags);
+    let duration = tick_now().saturating_sub(start);
     RECV_STARTED.store(0, Ordering::Relaxed);
     RECV_CALLS.fetch_add(1, Ordering::Relaxed);
-    RECV_MAX.fetch_max(tick_now().saturating_sub(start), Ordering::Relaxed);
+    RECV_MAX.fetch_max(duration, Ordering::Relaxed);
+    let errno = if n < 0 { socket_errno() } else { 0 };
     if n < 0 && retryable_socket_error(errno) {
         RECV_RETRIES.fetch_add(1, Ordering::Relaxed);
         return Ok(false);
