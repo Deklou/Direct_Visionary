@@ -8,6 +8,7 @@ pub mod frame_context;
 pub mod fighter_traits;
 pub mod hitbox_viewer;
 pub mod hurtbox_geometry;
+pub mod collision_view;
 pub mod jab_cancel;
 pub mod main_smash;
 pub mod math;

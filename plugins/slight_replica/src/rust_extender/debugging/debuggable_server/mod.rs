@@ -340,6 +340,24 @@ fn parse_tcp_payload(raw: &str) -> Option<ParsedEdit> {
         return None;
     }
 
+    if let Some(value) = v.get("collision_view") {
+        match serde_json::from_value(value.clone()) {
+            Ok(settings) => crate::slight::collision_view::set_config(settings),
+            Err(error) => crate::slight::diag::note(format!("COLLISION flags parse error: {error}")),
+        }
+        return None;
+    }
+    if let Some(value) = v.get("collision_roster") {
+        match serde_json::from_value(value.clone()) {
+            Ok(reply) => {
+                crate::slight::diag::note(format!("COLLISION roster received bytes={}", raw.len()));
+                crate::slight::collision_view::set_roster(reply);
+            }
+            Err(error) => crate::slight::diag::note(format!("COLLISION roster parse error: {error}")),
+        }
+        return None;
+    }
+
     // Experimental fighter parameters: replace only the two supported float attributes.
     if let Some(value) = v.get("trait_rules") {
         match serde_json::from_value::<Vec<crate::slight::fighter_traits::TraitRule>>(value.clone()) {
