@@ -298,7 +298,6 @@ unsafe fn handshake(client: i32, flags: i32) -> Option<u64> {
         ),
     ];
     let mut batch = TxBatch::new(frames);
-
     loop {
         match batch.write_step(client, false, flags) {
             Ok(true) => return Some(cid),
@@ -400,18 +399,15 @@ unsafe fn serve_client(client: i32, flags: i32) {
     let mut utf8_tail = Vec::new();
     loop {
         // Alternate one receive and one send. No lock is held during SDK calls.
-
         let received = match recv_once(client, &mut buf, &mut utf8_tail, flags) {
             Ok(received) => received,
             Err(()) => break,
         };
         if batch.is_none() {
-
             batch = take_batch();
         }
         let mut sent = false;
         if let Some(tx) = batch.as_mut() {
-
             match tx.write_step(client, true, flags) {
                 Ok(true) => {
                     batch = None;
@@ -429,11 +425,9 @@ unsafe fn serve_client(client: i32, flags: i32) {
     // Stop publishing before restoring unsent frames. The next client receives
     // its own handshake before any queued application data.
     CLIENT_FD.store(-1, Ordering::Release);
-
     if let Some(tx) = batch {
         tx.requeue();
     }
-
 }
 
 unsafe fn recv_once(client: i32, buf: &mut String, tail: &mut Vec<u8>, flags: i32) -> Result<bool, ()> {
@@ -546,14 +540,12 @@ fn inbound_push(payload: String) {
     // paused or heavily loaded game still proves that its socket thread is alive.
     if is_ping(&payload) {
         queue_pong();
-
         return;
     }
     // Timing rules are pure shared state. Install them on receipt so the next ACMD coroutine
     // boundary can see a frame-0 edit; the general parser below remains responsible for all
     // commands and game-thread-only updates.
     if crate::rust_extender::debuggable_server::apply_timing_rules_from_network(&payload) {
-
         return;
     }
     loop {
