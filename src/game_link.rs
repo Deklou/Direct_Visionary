@@ -1263,6 +1263,7 @@ struct Shared {
     status: LinkStatus,
     client_id: Option<u64>,
     connection_epoch: u64,
+    collision_requests: BTreeMap<i32, u64>,
     kinds: BTreeMap<u64, LiveKind>,
     /// Live ACMD capture log, keyed by motion hash (deduped; survives reconnects).
     captures: BTreeMap<u64, Vec<CaptureLine>>,
@@ -1402,6 +1403,7 @@ impl Default for Shared {
             status: LinkStatus::Disconnected,
             client_id: None,
             connection_epoch: 0,
+            collision_requests: BTreeMap::new(),
             kinds: BTreeMap::new(),
             captures: BTreeMap::new(),
             capture_claimed_runs: BTreeMap::new(),
@@ -1542,33 +1544,66 @@ impl GameLink {
             .unwrap_or(false)
     }
 
-    /// Session-only visualizer settings. Never changes authored collision rules.
-    pub fn send_collision_view(
-        &self,
-        flags: [bool; 4],
-        roster: &BTreeMap<i32, Vec<CollisionReferenceWire>>,
-    ) -> bool {
-        if self.sends_suppressed() || self.status() != LinkStatus::Connected {
+    /// Small session-only flags, independent of the hurtbox reference geometry.
+    pub fn send_collision_view(&self, epoch: u64, flags: [bool; 4], revision: u64) -> bool {
+        if self.sends_suppressed() {
             return false;
         }
-        let Ok(payload) = serde_json::to_string(&serde_json::json!({
+        let Ok(mut s) = self.shared.lock() else { return false; };
+        let Some(client_id) = s.client_id else { return false; };
+        if s.status != LinkStatus::Connected || s.connection_epoch != epoch {
+            return false;
+        }
+        let payload = serde_json::json!({
             "collision_view": {
+                "client_id": client_id,
+                "revision": revision,
                 "attacks": flags[0],
                 "hurtboxes": flags[1],
                 "intangible": flags[2],
                 "invincible": flags[3],
-                "roster": roster,
             }
-        })) else {
-            return false;
-        };
-        let frame = format!("<TCP_MESSAGE>{payload}</TCP_MESSAGE>");
-        if let Ok(mut s) = self.shared.lock() {
-            queue_latest_full_replace(&mut s.outbox, frame);
-            true
-        } else {
-            false
+        });
+        queue_latest_full_replace(&mut s.outbox, format!("<TCP_MESSAGE>{payload}</TCP_MESSAGE>"));
+        true
+    }
+
+    pub fn take_collision_requests(&self, epoch: u64) -> BTreeMap<i32, u64> {
+        if self.sends_suppressed() {
+            return BTreeMap::new();
         }
+        let Ok(mut s) = self.shared.lock() else { return BTreeMap::new(); };
+        if s.client_id.is_none() || s.connection_epoch != epoch {
+            return BTreeMap::new();
+        }
+        std::mem::take(&mut s.collision_requests)
+    }
+
+    /// Answer one fighter request with compact tuples, not the entire roster.
+    pub fn send_collision_roster(
+        &self,
+        epoch: u64,
+        revision: u64,
+        kind: i32,
+        volumes: &[CollisionReferenceWire],
+    ) -> bool {
+        if self.sends_suppressed() {
+            return false;
+        }
+        let Ok(mut s) = self.shared.lock() else { return false; };
+        let Some(client_id) = s.client_id else { return false; };
+        if s.status != LinkStatus::Connected || s.connection_epoch != epoch {
+            return false;
+        }
+        let compact: Vec<_> = volumes.iter().take(128)
+            .map(|v| (v.index, v.bone, v.endpoint1, v.endpoint2, v.radius))
+            .collect();
+        let Ok(geometry) = serde_json::to_string(&compact) else { return false; };
+        let prefix = format!("<TCP_MESSAGE>{{\"collision_roster\":{{\"kind\":{kind},");
+        let frame = format!("{prefix}\"client_id\":{client_id},\"revision\":{revision},\"volumes\":{geometry}}}}}</TCP_MESSAGE>");
+        s.outbox.retain(|message| !message.starts_with(&prefix));
+        push_outbox_capped(&mut s.outbox, frame);
+        true
     }
 
     /// Replace the complete live fighter-trait snapshot. An empty list restores vanilla reads.
@@ -2546,7 +2581,18 @@ fn handle_frame(shared: &Arc<Mutex<Shared>>, payload: &str) {
             }
         }
         "RemoveAll" => s.kinds.clear(),
+        "CollisionRosterRequest" => {
+            let client = body.get("client_id").and_then(|v| v.as_u64());
+            let kind = body.get("kind").and_then(|v| v.as_i64());
+            let revision = body.get("revision").and_then(|v| v.as_u64());
+            if let (Some(client), Some(kind), Some(revision)) = (client, kind, revision) {
+                if s.client_id == Some(client) && (0..128).contains(&kind) {
+                    s.collision_requests.insert(kind as i32, revision);
+                }
+            }
+        }
         "GiveClientId" => {
+            s.collision_requests.clear();
             let client_id = body
                 .get("GiveClientId")
                 .and_then(|g| g.get("client_id"))

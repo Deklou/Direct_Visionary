@@ -28,11 +28,24 @@ struct ReferenceVolume {
 
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct Config {
+    client_id: u64,
+    revision: u64,
     attacks: bool,
     hurtboxes: bool,
     intangible: bool,
     invincible: bool,
+    #[serde(skip)]
     roster: HashMap<i32, Vec<ReferenceVolume>>,
+    #[serde(skip)]
+    requests: HashMap<i32, u16>,
+}
+
+#[derive(Deserialize)]
+pub struct RosterReply {
+    client_id: u64,
+    revision: u64,
+    kind: i32,
+    volumes: Vec<(u32, u64, [f32; 3], [f32; 3], f32)>,
 }
 
 impl Config {
@@ -72,14 +85,69 @@ fn valid_geometry(bone: u64, a: [f32; 3], b: [f32; 3], radius: f32) -> bool {
 }
 
 pub fn set_config(mut config: Config) {
-    config.roster.retain(|kind, volumes| {
-        volumes.truncate(128);
-        volumes.retain(|v| v.index < 128
-            && valid_geometry(v.bone, v.endpoint1, v.endpoint2, v.radius));
-        (0..128).contains(kind) && !volumes.is_empty()
-    });
     let client = crate::rust_extender::net::simple_server::client_id();
-    *CONFIG.lock() = Some((client, config));
+    if config.client_id != client {
+        return;
+    }
+    let mut slot = CONFIG.lock();
+    if let Some((previous_client, previous)) = slot.as_mut() {
+        if *previous_client == client && previous.revision == config.revision {
+            config.roster = std::mem::take(&mut previous.roster);
+            config.requests = std::mem::take(&mut previous.requests);
+        }
+    }
+    crate::slight::diag::note(format!(
+        "COLLISION flags client={client} revision={} attacks={} hurtboxes={} intangible={} invincible={} cached={}",
+        config.revision, config.attacks, config.hurtboxes, config.intangible, config.invincible,
+        config.roster.len(),
+    ));
+    *slot = Some((client, config));
+}
+
+pub fn set_roster(reply: RosterReply) {
+    let client = crate::rust_extender::net::simple_server::client_id();
+    if reply.client_id != client || !(0..128).contains(&reply.kind) {
+        return;
+    }
+    let mut slot = CONFIG.lock();
+    let Some((configured_client, config)) = slot.as_mut() else { return; };
+    if *configured_client != client || config.revision != reply.revision {
+        return;
+    }
+    let volumes: Vec<_> = reply.volumes.into_iter().take(128)
+        .filter(|(index, bone, a, b, radius)| *index < 128 && valid_geometry(*bone, *a, *b, *radius))
+        .map(|(index, bone, endpoint1, endpoint2, radius)| ReferenceVolume {
+            index, bone, endpoint1, endpoint2, radius,
+        }).collect();
+    crate::slight::diag::note(format!(
+        "COLLISION roster client={client} revision={} kind={} volumes={}",
+        reply.revision, reply.kind, volumes.len(),
+    ));
+    config.roster.insert(reply.kind, volumes);
+    config.requests.remove(&reply.kind);
+}
+
+fn request_roster(config: &mut Config, kind: i32) {
+    if !(0..128).contains(&kind) {
+        return;
+    }
+    let remaining = config.requests.entry(kind).or_insert(0);
+    if *remaining != 0 {
+        *remaining -= 1;
+        return;
+    }
+    // Retry if the request or response was dropped; empty replies are cached too.
+    *remaining = 240;
+    let client_id = config.client_id;
+    let revision = config.revision;
+    let message = serde_json::json!({
+        "header": "CollisionRosterRequest",
+        "body": { "client_id": client_id, "revision": revision, "kind": kind }
+    });
+    crate::rust_extender::net::simple_server::queue(message.to_string());
+    crate::slight::diag::note(format!(
+        "COLLISION request client={client_id} revision={revision} kind={kind}"
+    ));
 }
 
 /// Bypass Visionary's aliases, carrier redirects and capture for our own spawn.
@@ -156,7 +224,7 @@ fn effective_status(local: i32, whole: i32, off: i32, xlu: i32, invincible: i32)
     }
 }
 
-unsafe fn desired(boma: *mut BattleObjectModuleAccessor, config: &Config) -> Vec<Sphere> {
+unsafe fn desired(boma: *mut BattleObjectModuleAccessor, config: &mut Config) -> Vec<Sphere> {
     let mut out = Vec::new();
     if config.attacks {
         for id in 0..8 {
@@ -180,9 +248,11 @@ unsafe fn desired(boma: *mut BattleObjectModuleAccessor, config: &Config) -> Vec
     }
     report_hit_vtable(boma);
     let kind = app::utility::get_kind(&mut *boma);
-    let Some(volumes) = config.roster.get(&kind) else {
+    if !config.roster.contains_key(&kind) {
+        request_roster(config, kind);
         return out;
-    };
+    }
+    let Some(volumes) = config.roster.get(&kind) else { return out; };
     // PRC shapes are references, not native geometry readback.
     let parts = HitModule::get_part_size(boma, 0) as i32;
     if !(1..=128).contains(&parts) {
@@ -255,9 +325,9 @@ pub unsafe fn tick(boma: *mut BattleObjectModuleAccessor) {
     {
         return;
     }
-    let Some(config) = CONFIG.try_lock() else { return; };
+    let Some(mut config) = CONFIG.try_lock() else { return; };
     let server = crate::rust_extender::net::simple_server::has_client();
-    let active = config.as_ref().filter(|(client, c)| {
+    let active = config.as_mut().filter(|(client, c)| {
         server && *client == crate::rust_extender::net::simple_server::client_id()
             && c.enabled() && app::smashball::is_training_mode()
     });
@@ -303,6 +373,20 @@ pub fn forget_match() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn flags_and_geometry_are_separate_wire_messages() {
+        let flags: Config = serde_json::from_str(
+            r#"{"client_id":2,"revision":1,"attacks":true,"hurtboxes":false,"intangible":false,"invincible":false}"#,
+        ).unwrap();
+        assert!(flags.attacks);
+        assert!(flags.roster.is_empty());
+        let reply: RosterReply = serde_json::from_str(
+            r#"{"kind":3,"client_id":2,"revision":1,"volumes":[[0,123,[1,2,3],[4,5,6],2.5]]}"#,
+        ).unwrap();
+        assert_eq!(reply.kind, 3);
+        assert_eq!(reply.volumes[0], (0, 123, [1.0, 2.0, 3.0], [4.0, 5.0, 6.0], 2.5));
+    }
 
     #[test]
     fn global_and_local_status_are_combined() {

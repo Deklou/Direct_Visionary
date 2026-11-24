@@ -341,8 +341,19 @@ fn parse_tcp_payload(raw: &str) -> Option<ParsedEdit> {
     }
 
     if let Some(value) = v.get("collision_view") {
-        if let Ok(settings) = serde_json::from_value(value.clone()) {
-            crate::slight::collision_view::set_config(settings);
+        match serde_json::from_value(value.clone()) {
+            Ok(settings) => crate::slight::collision_view::set_config(settings),
+            Err(error) => crate::slight::diag::note(format!("COLLISION flags parse error: {error}")),
+        }
+        return None;
+    }
+    if let Some(value) = v.get("collision_roster") {
+        match serde_json::from_value(value.clone()) {
+            Ok(reply) => {
+                crate::slight::diag::note(format!("COLLISION roster received bytes={}", raw.len()));
+                crate::slight::collision_view::set_roster(reply);
+            }
+            Err(error) => crate::slight::diag::note(format!("COLLISION roster parse error: {error}")),
         }
         return None;
     }

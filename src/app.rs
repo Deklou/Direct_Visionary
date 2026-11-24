@@ -3162,7 +3162,8 @@ pub struct VisionaryApp {
     /// no parameter data, while the checkbox itself is disabled for that fighter.
     show_hurtboxes: bool,
     live_collision_flags: [bool; 4],
-    live_collision_sent: Option<(u64, [bool; 4])>,
+    live_collision_sent: Option<(u64, [bool; 4], u64)>,
+    live_collision_revision: u64,
     live_collision_paths: BTreeMap<i32, PathBuf>,
     live_collision_catalog: BTreeMap<i32, Vec<crate::game_link::CollisionReferenceWire>>,
     show_debug: bool,
@@ -3642,6 +3643,7 @@ impl VisionaryApp {
             show_hurtboxes: load_hurtbox_visibility(),
             live_collision_flags: [false; 4],
             live_collision_sent: None,
+            live_collision_revision: 0,
             live_collision_paths: BTreeMap::new(),
             live_collision_catalog: BTreeMap::new(),
             show_debug: false,
@@ -4546,35 +4548,47 @@ impl VisionaryApp {
                 })
                 .collect();
             if paths != self.live_collision_paths {
-                self.live_collision_catalog = paths.iter()
-                    .filter_map(|(&kind, path)| {
-                        let volumes: Vec<_> = crate::data::load_live_hurtbox_volumes(path).volumes
-                            .into_iter()
-                            .filter(|v| matches!(v.shape, crate::data::HurtboxShape::Capsule))
-                            .filter(|v| v.index < 128 && v.radius > 0.0 && v.radius.is_finite())
-                            .map(|v| crate::game_link::CollisionReferenceWire {
-                                index: v.index as u32,
-                                bone: v.bone_hash,
-                                endpoint1: v.endpoint1,
-                                endpoint2: v.endpoint2,
-                                radius: v.radius,
-                            })
-                            .take(128)
-                            .collect();
-                        (!volumes.is_empty()).then_some((kind, volumes))
-                    })
-                    .collect();
+                self.live_collision_catalog.clear();
                 self.live_collision_paths = paths;
-                self.live_collision_sent = None;
+                self.live_collision_revision = self.live_collision_revision.wrapping_add(1);
             }
         }
-        if self.live_collision_sent == Some((epoch, flags)) {
+        let revision = self.live_collision_revision;
+        if self.live_collision_sent != Some((epoch, flags, revision)) {
+            if !self.game_link.send_collision_view(epoch, flags, revision) {
+                return;
+            }
+            self.live_collision_sent = Some((epoch, flags, revision));
+        }
+        let requests = self.game_link.take_collision_requests(epoch);
+        if !wants_hurtboxes {
             return;
         }
-        let empty = BTreeMap::new();
-        let roster = if wants_hurtboxes { &self.live_collision_catalog } else { &empty };
-        if self.game_link.send_collision_view(flags, roster) {
-            self.live_collision_sent = Some((epoch, flags));
+        for (kind, requested_revision) in requests {
+            if requested_revision != revision {
+                continue;
+            }
+            if !self.live_collision_catalog.contains_key(&kind) {
+                let volumes = self.live_collision_paths.get(&kind)
+                    .map(|path| crate::data::load_live_hurtbox_volumes(path).volumes
+                        .into_iter()
+                        .filter(|v| matches!(v.shape, crate::data::HurtboxShape::Capsule))
+                        .filter(|v| v.index < 128 && v.radius > 0.0 && v.radius.is_finite())
+                        .map(|v| crate::game_link::CollisionReferenceWire {
+                            index: v.index as u32,
+                            bone: v.bone_hash,
+                            endpoint1: v.endpoint1,
+                            endpoint2: v.endpoint2,
+                            radius: v.radius,
+                        })
+                        .take(128)
+                        .collect())
+                    .unwrap_or_default();
+                self.live_collision_catalog.insert(kind, volumes);
+            }
+            if let Some(volumes) = self.live_collision_catalog.get(&kind) {
+                self.game_link.send_collision_roster(epoch, revision, kind, volumes);
+            }
         }
     }
 
@@ -4587,7 +4601,7 @@ impl VisionaryApp {
             ui.checkbox(&mut self.live_collision_flags[2], "Intangible — blue");
             ui.checkbox(&mut self.live_collision_flags[3], "Invincible — green");
             ui.small("All loaded fighters use parameter geometry and experimental live status.");
-            ui.small(format!("Hurtbox references available for {} fighters.", self.live_collision_catalog.len()));
+            ui.small(format!("Hurtbox references loaded on demand: {} fighters.", self.live_collision_catalog.values().filter(|v| !v.is_empty()).count()));
             if self.live_collision_flags != old {
                 self.send_live_collision_view();
             }
