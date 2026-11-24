@@ -84,7 +84,7 @@ fn traffic(inner: &str) -> &'static Traffic {
 }
 
 pub fn tick_now() -> u64 {
-    unsafe { nnsdk::nn::os::GetSystemTick() as u64 }
+    unsafe { skyline::nn::os::GetSystemTick() as u64 }
 }
 
 fn elapsed_ms(ticks: u64) -> f64 {
