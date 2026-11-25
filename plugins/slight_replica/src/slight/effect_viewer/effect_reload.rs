@@ -1305,47 +1305,60 @@ const CARRIER_SWAP_MAX_WAIT: u64 = 1800;
 /// resulting GPU upload. A manual `load_effects` skips that and leaves the set invisible — the
 /// wall that stopped [`do_force_reread`].
 ///
-/// The handle is resolved through the manager's KIND map, not through [`ACTIVE_SLOTS`]. Our own
-/// slot table is cleared by `untrack_slot` as soon as the outgoing object unloads, so by the time
-/// a swap gets here it is always empty for the carrier — the first attempt at this reported
-/// `evicted=0` for exactly that reason. The kind map is the table that outlives the object, which
-/// is what makes it both the cause of the staleness and the way to find it.
+/// Only the handle observed for the actual outgoing carrier folder is eligible.
+/// Entry names are global: a newly staged transplant can resolve to a live fighter's handle.
+/// Never use those names as evidence of ownership.
 unsafe fn evict_carrier_effect_handle(ef_file: &str) -> usize {
     let manager = effect_manager();
     if manager.is_null() {
         return 0;
     }
-    let mut handles: Vec<u32> = Vec::new();
-    // The handle observed while the previous carrier was live. Held separately because a swap to
-    // an entirely different effect shares no kind name with the content being replaced, so the
-    // current kinds alone would resolve nothing.
-    let remembered = AUTO_CARRIER_HANDLE.swap(0, Ordering::Relaxed) as u32;
-    if remembered != 0 {
-        handles.push(remembered);
+    let handle = AUTO_CARRIER_HANDLE.swap(0, Ordering::Relaxed) as u32;
+    let folder_hash = smash::hash40(eff_dir(ef_file));
+    if handle == 0
+        || AUTO_CARRIER_LOADED_FOLDER.load(Ordering::Acquire) != folder_hash
+    {
+        return 0;
     }
-    for kind in AUTO_CARRIER_KINDS.lock().iter() {
-        if let Some((handle, _)) = kind_lookup(manager, *kind) {
-            handles.push(handle);
-        }
+    let Some(slot) = carrier_manager_slot(manager, handle, folder_hash) else {
+        return 0;
+    };
+    // 13.0.5 load/unload (main+0x355fea0 / 0x3563cd0):
+    // slot+0x98 is its refcount; nonzero means a native owner can still use it.
+    // This is a conservative check, NOT a substitute for the manager mutex or
+    // a dedicated resource identity. Keep the legacy carrier disabled.
+    let refs = *((slot + 0x98) as *const i32);
+    if refs != 0 || ACTIVE_SLOTS.lock().contains_key(&handle) {
+        dlog(&format!("CARRIER_EVICT_REFUSED handle={handle} refs={refs}"));
+        return 0;
     }
-    handles.sort_unstable();
-    handles.dedup();
-    let folder = eff_dir(ef_file).to_string();
-    let mut evicted = 0;
-    for handle in handles {
-        if evict_handle_from_manager_map(manager, handle) {
-            evicted += 1;
-            dlog(&format!(
-                "CARRIER_EVICT folder={folder} handle={handle} (next load re-parses)"
-            ));
-        }
+    if evict_handle_from_manager_map(manager, handle) {
+        dlog(&format!("CARRIER_EVICT folder={} handle={handle}", eff_dir(ef_file)));
+        1
+    } else {
+        0
     }
-    evicted
 }
 
-/// Effect handle of the live carrier, remembered so a later swap can evict it even when the new
-/// content shares no entry name with the old. Zero when no carrier has been observed loaded.
+/// Native slot identity, independently verified against the folder hash written by load_effects.
+/// The manager has 30 slots of stride 0xa8, starting at +0x18000.
+unsafe fn carrier_manager_slot(manager: *mut u64, handle: u32, folder_hash: u64) -> Option<usize> {
+    if folder_hash == 0 {
+        return None;
+    }
+    let index = manager_slot_for_handle(manager, handle)?;
+    if index >= 30 {
+        return None;
+    }
+    let slot = manager as usize + 0x18000 + index as usize * 0xa8;
+    (*((slot + 0x08) as *const u64) == folder_hash
+        && *(slot as *const i32) == handle as i32).then_some(slot)
+}
+
+/// Effect handle of the live carrier, remembered across retirement.
 static AUTO_CARRIER_HANDLE: AtomicU64 = AtomicU64::new(0);
+/// Folder of the carrier actually constructed, not the next editor snapshot.
+static AUTO_CARRIER_LOADED_FOLDER: AtomicU64 = AtomicU64::new(0);
 /// Current carrier's effect-set object. Unlike the kind map, this exposes the render-resource
 /// state machine directly (`+0x20`: 0 loading, 3 ready) and lets the readiness hook distinguish
 /// "never scheduled" from "scheduled but waiting on a missing resource handle".
@@ -1425,19 +1438,28 @@ unsafe fn retiring_carrier_kinds_present() -> usize {
         .count()
 }
 
-/// Record the effect handle the carrier's blessed load produced, by resolving any of its entry
-/// names through the manager's kind map.
+/// Identify a single successful load of the carrier's own folder, never by a global effect name.
+fn unique_carrier_handle(slots: &HashMap<u32, EffectSlot>, folder_hash: u64) -> Option<u32> {
+    if folder_hash == 0 {
+        return None;
+    }
+    let mut matches = slots.iter().filter(|(handle, slot)| {
+        **handle != 0 && slot.result == 1 && slot.path_hash == folder_hash
+    }).map(|(handle, _)| *handle);
+    let handle = matches.next()?;
+    matches.next().is_none().then_some(handle)
+}
+
 unsafe fn remember_carrier_handle() {
     let manager = effect_manager();
     if manager.is_null() {
         return;
     }
-    let handle = AUTO_CARRIER_KINDS
-        .lock()
-        .iter()
-        .find_map(|kind| kind_lookup(manager, *kind))
-        .map(|(handle, _)| handle);
-    if let Some(handle) = handle {
+    let folder_hash = AUTO_CARRIER_LOADED_FOLDER.load(Ordering::Acquire);
+    let handle = unique_carrier_handle(&ACTIVE_SLOTS.lock(), folder_hash);
+    if let Some(handle) = handle.filter(|handle| {
+        carrier_manager_slot(manager, *handle, folder_hash).is_some()
+    }) {
         AUTO_CARRIER_HANDLE.store(handle as u64, Ordering::Relaxed);
         let set = unsafe { set_object_for_handle(manager, handle) };
         AUTO_CARRIER_SET.store(set, Ordering::Release);
@@ -2285,6 +2307,7 @@ pub unsafe fn pump_auto_carrier(boma: *mut smash::app::BattleObjectModuleAccesso
     mark(&format!(
         "auto_carrier_pre_reserve path={ef_file} item_kind={item_kind:#x} gen={generation} disk_gen={disk_generation} file={file_state:?} directory={dir_state:?} handle_evicted={evicted}"
     ));
+    AUTO_CARRIER_LOADED_FOLDER.store(smash::hash40(eff_dir(&ef_file)), Ordering::Release);
     let have_result = smash::app::lua_bind::ItemModule::have_item(
         boma,
         smash::app::ItemKind(item_kind),
@@ -4140,4 +4163,19 @@ pub fn pump_carrier_status() {
 /// Make the next [`pump_carrier_status`] re-send unconditionally (new client connected).
 pub fn reset_carrier_status_latch() {
     LAST_CARRIER_REPORT.store(u64::MAX, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+#[test]
+fn carrier_handle_requires_unique_successful_folder_load() {
+    let slot = |path_hash, result| EffectSlot { search_index: 1, path_hash, result };
+    let mut slots = HashMap::from([(10, slot(100, 1)), (20, slot(200, 1)), (30, slot(100, 0))]);
+    assert_eq!(unique_carrier_handle(&slots, 100), Some(10));
+    assert_eq!(unique_carrier_handle(&slots, 200), Some(20));
+    assert_eq!(unique_carrier_handle(&slots, 300), None);
+    assert_eq!(unique_carrier_handle(&slots, 0), None);
+    slots.insert(40, slot(100, 1));
+    assert_eq!(unique_carrier_handle(&slots, 100), None);
+    slots.remove(&10);
+    assert_eq!(unique_carrier_handle(&slots, 100), Some(40));
 }
