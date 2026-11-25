@@ -1017,6 +1017,7 @@ pub struct HitboxRuleWire {
 #[derive(Serialize)]
 struct ScopedSpawnRuleWire<'a> {
     fighter_kind: i32,
+    costume_slots: &'a [u8],
     #[serde(flatten)]
     rule: &'a SpawnRuleWire,
 }
@@ -1024,6 +1025,7 @@ struct ScopedSpawnRuleWire<'a> {
 #[derive(Serialize)]
 struct ScopedEffectControlRuleWire<'a> {
     fighter_kind: i32,
+    costume_slots: &'a [u8],
     #[serde(flatten)]
     rule: &'a EffectControlRuleWire,
 }
@@ -1031,6 +1033,7 @@ struct ScopedEffectControlRuleWire<'a> {
 #[derive(Serialize)]
 struct ScopedHitboxRuleWire<'a> {
     fighter_kind: i32,
+    costume_slots: &'a [u8],
     #[serde(flatten)]
     rule: &'a HitboxRuleWire,
 }
@@ -1285,6 +1288,7 @@ struct Shared {
     client_id: Option<u64>,
     /// Only a matching plugin can consume the scoped-cancel wire format.
     scoped_cancels_supported: bool,
+    scoped_acmd_supported: bool,
     connection_epoch: u64,
     collision_requests: BTreeMap<i32, u64>,
     kinds: BTreeMap<u64, LiveKind>,
@@ -1384,17 +1388,19 @@ fn retain_latest_for_marker(messages: &mut Vec<String>, marker: &str) {
 /// queueing (so offline drags cannot grow the outbox without bound) and when flushing
 /// (so a burst of queued states sends once).
 fn retain_latest_full_replace(messages: &mut Vec<String>) {
-    // Legacy and scoped cancels replace the same runtime list, including a legacy clear.
-    let is_cancel = |frame: &str| {
-        frame.contains("\"cancel_rules\":") || frame.contains("\"cancel_rules_scoped\":")
-    };
-    if let Some(latest) = messages.iter().rposition(|frame| is_cancel(frame)) {
-        let mut index = 0;
-        messages.retain(|frame| {
-            let keep = !is_cancel(frame) || index == latest;
-            index += 1;
-            keep
-        });
+    // Each legacy clear and scoped snapshot replace the same runtime list.
+    for family in ["cancel_rules", "hitbox_rules", "spawn_rules", "effect_control_rules"] {
+        let legacy = format!("\"{family}\":");
+        let scoped = format!("\"{family}_scoped\":");
+        let same_family = |frame: &str| frame.contains(&legacy) || frame.contains(&scoped);
+        if let Some(latest) = messages.iter().rposition(|frame| same_family(frame)) {
+            let mut index = 0;
+            messages.retain(|frame| {
+                let keep = !same_family(frame) || index == latest;
+                index += 1;
+                keep
+            });
+        }
     }
     for marker in FULL_REPLACE_MARKERS {
         retain_latest_for_marker(messages, marker);
@@ -1452,6 +1458,7 @@ impl Default for Shared {
             status: LinkStatus::Disconnected,
             client_id: None,
             scoped_cancels_supported: false,
+            scoped_acmd_supported: false,
             connection_epoch: 0,
             collision_requests: BTreeMap::new(),
             kinds: BTreeMap::new(),
@@ -1726,23 +1733,47 @@ impl GameLink {
         })
     }
 
+    /// Send a scoped full replacement only to a plugin that advertised this protocol on the
+    /// current socket. An unverified target or legacy plugin receives a clear, never a rule.
+    fn send_scoped_acmd_payload<T: Serialize>(&self, family: &str, rules: &[T], valid: bool) -> bool {
+        if self.sends_suppressed() {
+            return false;
+        }
+        let scoped_key = format!("{family}_scoped");
+        let scoped = serde_json::to_string(&serde_json::json!({ (scoped_key): rules })).ok();
+        let clear = format!("<TCP_MESSAGE>{{\"{family}\":[]}}</TCP_MESSAGE>");
+        let Ok(mut shared) = self.shared.lock() else { return false; };
+        let supported = valid && shared.status == LinkStatus::Connected
+            && shared.client_id.is_some() && shared.scoped_acmd_supported;
+        let (frame, sent) = match (supported, scoped) {
+            (true, Some(payload)) => (format!("<TCP_MESSAGE>{payload}</TCP_MESSAGE>"), true),
+            _ => (clear, false),
+        };
+        queue_latest_full_replace(&mut shared.outbox, frame);
+        shared.edits_tx += 1;
+        sent
+    }
+
     /// Legacy serializers retained for wire-shape tests.
     #[cfg(test)]
     pub fn send_spawn_rules(&self, rules: &[SpawnRuleWire]) {
         self.send_spawn_payload(rules);
     }
 
-    pub fn send_scoped_spawn_rules(&self, rules: &[(i32, &SpawnRuleWire)]) {
+    pub fn send_scoped_spawn_rules(&self, rules: &[(i32, &[u8], &SpawnRuleWire)]) -> bool {
         let scoped: Vec<_> = rules
             .iter()
-            .map(|(fighter_kind, rule)| ScopedSpawnRuleWire {
+            .map(|(fighter_kind, costume_slots, rule)| ScopedSpawnRuleWire {
                 fighter_kind: *fighter_kind,
+                costume_slots: *costume_slots,
                 rule: *rule,
             })
             .collect();
-        self.send_spawn_payload(&scoped);
+        let valid = scoped.iter().all(|rule| rule.fighter_kind >= 0 && !rule.costume_slots.is_empty());
+        self.send_scoped_acmd_payload("spawn_rules", &scoped, valid)
     }
 
+    #[cfg(test)]
     fn send_spawn_payload<T: Serialize>(&self, rules: &[T]) {
         if self.sends_suppressed() {
             return;
@@ -1763,17 +1794,20 @@ impl GameLink {
         self.send_effect_control_payload(rules);
     }
 
-    pub fn send_scoped_effect_control_rules(&self, rules: &[(i32, &EffectControlRuleWire)]) {
+    pub fn send_scoped_effect_control_rules(&self, rules: &[(i32, &[u8], &EffectControlRuleWire)]) -> bool {
         let scoped: Vec<_> = rules
             .iter()
-            .map(|(fighter_kind, rule)| ScopedEffectControlRuleWire {
+            .map(|(fighter_kind, costume_slots, rule)| ScopedEffectControlRuleWire {
                 fighter_kind: *fighter_kind,
+                costume_slots: *costume_slots,
                 rule: *rule,
             })
             .collect();
-        self.send_effect_control_payload(&scoped);
+        let valid = scoped.iter().all(|rule| rule.fighter_kind >= 0 && !rule.costume_slots.is_empty());
+        self.send_scoped_acmd_payload("effect_control_rules", &scoped, valid)
     }
 
+    #[cfg(test)]
     fn send_effect_control_payload<T: Serialize>(&self, rules: &[T]) {
         if self.sends_suppressed() {
             return;
@@ -2172,18 +2206,21 @@ impl GameLink {
     }
 
     /// Replace all live ACMD rules, preserving each rule's owning fighter.
-    pub fn send_scoped_hitbox_rules(&self, rules: &[(i32, &HitboxRuleWire)]) {
+    pub fn send_scoped_hitbox_rules(&self, rules: &[(i32, &[u8], &HitboxRuleWire)]) -> bool {
         let scoped: Vec<_> = rules
             .iter()
-            .map(|(fighter_kind, rule)| ScopedHitboxRuleWire {
+            .map(|(fighter_kind, costume_slots, rule)| ScopedHitboxRuleWire {
                 fighter_kind: *fighter_kind,
+                costume_slots: *costume_slots,
                 rule: *rule,
             })
             .collect();
-        self.send_hitbox_payload(&scoped);
+        let valid = scoped.iter().all(|rule| rule.fighter_kind >= 0 && !rule.costume_slots.is_empty());
+        self.send_scoped_acmd_payload("hitbox_rules", &scoped, valid)
     }
 
     /// Same full-list replace and TCP coalescing as the original rule sender.
+    #[cfg(test)]
     fn send_hitbox_payload<T: Serialize>(&self, rules: &[T]) {
         if self.sends_suppressed() {
             return;
@@ -2250,6 +2287,7 @@ fn link_thread(shared: Arc<Mutex<Shared>>) {
             s.status = LinkStatus::Connecting;
             s.client_id = None;
             s.scoped_cancels_supported = false;
+                s.scoped_acmd_supported = false;
             s.last_rx = None;
         }
         let addr = plugin_addr();
@@ -2269,6 +2307,7 @@ fn link_thread(shared: Arc<Mutex<Shared>>) {
                 s.last_error = reason;
                 s.client_id = None;
                 s.scoped_cancels_supported = false;
+                s.scoped_acmd_supported = false;
                 s.last_rx = None;
             }
             Err(e) => {
@@ -2278,6 +2317,7 @@ fn link_thread(shared: Arc<Mutex<Shared>>) {
                 s.last_error = Some(format!("connect to {addr}: {e}{hint}"));
                 s.client_id = None;
                 s.scoped_cancels_supported = false;
+                s.scoped_acmd_supported = false;
                 s.last_rx = None;
             }
         }
@@ -2320,6 +2360,13 @@ fn serve_connection(shared: &Arc<Mutex<Shared>>, mut stream: TcpStream) -> Optio
             // The editor republishes its current, revalidated state after GiveClientId.
             if !s.scoped_cancels_supported {
                 pending.retain(|frame| !frame.contains("\"cancel_rules_scoped\":"));
+            }
+            if !s.scoped_acmd_supported {
+                pending.retain(|frame| ![
+                    "\"hitbox_rules_scoped\":",
+                    "\"spawn_rules_scoped\":",
+                    "\"effect_control_rules_scoped\":",
+                ].iter().any(|marker| frame.contains(marker)));
             }
             pending
         };
@@ -2754,10 +2801,20 @@ fn handle_frame(shared: &Arc<Mutex<Shared>>, payload: &str) {
                     .and_then(|data| data.get("scoped_cancels"))
                     .and_then(|value| value.as_bool())
                     == Some(true);
+            s.scoped_acmd_supported = client_id.is_some()
+                && body
+                    .get("GiveClientId")
+                    .and_then(|data| data.get("scoped_acmd"))
+                    .and_then(|value| value.as_bool())
+                    == Some(true);
         }
         _ => {}
     }
 }
+
+#[cfg(test)]
+#[path = "../plugins/slight_replica/src/slight/rule_scope.rs"]
+mod plugin_rule_scope;
 
 #[cfg(test)]
 mod tests {
@@ -3321,9 +3378,32 @@ mod tests {
         assert_eq!(link.captures_count(0xdead, Some(8)), 0);
     }
 
-    #[test]
-    fn scoped_effects_and_controls_keep_identical_motions_separate() {
+    fn scoped_acmd_link() -> GameLink {
         let link = GameLink::default();
+        link.shared.lock().unwrap().status = LinkStatus::Connected;
+        feed(&link, &[plugin_frame("GiveClientId", &serde_json::json!({
+            "GiveClientId": { "client_id": 7, "scoped_acmd": true }
+        }))]);
+        link
+    }
+
+    #[test]
+    fn scoped_acmd_rejects_legacy_handshake_and_replaces_stale_snapshot() {
+        let link = scoped_acmd_link();
+        assert!(link.send_scoped_hitbox_rules(&[]));
+        assert!(link.shared.lock().unwrap().outbox[0].contains("\"hitbox_rules_scoped\":"));
+        // A plugin supporting scoped cancels is not necessarily capable of scoped ACMD.
+        feed(&link, &[plugin_frame("GiveClientId", &serde_json::json!({
+            "GiveClientId": { "client_id": 8, "scoped_cancels": true }
+        }))]);
+        assert!(!link.send_scoped_hitbox_rules(&[]));
+        let pending = link.shared.lock().unwrap().outbox.clone();
+        assert_eq!(pending, vec![r#"<TCP_MESSAGE>{"hitbox_rules":[]}</TCP_MESSAGE>"#]);
+    }
+
+    #[test]
+    fn scoped_acmd_effects_and_controls_keep_identical_motions_separate() {
+        let link = scoped_acmd_link();
         let effect = SpawnRuleWire {
             eff_hash: 0x123,
             suppress: false,
@@ -3345,12 +3425,14 @@ mod tests {
             inject: None,
             color_inject: None,
         };
-        link.send_scoped_spawn_rules(&[(0x18, &effect), (0x01, &effect)]);
+        assert!(link.send_scoped_spawn_rules(&[(0x18, &[0, 1], &effect), (0x01, &[8, 9], &effect)]));
         let frame = link.shared.lock().unwrap().outbox.last().unwrap().clone();
         let body = &frame["<TCP_MESSAGE>".len()..frame.len() - "</TCP_MESSAGE>".len()];
         let json: serde_json::Value = serde_json::from_str(body).unwrap();
-        let effects = json["spawn_rules"].as_array().unwrap();
+        let effects = json["spawn_rules_scoped"].as_array().unwrap();
         assert_eq!(effects.len(), 2);
+        assert_eq!(effects[0]["costume_slots"], serde_json::json!([0, 1]));
+        assert_eq!(effects[1]["costume_slots"], serde_json::json!([8, 9]));
         assert_eq!(effects[0]["fighter_kind"].as_i64(), Some(0x18));
         assert_eq!(effects[1]["fighter_kind"].as_i64(), Some(0x01));
         assert_eq!(effects[0]["motion"], effects[1]["motion"]);
@@ -3370,12 +3452,13 @@ mod tests {
                 args: vec![LuaArgWire::Int(3)],
             }),
         };
-        link.send_scoped_effect_control_rules(&[(0x19, &control), (0x00, &control)]);
+        assert!(link.send_scoped_effect_control_rules(&[(0x19, &[0], &control), (0x00, &[8, 9], &control)]));
         let frame = link.shared.lock().unwrap().outbox.last().unwrap().clone();
         let body = &frame["<TCP_MESSAGE>".len()..frame.len() - "</TCP_MESSAGE>".len()];
         let json: serde_json::Value = serde_json::from_str(body).unwrap();
-        let controls = json["effect_control_rules"].as_array().unwrap();
+        let controls = json["effect_control_rules_scoped"].as_array().unwrap();
         assert_eq!(controls.len(), 2);
+        assert_eq!(controls[1]["costume_slots"], serde_json::json!([8, 9]));
         assert_eq!(controls[0]["fighter_kind"].as_i64(), Some(0x19));
         assert_eq!(controls[1]["fighter_kind"].as_i64(), Some(0x00));
         assert_eq!(controls[0]["motion"], controls[1]["motion"]);
@@ -3383,23 +3466,24 @@ mod tests {
     }
 
     #[test]
-    fn plugin_live_matchers_require_fighter_kind() {
+    fn scoped_acmd_plugin_live_matchers_require_fighter_and_costume() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("plugins/slight_replica/src/slight");
         let hitbox = std::fs::read_to_string(root.join("hitbox_viewer/mod.rs")).unwrap();
         let spawn = std::fs::read_to_string(root.join("effect_viewer/spawn_rules.rs")).unwrap();
         let control = std::fs::read_to_string(root.join("effect_viewer/control_rules.rs")).unwrap();
         let hooks = std::fs::read_to_string(root.join("effect_viewer/acmd_hooks.rs")).unwrap();
-        assert!(hitbox.contains("self.fighter_kind == Some(fighter_kind)"));
-        assert!(hitbox.contains("r.fighter_kind == Some(fighter_kind)"));
-        assert!(spawn.contains("self.fighter_kind == Some(fighter_kind)"));
-        assert!(control.contains("self.fighter_kind == Some(fighter_kind)"));
-        assert!(hooks.contains("live_fighter_kind(boma)"));
+        assert!(hitbox.contains("target.matches(self.fighter_kind, self.costume_slots.as_deref())"));
+        assert!(hitbox.contains("target.matches(r.fighter_kind, r.costume_slots.as_deref())"));
+        assert!(hitbox.contains("FIGHTER_INSTANCE_WORK_ID_INT_COLOR"));
+        assert!(spawn.contains("target.matches(self.fighter_kind, self.costume_slots.as_deref())"));
+        assert!(control.contains("target.matches(self.fighter_kind, self.costume_slots.as_deref())"));
+        assert!(hooks.contains("live_rule_target(boma)"));
     }
 
     #[test]
-    fn scoped_rules_keep_identical_motions_separate() {
-        let link = GameLink::default();
+    fn scoped_acmd_rules_keep_identical_motions_separate() {
+        let link = scoped_acmd_link();
         // attack_hi3 has the same motion hash for Ganondorf and Donkey Kong.
         let rate = HitboxRuleWire {
             motion: 0xacbfc42e6,
@@ -3431,12 +3515,14 @@ mod tests {
             }),
             func: None,
         };
-        link.send_scoped_hitbox_rules(&[(0x18, &rate), (0x01, &rate), (0x19, &injection)]);
+        assert!(link.send_scoped_hitbox_rules(&[(0x18, &[0, 1], &rate), (0x01, &[8, 9], &rate), (0x19, &[0], &injection)]));
         let frame = link.shared.lock().unwrap().outbox[0].clone();
         let inner = &frame["<TCP_MESSAGE>".len()..frame.len() - "</TCP_MESSAGE>".len()];
         let value: serde_json::Value = serde_json::from_str(inner).unwrap();
-        let rules = value["hitbox_rules"].as_array().unwrap();
+        let rules = value["hitbox_rules_scoped"].as_array().unwrap();
         assert_eq!(rules.len(), 3);
+        assert_eq!(rules[0]["costume_slots"], serde_json::json!([0, 1]));
+        assert_eq!(rules[1]["costume_slots"], serde_json::json!([8, 9]));
         assert_eq!(rules[0]["fighter_kind"], 0x18);
         assert_eq!(rules[1]["fighter_kind"], 0x01);
         assert_eq!(rules[2]["fighter_kind"], 0x19);
@@ -3444,6 +3530,8 @@ mod tests {
         assert_eq!(rules[0]["overrides"]["motion_rate"], 0.5);
         assert!(rules[2]["inject"].is_object());
         assert_eq!(value.as_object().unwrap().len(), 1);
+        assert!(!link.send_scoped_hitbox_rules(&[(0x18, &[], &rate)]));
+        assert_eq!(link.shared.lock().unwrap().outbox, vec![r#"<TCP_MESSAGE>{"hitbox_rules":[]}</TCP_MESSAGE>"#]);
     }
 
     #[test]

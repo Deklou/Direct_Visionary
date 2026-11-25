@@ -262,7 +262,7 @@ pub fn apply_timing_rules_from_network(raw: &str) -> bool {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
         return false;
     };
-    if let Some(rules) = value.get("spawn_rules") {
+    if let Some(rules) = crate::slight::rule_scope::acmd_snapshot(&value, "spawn_rules") {
         let Ok(rules) = serde_json::from_value::<
             Vec<crate::slight::effect_viewer::spawn_rules::SpawnRule>,
         >(rules.clone()) else {
@@ -270,7 +270,7 @@ pub fn apply_timing_rules_from_network(raw: &str) -> bool {
         };
         return crate::slight::effect_viewer::spawn_rules::set_rules(rules);
     }
-    if let Some(rules) = value.get("effect_control_rules") {
+    if let Some(rules) = crate::slight::rule_scope::acmd_snapshot(&value, "effect_control_rules") {
         let Ok(rules) = serde_json::from_value::<
             Vec<crate::slight::effect_viewer::control_rules::ControlRule>,
         >(rules.clone()) else {
@@ -396,7 +396,7 @@ fn parse_tcp_payload(raw: &str) -> Option<ParsedEdit> {
     }
 
     // Hitbox rules: full-list replace (modify/suppress/inject ATTACKs).
-    if let Some(rules_v) = v.get("hitbox_rules") {
+    if let Some(rules_v) = crate::slight::rule_scope::acmd_snapshot(&v, "hitbox_rules") {
         match serde_json::from_value::<Vec<crate::slight::hitbox_viewer::HitboxRule>>(
             rules_v.clone(),
         ) {
@@ -566,7 +566,7 @@ fn parse_tcp_payload(raw: &str) -> Option<ParsedEdit> {
     }
 
     // Eff-editor spawn rules: full-list replace, handled here (not an effect edit).
-    if let Some(rules_v) = v.get("spawn_rules") {
+    if let Some(rules_v) = crate::slight::rule_scope::acmd_snapshot(&v, "spawn_rules") {
         match serde_json::from_value::<Vec<crate::slight::effect_viewer::spawn_rules::SpawnRule>>(
             rules_v.clone(),
         ) {
@@ -579,7 +579,7 @@ fn parse_tcp_payload(raw: &str) -> Option<ParsedEdit> {
     }
 
     // Effect point controls: full-list replace (detach and area toggles).
-    if let Some(rules_v) = v.get("effect_control_rules") {
+    if let Some(rules_v) = crate::slight::rule_scope::acmd_snapshot(&v, "effect_control_rules") {
         match serde_json::from_value::<Vec<crate::slight::effect_viewer::control_rules::ControlRule>>(
             rules_v.clone(),
         ) {
