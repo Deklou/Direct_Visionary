@@ -293,6 +293,14 @@ impl RosterWindow {
         }
         self.ensure_initialized(&[]);
         self.refresh(fighters, data_root);
+        for (fighter, params) in &self.params {
+            if !super::traits::edits_for(params).is_empty()
+                && (roster.authored.iter().any(|entry| entry.donor.eq_ignore_ascii_case(fighter))
+                    || !super::edit_scope::exclusive_fighter_in_roots(&self.index, fighter, &self.roots, data_root))
+            {
+                anyhow::bail!("{fighter}: fighter-wide trait edits cannot be deployed or exported for a shared or unverified fighter.");
+            }
+        }
         let ui_root = self.ui_root();
         let mut report =
             super::export::export_roster(mod_root, ui_root.as_deref(), &self.index, roster)?;
@@ -609,7 +617,7 @@ impl RosterWindow {
                                 let roots = self.roots.clone();
                                 let labels = std::mem::take(&mut self.labels);
                                 self.traits
-                                    .ui(ui, &roots, &labels, &self.index, &mut self.params);
+                                    .ui(ui, &roots, &labels, &self.index, &mut self.params, data_root);
                                 self.labels = labels;
                             }
                         }

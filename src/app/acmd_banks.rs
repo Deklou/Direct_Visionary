@@ -73,6 +73,24 @@ fn clone_fighter_moves<V: Clone>(map: &HashMap<String, V>, fighter: &str) -> Has
 }
 
 impl VisionaryApp {
+    /// Legacy EFF records and fighter_param rows have no logical owner identity.
+    /// Only an exclusive, verified base fighter may use these shared mechanisms.
+    pub(super) fn exclusive_fighter_slots(&self, fighter: &str) -> Option<Vec<u8>> {
+        let entry = self.state.fighters.iter().find(|entry| entry.name.eq_ignore_ascii_case(fighter))?;
+        let base = self.cancel_base_slots.get(&entry.name)?;
+        let index = crate::roster::index::RosterIndex::build(
+            std::slice::from_ref(entry), &self.roster.library, &self.roster.project, None,
+        );
+        if self.roster.project.authored.iter().any(|owner| owner.donor.eq_ignore_ascii_case(fighter))
+            || !crate::roster::edit_scope::exclusive_fighter(&index, &entry.name, base, &entry.slots)
+        {
+            return None;
+        }
+        let mut slots = base.clone();
+        slots.sort_unstable();
+        Some(slots)
+    }
+
     pub(super) fn verified_acmd_binding(&self, binding: &CancelBinding) -> bool {
         self.current_cancel_binding(&binding.scope.fighter, &binding.scope.key).as_ref() == Some(binding)
     }

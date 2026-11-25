@@ -751,17 +751,13 @@ unsafe fn rewrite_kind(lua_state: u64, from: u64, to: u64, flip: bool) {
     }
 }
 
-/// The owner fighter's costume slot (color index), or -1 when unresolvable.
-unsafe fn costume_of(lua_state: u64) -> i32 {
+unsafe fn alias_target(lua_state: u64) -> crate::slight::rule_scope::RuntimeTarget {
+    if lua_state == 0 {
+        return crate::slight::rule_scope::RuntimeTarget::UNKNOWN;
+    }
     let boma = smash::app::sv_system::battle_object_module_accessor(lua_state)
         as *mut smash::app::BattleObjectModuleAccessor;
-    if boma.is_null() {
-        return -1;
-    }
-    smash::app::lua_bind::WorkModule::get_int(
-        boma,
-        *smash::lib::lua_const::FIGHTER_INSTANCE_WORK_ID_INT_COLOR,
-    )
+    live_rule_target(boma)
 }
 
 /// One-time: log the CONCRETE EffectModule vtable targets (req = vtable+0x68,
@@ -1613,7 +1609,7 @@ macro_rules! effect_hook {
                 if crate::slight::effect_viewer::spawn_rules::any_alias() {
                     if let Some(to) = crate::slight::effect_viewer::spawn_rules::alias_for(
                         args.eff_hash,
-                        costume_of(lua_state),
+                        alias_target(lua_state),
                     ) {
                         // If the alias target is a merged `_os` kind but the donor's REAL
                         // kind is now co-loaded (GPU-valid), retarget to the real kind so the
@@ -2235,7 +2231,7 @@ unsafe fn hook_effect_off_kind(lua_state: u64) {
     // names `kirby_dash`, the effect exists as `vsnedit_kirby_dash`, nothing matches, and it
     // survives until the animation ends and everything is flushed.
     if let Some(from) = logical_hash {
-        let to = crate::slight::effect_viewer::spawn_rules::alias_for(from, costume_of(lua_state))
+        let to = crate::slight::effect_viewer::spawn_rules::alias_for(from, alias_target(lua_state))
             .unwrap_or(from);
         let to = crate::slight::effect_viewer::effect_reload::coload_remap(to).unwrap_or(to);
         if to != from {

@@ -438,9 +438,9 @@ fn hook_req(
 ///
 /// `costume` is the fighter colour index, or -1 when it cannot be resolved — slot-gated aliases
 /// then do not match, which is the documented conservative behaviour.
-fn alias_and_remap(eff_hash: phx::Hash40, costume: i32) -> phx::Hash40 {
+fn alias_and_remap(eff_hash: phx::Hash40, target: crate::slight::rule_scope::RuntimeTarget) -> phx::Hash40 {
     let aliased = if spawn_rules::any_alias() {
-        spawn_rules::alias_for(eff_hash.hash, costume).unwrap_or(eff_hash.hash)
+        spawn_rules::alias_for(eff_hash.hash, target).unwrap_or(eff_hash.hash)
     } else {
         eff_hash.hash
     };
@@ -450,15 +450,9 @@ fn alias_and_remap(eff_hash: phx::Hash40, costume: i32) -> phx::Hash40 {
     }
 }
 
-/// Fighter colour index for an object, or -1 when it cannot be resolved.
-unsafe fn costume_of_boma(boma: *mut smash::app::BattleObjectModuleAccessor) -> i32 {
-    if boma.is_null() {
-        return -1;
-    }
-    smash::app::lua_bind::WorkModule::get_int(
-        boma,
-        *smash::lib::lua_const::FIGHTER_INSTANCE_WORK_ID_INT_COLOR,
-    )
+unsafe fn alias_target(boma: *mut smash::app::BattleObjectModuleAccessor) -> crate::slight::rule_scope::RuntimeTarget {
+    crate::slight::hitbox_viewer::rule_target(boma)
+        .unwrap_or(crate::slight::rule_scope::RuntimeTarget::UNKNOWN)
 }
 
 /// Resolve a requested kind at the req boundary — the robust interception point, since it
@@ -475,7 +469,7 @@ fn remap_eff(
     if *SKIP_REMAP {
         return eff_hash;
     }
-    let out = alias_and_remap(eff_hash, unsafe { costume_of_boma(module_accessor) });
+    let out = alias_and_remap(eff_hash, unsafe { alias_target(module_accessor) });
     // Log only when the input is a known merged `_os` kind, so we can see whether remap_eff
     // is even reached for the refused spawn and what it decided.
     if crate::slight::smash_utils::trace_enabled()
@@ -812,13 +806,13 @@ macro_rules! stop_kind_hook {
             if *KILL_PASSTHROUGH {
                 return original!()(module_accessor, eff_hash, arg3);
             }
-            let costume = unsafe { costume_of_boma(module_accessor) };
+            let target = unsafe { alias_target(module_accessor) };
             let requested =
                 match crate::slight::effect_viewer::effect_reload::coload_remap(eff_hash.hash) {
                     Some(real) => phx::Hash40 { hash: real },
                     None => eff_hash,
                 };
-            let aliased = alias_and_remap(eff_hash, costume);
+            let aliased = alias_and_remap(eff_hash, target);
             trace_stop($label, requested, aliased, arg3);
 
             let r = original!()(module_accessor, requested, arg3);

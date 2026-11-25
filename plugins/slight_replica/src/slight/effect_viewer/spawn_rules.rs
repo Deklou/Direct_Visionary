@@ -544,48 +544,30 @@ pub fn color_for(target: RuntimeTarget,
 // hook, while every rule/pin/override still keys on the REQUESTED (copy) hash. The
 // live game then matches what the export will produce.
 
-/// requested kind (`from`) → kind that exists live (`to`), optionally costume-gated.
-#[derive(Clone, Debug, Deserialize)]
-pub struct EffectAlias {
-    pub from: u64,
-    pub to: u64,
-    /// Costume slots the alias is active on; empty = all costumes. NOT limited to the
-    /// vanilla c00–c07: slot-add mods use higher indices, and `u8` spans the whole colour
-    /// index range the runtime can report.
-    #[serde(default)]
-    pub slots: Vec<u8>,
-}
+pub use crate::slight::rule_scope::EffectAlias;
 
 static ALIASES: parking_lot::Mutex<Vec<EffectAlias>> = parking_lot::Mutex::new(Vec::new());
 
-/// Full-list replace (idempotent, like rules). Empty clears all aliases.
-pub fn set_aliases(aliases: Vec<EffectAlias>) {
-    let n = aliases.len();
-    if let Some(mut a) = ALIASES.try_lock() {
-        *a = aliases;
-        crate::slight::diag::note(format!("effect aliases replaced: {n} alias(es)"));
-    } else {
-        crate::slight::diag::note("effect aliases: lock contended, push dropped");
+/// A clear must not be dropped on contention. Readers never park and the lock is
+/// held only for a short lookup or a Vec swap, never during native calls.
+pub fn set_aliases(mut aliases: Vec<EffectAlias>) {
+    if !aliases.iter().all(EffectAlias::valid) {
+        aliases.clear();
     }
+    let old = loop {
+        if let Some(mut current) = ALIASES.try_lock() {
+            break std::mem::replace(&mut *current, aliases);
+        }
+        core::hint::spin_loop();
+    };
+    drop(old);
 }
 
-/// Cheap gate so the hooks skip the costume lookup when no aliases exist.
 pub fn any_alias() -> bool {
     ALIASES.try_lock().map(|a| !a.is_empty()).unwrap_or(false)
 }
 
-/// The live substitute for a requested kind (`costume` = fighter color index, -1 when
-/// unknown — slot-gated aliases then do NOT match).
-pub fn alias_for(from: u64, costume: i32) -> Option<u64> {
+pub fn alias_for(from: u64, target: RuntimeTarget) -> Option<u64> {
     let aliases = ALIASES.try_lock()?;
-    // `try_from`, not `as`: a costume index outside u8 would WRAP and could then falsely
-    // match a low-numbered slot (colour 264 aliasing onto a c08-scoped entry). Out of range
-    // means "no slot-gated alias applies", same as the unknown-costume (-1) case.
-    let slot = u8::try_from(costume).ok();
-    aliases
-        .iter()
-        .find(|a| {
-            a.from == from && (a.slots.is_empty() || slot.is_some_and(|s| a.slots.contains(&s)))
-        })
-        .map(|a| a.to)
+    crate::slight::rule_scope::effect_alias_for(&aliases, from, target)
 }

@@ -152,6 +152,33 @@ pub fn resolve(
     })
 }
 
+/// Fighter-wide edits cannot be isolated if another logical owner or an unknown
+/// extra costume shares the engine fighter. No guessed/default costume list.
+pub fn exclusive_fighter(index: &RosterIndex, fighter: &str, base: &[u8], available: &[u8]) -> bool {
+    let mut owners = index.entries.iter().filter(|entry|
+        entry.fighter.as_deref().is_some_and(|name| name.eq_ignore_ascii_case(fighter)));
+    let Some(entry) = owners.next() else { return false; };
+    if owners.next().is_some() || entry.key != RosterKey::fighter(fighter)
+        || entry.origin != EntryOrigin::Vanilla || entry.backing != RosterBacking::Fighter
+    {
+        return false;
+    }
+    let base_set: BTreeSet<_> = base.iter().copied().collect();
+    let available_set: BTreeSet<_> = available.iter().copied().collect();
+    !base_set.is_empty() && base_set.len() == base.len()
+        && available_set.len() == available.len() && base_set == available_set
+}
+
+pub fn exclusive_fighter_in_roots(
+    index: &RosterIndex, fighter: &str, roots: &[std::path::PathBuf],
+    data_root: Option<&std::path::PathBuf>,
+) -> bool {
+    let Some(root) = data_root else { return false; };
+    let base = crate::data::discover_costume_slots(std::slice::from_ref(root), fighter);
+    let available = crate::data::discover_costume_slots(roots, fighter);
+    exclusive_fighter(index, fighter, &base, &available)
+}
+
 fn checked_slots(slots: &[u8], owner: &RosterKey) -> Result<Vec<u8>, ScopeError> {
     if slots.is_empty() {
         return Err(ScopeError::InvalidSlots(owner.clone()));
@@ -336,4 +363,25 @@ mod tests {
             Err(ScopeError::InvalidSlots(_))
         ));
     }
+}
+
+#[cfg(test)]
+#[test]
+fn scoped_acmd_shared_traits_require_one_verified_engine_owner() {
+    use super::{RosterEntry, RosterEntryId};
+    let entry = |key, backing, origin| RosterEntry {
+        id: RosterEntryId(0), key, name_id: None, backing, fighter: Some("mario".into()),
+        display_name: "Mario".into(), css_order: None, providers: Vec::new(),
+        origin, hidden: false, on_roster: true,
+    };
+    let mut index = RosterIndex::default();
+    index.entries.push(entry(RosterKey::fighter("mario"), RosterBacking::Fighter, EntryOrigin::Vanilla));
+    assert!(exclusive_fighter(&index, "mario", &[0, 1], &[1, 0]));
+    assert!(!exclusive_fighter(&index, "mario", &[0, 1], &[0, 1, 8]));
+    assert!(!exclusive_fighter(&index, "mario", &[], &[0, 1]));
+    index.entries.push(entry(RosterKey::slot("mario", 8), RosterBacking::SlotClone {
+        donor: "mario".into(), slot: 8, slots: vec![9]
+    }, EntryOrigin::Authored));
+    assert!(!exclusive_fighter(&index, "mario", &[0, 1], &[0, 1, 8, 9]));
+    assert!(!exclusive_fighter(&index, "mario", &[0, 1], &[0, 1]));
 }

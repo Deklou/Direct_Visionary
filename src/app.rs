@@ -18268,7 +18268,7 @@ If you step every basis for a                          type and NONE of them mat
             .iter()
             .filter_map(|(fighter, params)| {
                 let fields = crate::roster::traits::edits_for(params);
-                (!fields.is_empty()).then(|| crate::game_link::TraitRuleWire {
+                (!fields.is_empty() && self.exclusive_fighter_slots(fighter).is_some()).then(|| crate::game_link::TraitRuleWire {
                     fighter: fighter.clone(),
                     fields: fields.clone(),
                 })
@@ -20484,6 +20484,15 @@ If you step every basis for a                          type and NONE of them mat
         }
         let project = self.build_project();
         if !self.validate_acmd_export_bindings(&project) { return; }
+        for (fighter, edits) in &project.fighters {
+            if (!crate::roster::traits::edits_for(&edits.params).is_empty()
+                || edits.eff.as_ref().is_some_and(|eff| !eff.is_empty()))
+                && self.exclusive_fighter_slots(fighter).is_none()
+            {
+                self.state.status = format!("Export refused: {fighter} has shared or unverified fighter-wide edits.");
+                return;
+            }
+        }
         // The manual workspace overlay is a first-class export even when there are no serialized
         // ACMD/EFF edits. This is the common model/animation iteration case.
         let has_workspace_overlay = self
@@ -29967,8 +29976,11 @@ If you step every basis for a                          type and NONE of them mat
                     .loaded_rel()
                     .map(|rel| crate::mod_project::fighter_from_source_rel(&rel))
                     .filter(|f| !f.is_empty())
-            });
+            })
+            .filter(|fighter| self.exclusive_fighter_slots(fighter).is_some());
         for (fighter, eff) in &self.eff_mods {
+            let Some(base_slots) = self.exclusive_fighter_slots(fighter) else { continue; };
+            let Some(fighter_kind) = fighter_kind_id(fighter) else { continue; };
             let own_rel = format!("effect/fighter/{fighter}/ef_{fighter}.eff");
             for op in &eff.transplants {
                 // Is the donor's ORIGINAL kind resident in a normal match? Same-file, same-
@@ -29996,11 +30008,16 @@ If you step every basis for a                          type and NONE of them mat
                 if from == to {
                     continue;
                 }
-                let wire = crate::game_link::EffectAliasWire {
-                    from,
-                    to,
-                    slots: op.one_slot_slots.clone(),
+                let mut costume_slots = if op.one_slot_slots.is_empty() {
+                    base_slots.clone()
+                } else if op.one_slot_slots.iter().all(|slot| base_slots.contains(slot)) {
+                    op.one_slot_slots.clone()
+                } else {
+                    continue;
                 };
+                costume_slots.sort_unstable();
+                costume_slots.dedup();
+                let wire = crate::game_link::EffectAliasWire { from, to, fighter_kind, costume_slots };
                 if !aliases.contains(&wire) {
                     aliases.push(wire);
                 }
@@ -30320,10 +30337,13 @@ If you step every basis for a                          type and NONE of them mat
 
         // Redirect spawns of the original kind onto the edited clone.
         for (from_name, to_name) in &authored_aliases {
+            let Some(fighter) = carrier_fighter.as_deref() else { continue; };
+            let Some(fighter_kind) = fighter_kind_id(fighter) else { continue; };
+            let Some(costume_slots) = self.exclusive_fighter_slots(fighter) else { continue; };
             let wire = crate::game_link::EffectAliasWire {
                 from: effect_name_hash(from_name),
                 to: effect_name_hash(to_name),
-                slots: Vec::new(),
+                fighter_kind, costume_slots,
             };
             if wire.from == wire.to {
                 continue;
@@ -30333,7 +30353,9 @@ If you step every basis for a                          type and NONE of them mat
             // leaves the plugin picking arbitrarily. The transplant alias is registered first
             // and wins; the authored edit then has nowhere to live, so say so rather than
             // silently rendering the unedited copy.
-            if let Some(existing) = aliases.iter().find(|a| a.from == wire.from) {
+            if let Some(existing) = aliases.iter().find(|a| a.from == wire.from
+                && a.fighter_kind == wire.fighter_kind
+                && a.costume_slots.iter().any(|slot| wire.costume_slots.contains(slot))) {
                 if existing.to != wire.to {
                     carrier_name_conflicts.push(from_name.clone());
                 }
@@ -30378,6 +30400,7 @@ If you step every basis for a                          type and NONE of them mat
         // build the small stripped eff the plugin injects as resident data.
         let mut donor_wants: HashMap<String, Vec<String>> = HashMap::new();
         for (fighter, eff) in &self.eff_mods {
+            if self.exclusive_fighter_slots(fighter).is_none() { continue; }
             let target = if eff.source_rel.is_empty() {
                 format!("effect/fighter/{fighter}/ef_{fighter}.eff")
             } else {
@@ -30845,6 +30868,10 @@ If you step every basis for a                          type and NONE of them mat
     /// Cross-fighter donor content thereby loads WITH the fighter — no export, no donor
     /// fighter in the match; re-entering the match picks it up. Returns success.
     fn deploy_live_eff(&mut self, fighter: &str) -> bool {
+        if self.exclusive_fighter_slots(fighter).is_none() {
+            self.state.status = "Live EFF deploy refused: shared or unverified costume ownership.".into();
+            return false;
+        }
         let Some(eff) = self.eff_mods.get(fighter).cloned() else {
             return false;
         };
@@ -30940,6 +30967,11 @@ If you step every basis for a                          type and NONE of them mat
         // is built from `eff_mods`, not from the editor's working copy.
         self.sync_eff_mods_from_editor();
         let fighter = crate::mod_project::fighter_from_source_rel(&rel);
+        if self.exclusive_fighter_slots(&fighter).is_none() {
+            self.push_effect_aliases();
+            self.eff_editor.carrier_expected = false;
+            return "EFF edits preserved; live application refused for shared or unverified costume ownership.".into();
+        }
         let entry = self.eff_mods.get(&fighter);
         let known = entry.is_some();
         let (edits, transplants) = entry
@@ -35584,6 +35616,7 @@ impl eframe::App for VisionaryApp {
                 }
             }
             self.publish_live_rule_union();
+            self.push_effect_aliases();
         }
         self.perf.end("eff_editor", t);
         for removal in self.eff_editor.take_transplant_removals() {

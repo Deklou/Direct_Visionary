@@ -555,12 +555,15 @@ fn parse_tcp_payload(raw: &str) -> Option<ParsedEdit> {
     }
 
     // Live transplant aliases: full-list replace (copy/replaced kind → donor kind).
-    if let Some(aliases_v) = v.get("effect_aliases") {
+    if let Some(aliases_v) = crate::slight::rule_scope::acmd_snapshot(&v, "effect_aliases") {
         match serde_json::from_value::<Vec<crate::slight::effect_viewer::spawn_rules::EffectAlias>>(
             aliases_v.clone(),
         ) {
             Ok(aliases) => crate::slight::effect_viewer::spawn_rules::set_aliases(aliases),
-            Err(e) => crate::slight::diag::note(format!("effect_aliases parse error: {e}")),
+            Err(e) => {
+                crate::slight::effect_viewer::spawn_rules::set_aliases(Vec::new());
+                crate::slight::diag::note(format!("effect_aliases parse error: {e}"));
+            }
         }
         return None;
     }

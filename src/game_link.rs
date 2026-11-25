@@ -318,9 +318,8 @@ pub struct EffectAliasWire {
     pub from: u64,
     /// Kind that exists in the loaded eff resources (the donor).
     pub to: u64,
-    /// Costume slots (c00…) the alias applies to; empty = all.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub slots: Vec<u8>,
+    pub fighter_kind: i32,
+    pub costume_slots: Vec<u8>,
 }
 
 /// Wire form of the plugin's `effect_reload::DonorSpec` (field names must match).
@@ -1316,6 +1315,7 @@ struct Shared {
     /// Only a matching plugin can consume the scoped-cancel wire format.
     scoped_cancels_supported: bool,
     scoped_acmd_supported: bool,
+    scoped_aliases_supported: bool,
     connection_epoch: u64,
     collision_requests: BTreeMap<i32, u64>,
     kinds: BTreeMap<u64, LiveKind>,
@@ -1416,7 +1416,7 @@ fn retain_latest_for_marker(messages: &mut Vec<String>, marker: &str) {
 /// (so a burst of queued states sends once).
 fn retain_latest_full_replace(messages: &mut Vec<String>) {
     // Each legacy clear and scoped snapshot replace the same runtime list.
-    for family in ["cancel_rules", "hitbox_rules", "spawn_rules", "effect_control_rules"] {
+    for family in ["cancel_rules", "hitbox_rules", "spawn_rules", "effect_control_rules", "effect_aliases"] {
         let legacy = format!("\"{family}\":");
         let scoped = format!("\"{family}_scoped\":");
         let same_family = |frame: &str| frame.contains(&legacy) || frame.contains(&scoped);
@@ -1486,6 +1486,7 @@ impl Default for Shared {
             client_id: None,
             scoped_cancels_supported: false,
             scoped_acmd_supported: false,
+            scoped_aliases_supported: false,
             connection_epoch: 0,
             collision_requests: BTreeMap::new(),
             kinds: BTreeMap::new(),
@@ -1771,7 +1772,11 @@ impl GameLink {
         let clear = format!("<TCP_MESSAGE>{{\"{family}\":[]}}</TCP_MESSAGE>");
         let Ok(mut shared) = self.shared.lock() else { return false; };
         let supported = valid && shared.status == LinkStatus::Connected
-            && shared.client_id.is_some() && shared.scoped_acmd_supported;
+            && shared.client_id.is_some() && if family == "effect_aliases" {
+                shared.scoped_aliases_supported
+            } else {
+                shared.scoped_acmd_supported
+            };
         let (frame, sent) = match (supported, scoped) {
             (true, Some(payload)) => (format!("<TCP_MESSAGE>{payload}</TCP_MESSAGE>"), true),
             _ => (clear, false),
@@ -1851,21 +1856,12 @@ impl GameLink {
         }
     }
 
-    /// Replace the plugin's live transplant alias list (copy/replaced kind → donor kind,
-    /// optionally costume-gated). Full-list replace; empty clears all aliases.
+    /// Legacy receivers get only a clear. Aliases are never unscoped.
     pub fn send_effect_aliases(&self, aliases: &[EffectAliasWire]) {
-        if self.sends_suppressed() {
-            return;
-        }
-        let Ok(payload) = serde_json::to_string(&serde_json::json!({ "effect_aliases": aliases }))
-        else {
-            return;
-        };
-        let frame = format!("<TCP_MESSAGE>{payload}</TCP_MESSAGE>");
-        if let Ok(mut s) = self.shared.lock() {
-            queue_latest_full_replace(&mut s.outbox, frame);
-            s.edits_tx += 1;
-        }
+        let valid = aliases.iter().all(|alias| alias.fighter_kind >= 0 && !alias.costume_slots.is_empty()
+            && alias.from != alias.to && alias.from > 0 && alias.from <= 0xff_ffff_ffff
+            && alias.to > 0 && alias.to <= 0xff_ffff_ffff);
+        self.send_scoped_acmd_payload("effect_aliases", aliases, valid);
     }
 
     /// Cross-fighter donor eff files the plugin co-loads with each target fighter's
@@ -2348,6 +2344,7 @@ fn link_thread(shared: Arc<Mutex<Shared>>) {
             s.client_id = None;
             s.scoped_cancels_supported = false;
                 s.scoped_acmd_supported = false;
+                s.scoped_aliases_supported = false;
             s.last_rx = None;
         }
         let addr = plugin_addr();
@@ -2368,6 +2365,7 @@ fn link_thread(shared: Arc<Mutex<Shared>>) {
                 s.client_id = None;
                 s.scoped_cancels_supported = false;
                 s.scoped_acmd_supported = false;
+                s.scoped_aliases_supported = false;
                 s.last_rx = None;
             }
             Err(e) => {
@@ -2378,6 +2376,7 @@ fn link_thread(shared: Arc<Mutex<Shared>>) {
                 s.client_id = None;
                 s.scoped_cancels_supported = false;
                 s.scoped_acmd_supported = false;
+                s.scoped_aliases_supported = false;
                 s.last_rx = None;
             }
         }
@@ -2427,6 +2426,9 @@ fn serve_connection(shared: &Arc<Mutex<Shared>>, mut stream: TcpStream) -> Optio
                     "\"spawn_rules_scoped\":",
                     "\"effect_control_rules_scoped\":",
                 ].iter().any(|marker| frame.contains(marker)));
+            }
+            if !s.scoped_aliases_supported {
+                pending.retain(|frame| !frame.contains("\"effect_aliases_scoped\":"));
             }
             pending
         };
@@ -2875,6 +2877,10 @@ fn handle_frame(shared: &Arc<Mutex<Shared>>, payload: &str) {
                     .and_then(|data| data.get("scoped_acmd"))
                     .and_then(|value| value.as_bool())
                     == Some(true);
+            s.scoped_aliases_supported = client_id.is_some()
+                && body.get("GiveClientId")
+                    .and_then(|data| data.get("scoped_aliases"))
+                    .and_then(|value| value.as_bool()) == Some(true);
         }
         _ => {}
     }
@@ -3831,31 +3837,33 @@ mod tests {
     }
 
     #[test]
-    fn outbound_effect_aliases_match_plugin_field_names() {
-        let link = GameLink::default();
-        link.send_effect_aliases(&[
-            EffectAliasWire {
-                from: 0x111,
-                to: 0x222,
-                slots: vec![],
-            },
-            EffectAliasWire {
-                from: 0x333,
-                to: 0x444,
-                slots: vec![1, 3],
-            },
-        ]);
-        let frame = link.shared.lock().unwrap().outbox[0].clone();
-        let inner = &frame["<TCP_MESSAGE>".len()..frame.len() - "</TCP_MESSAGE>".len()];
-        let v: serde_json::Value = serde_json::from_str(inner).unwrap();
-        // Field names the plugin's spawn_rules::EffectAlias serde(Deserialize) expects.
-        let aliases = v.get("effect_aliases").and_then(|a| a.as_array()).unwrap();
-        assert_eq!(aliases[0]["from"].as_u64(), Some(0x111));
-        assert_eq!(aliases[0]["to"].as_u64(), Some(0x222));
-        // Empty slots (all costumes) omitted so the plugin's serde(default) fills it.
-        assert!(aliases[0].get("slots").is_none());
-        assert_eq!(aliases[1]["slots"][0].as_u64(), Some(1));
-        assert_eq!(aliases[1]["slots"][1].as_u64(), Some(3));
+    fn scoped_acmd_alias_wire_requires_own_handshake_and_clears_stale_rules() {
+        let link = scoped_acmd_link();
+        let rules = [
+            EffectAliasWire { from: 0x111, to: 0x222, fighter_kind: 1, costume_slots: vec![0, 1] },
+            EffectAliasWire { from: 0x111, to: 0x333, fighter_kind: 2, costume_slots: vec![0, 1] },
+        ];
+        link.send_effect_aliases(&rules);
+        assert_eq!(link.shared.lock().unwrap().outbox, vec![r#"<TCP_MESSAGE>{"effect_aliases":[]}</TCP_MESSAGE>"#]);
+        feed(&link, &[plugin_frame("GiveClientId", &serde_json::json!({
+            "GiveClientId": { "client_id": 8, "scoped_acmd": true, "scoped_aliases": true }
+        }))]);
+        link.send_effect_aliases(&rules);
+        let pending = link.shared.lock().unwrap().outbox.clone();
+        assert_eq!(pending.len(), 1);
+        let frame = &pending[0];
+        let payload = frame.strip_prefix("<TCP_MESSAGE>").unwrap().strip_suffix("</TCP_MESSAGE>").unwrap();
+        let v: serde_json::Value = serde_json::from_str(payload).unwrap();
+        let aliases: Vec<super::plugin_rule_scope::EffectAlias> =
+            serde_json::from_value(v["effect_aliases_scoped"].clone()).unwrap();
+        assert_eq!(aliases[0].fighter_kind, 1);
+        assert_eq!(aliases[1].fighter_kind, 2);
+        assert_eq!(aliases[0].costume_slots, vec![0, 1]);
+        feed(&link, &[plugin_frame("GiveClientId", &serde_json::json!({
+            "GiveClientId": { "client_id": 9, "scoped_acmd": true }
+        }))]);
+        link.send_effect_aliases(&rules);
+        assert_eq!(link.shared.lock().unwrap().outbox, vec![r#"<TCP_MESSAGE>{"effect_aliases":[]}</TCP_MESSAGE>"#]);
     }
 
     #[test]
