@@ -18,6 +18,8 @@ pub struct ControlInject {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ControlRule {
+    #[serde(default)]
+    pub fighter_kind: Option<i32>,
     pub motion: Option<u64>,
     pub func: String,
     #[serde(default)]
@@ -41,12 +43,27 @@ pub struct ControlRule {
 }
 
 impl ControlRule {
-    fn matches(&self, func: &str, args: &[LuaArg], motion: u64, frame: f32) -> bool {
-        self.func == func
+    fn matches(&self, fighter_kind: i32, func: &str, args: &[LuaArg], motion: u64, frame: f32) -> bool {
+        self.fighter_kind == Some(fighter_kind)
+            && self.func == func
             && self.motion.map(|m| m == motion).unwrap_or(true)
             && self.args == args
             && self.frame_start.map(|start| frame >= start).unwrap_or(true)
             && self.frame_end.map(|end| frame <= end).unwrap_or(true)
+    }
+}
+
+#[cfg(test)]
+mod fighter_scope_tests {
+    use super::*;
+
+    #[test]
+    fn same_motion_and_control_args_do_not_match_another_fighter() {
+        let rule: ControlRule = serde_json::from_str(
+            r#"{"fighter_kind":25,"motion":42,"func":"EFFECT_DETACH_KIND","args":[]}"#
+        ).unwrap();
+        assert!(rule.matches(25, "EFFECT_DETACH_KIND", &[], 42, 3.0));
+        assert!(!rule.matches(24, "EFFECT_DETACH_KIND", &[], 42, 3.0));
     }
 }
 
@@ -157,14 +174,14 @@ pub fn any_for(func: &str) -> bool {
         .unwrap_or(false)
 }
 
-pub fn suppressed(func: &str, args: &[LuaArg], motion: u64, frame: f32) -> bool {
+pub fn suppressed(fighter_kind: i32, func: &str, args: &[LuaArg], motion: u64, frame: f32) -> bool {
     service_pending();
     RULES
         .try_lock()
         .map(|rules| {
             rules
                 .iter()
-                .any(|rule| rule.suppress && rule.matches(func, args, motion, frame))
+                .any(|rule| rule.suppress && rule.matches(fighter_kind, func, args, motion, frame))
         })
         .unwrap_or(false)
 }
@@ -180,19 +197,20 @@ pub fn any_inject() -> bool {
 /// Whether this motion has at least one point-control replacement.  This is used while the
 /// native motion transition is publishing its new hash and the ACMD boundary may still expose
 /// the previous motion.
-pub fn has_inject_for(motion: u64) -> bool {
+pub fn has_inject_for(fighter_kind: i32, motion: u64) -> bool {
     service_pending();
     RULES
         .try_lock()
         .map(|rules| {
             rules.iter().any(|rule| {
-                rule.inject.is_some() && rule.motion.map(|wanted| wanted == motion).unwrap_or(true)
+                rule.inject.is_some() && rule.fighter_kind == Some(fighter_kind)
+                    && rule.motion.map(|wanted| wanted == motion).unwrap_or(true)
             })
         })
         .unwrap_or(false)
 }
 
-pub fn injections_for(motion: u64) -> Vec<(usize, ControlInject, Option<i32>, u64)> {
+pub fn injections_for(fighter_kind: i32, motion: u64) -> Vec<(usize, ControlInject, Option<i32>, u64)> {
     service_pending();
     let Some(rules) = RULES.try_lock() else {
         return Vec::new();
@@ -201,7 +219,8 @@ pub fn injections_for(motion: u64) -> Vec<(usize, ControlInject, Option<i32>, u6
         .iter()
         .enumerate()
         .filter(|(_, rule)| {
-            rule.inject.is_some() && rule.motion.map(|wanted| wanted == motion).unwrap_or(true)
+            rule.inject.is_some() && rule.fighter_kind == Some(fighter_kind)
+                && rule.motion.map(|wanted| wanted == motion).unwrap_or(true)
         })
         .map(|(index, rule)| {
             (

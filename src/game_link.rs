@@ -1014,6 +1014,27 @@ pub struct HitboxRuleWire {
     pub func: Option<String>,
 }
 
+#[derive(Serialize)]
+struct ScopedSpawnRuleWire<'a> {
+    fighter_kind: i32,
+    #[serde(flatten)]
+    rule: &'a SpawnRuleWire,
+}
+
+#[derive(Serialize)]
+struct ScopedEffectControlRuleWire<'a> {
+    fighter_kind: i32,
+    #[serde(flatten)]
+    rule: &'a EffectControlRuleWire,
+}
+
+#[derive(Serialize)]
+struct ScopedHitboxRuleWire<'a> {
+    fighter_kind: i32,
+    #[serde(flatten)]
+    rule: &'a HitboxRuleWire,
+}
+
 // ── Shared live-override store ───────────────────────────────────────────────
 //
 // ONE per-kind runtime form that both the Effects panel and the Eff Editor game panel read
@@ -1705,9 +1726,24 @@ impl GameLink {
         })
     }
 
-    /// Replace the plugin's live spawn-rule list (suppress/retime ACMD effect spawns).
-    /// Send the FULL current rule set every time — an empty slice clears all rules.
+    /// Legacy serializers retained for wire-shape tests.
+    #[cfg(test)]
     pub fn send_spawn_rules(&self, rules: &[SpawnRuleWire]) {
+        self.send_spawn_payload(rules);
+    }
+
+    pub fn send_scoped_spawn_rules(&self, rules: &[(i32, &SpawnRuleWire)]) {
+        let scoped: Vec<_> = rules
+            .iter()
+            .map(|(fighter_kind, rule)| ScopedSpawnRuleWire {
+                fighter_kind: *fighter_kind,
+                rule: *rule,
+            })
+            .collect();
+        self.send_spawn_payload(&scoped);
+    }
+
+    fn send_spawn_payload<T: Serialize>(&self, rules: &[T]) {
         if self.sends_suppressed() {
             return;
         }
@@ -1722,8 +1758,23 @@ impl GameLink {
         }
     }
 
-    /// Replace the live effect point-control rules (detach and area toggles).
+    #[cfg(test)]
     pub fn send_effect_control_rules(&self, rules: &[EffectControlRuleWire]) {
+        self.send_effect_control_payload(rules);
+    }
+
+    pub fn send_scoped_effect_control_rules(&self, rules: &[(i32, &EffectControlRuleWire)]) {
+        let scoped: Vec<_> = rules
+            .iter()
+            .map(|(fighter_kind, rule)| ScopedEffectControlRuleWire {
+                fighter_kind: *fighter_kind,
+                rule: *rule,
+            })
+            .collect();
+        self.send_effect_control_payload(&scoped);
+    }
+
+    fn send_effect_control_payload<T: Serialize>(&self, rules: &[T]) {
         if self.sends_suppressed() {
             return;
         }
@@ -2114,9 +2165,26 @@ impl GameLink {
             .unwrap_or(0)
     }
 
-    /// Replace the plugin's live hitbox-rule list (modify/suppress/inject ATTACKs).
-    /// Always the FULL set — an empty slice clears all rules.
+    /// Legacy serializer for wire-shape tests. Runtime publications use scoped rules.
+    #[cfg(test)]
     pub fn send_hitbox_rules(&self, rules: &[HitboxRuleWire]) {
+        self.send_hitbox_payload(rules);
+    }
+
+    /// Replace all live ACMD rules, preserving each rule's owning fighter.
+    pub fn send_scoped_hitbox_rules(&self, rules: &[(i32, &HitboxRuleWire)]) {
+        let scoped: Vec<_> = rules
+            .iter()
+            .map(|(fighter_kind, rule)| ScopedHitboxRuleWire {
+                fighter_kind: *fighter_kind,
+                rule: *rule,
+            })
+            .collect();
+        self.send_hitbox_payload(&scoped);
+    }
+
+    /// Same full-list replace and TCP coalescing as the original rule sender.
+    fn send_hitbox_payload<T: Serialize>(&self, rules: &[T]) {
         if self.sends_suppressed() {
             return;
         }
@@ -3251,6 +3319,131 @@ mod tests {
         assert_eq!(link.captures_count(0x1234, None), 3);
         assert_eq!(link.captures_count(0x5678, Some(8)), 1);
         assert_eq!(link.captures_count(0xdead, Some(8)), 0);
+    }
+
+    #[test]
+    fn scoped_effects_and_controls_keep_identical_motions_separate() {
+        let link = GameLink::default();
+        let effect = SpawnRuleWire {
+            eff_hash: 0x123,
+            suppress: false,
+            stop_func: None,
+            motion: Some(hash40::hash40("attack_hi3").0),
+            frame_start: None,
+            frame_end: None,
+            pos: None,
+            rot: None,
+            scale: None,
+            rate: Some(1.5),
+            camera_offset: None,
+            tint: None,
+            particle_tint: None,
+            alpha: None,
+            scale_w: None,
+            color: None,
+            transition: None,
+            inject: None,
+            color_inject: None,
+        };
+        link.send_scoped_spawn_rules(&[(0x18, &effect), (0x01, &effect)]);
+        let frame = link.shared.lock().unwrap().outbox.last().unwrap().clone();
+        let body = &frame["<TCP_MESSAGE>".len()..frame.len() - "</TCP_MESSAGE>".len()];
+        let json: serde_json::Value = serde_json::from_str(body).unwrap();
+        let effects = json["spawn_rules"].as_array().unwrap();
+        assert_eq!(effects.len(), 2);
+        assert_eq!(effects[0]["fighter_kind"].as_i64(), Some(0x18));
+        assert_eq!(effects[1]["fighter_kind"].as_i64(), Some(0x01));
+        assert_eq!(effects[0]["motion"], effects[1]["motion"]);
+        assert_eq!(effects[0]["rate"].as_f64(), Some(1.5));
+
+        let control = EffectControlRuleWire {
+            motion: Some(hash40::hash40("attack_11").0),
+            func: "ENABLE_AREA".into(),
+            args: vec![LuaArgWire::Int(2)],
+            suppress: true,
+            frame_start: Some(5.0),
+            frame_end: Some(5.0),
+            work_slot: None,
+            inject: Some(EffectControlInjectWire {
+                frame: 7.0,
+                func: "ENABLE_AREA".into(),
+                args: vec![LuaArgWire::Int(3)],
+            }),
+        };
+        link.send_scoped_effect_control_rules(&[(0x19, &control), (0x00, &control)]);
+        let frame = link.shared.lock().unwrap().outbox.last().unwrap().clone();
+        let body = &frame["<TCP_MESSAGE>".len()..frame.len() - "</TCP_MESSAGE>".len()];
+        let json: serde_json::Value = serde_json::from_str(body).unwrap();
+        let controls = json["effect_control_rules"].as_array().unwrap();
+        assert_eq!(controls.len(), 2);
+        assert_eq!(controls[0]["fighter_kind"].as_i64(), Some(0x19));
+        assert_eq!(controls[1]["fighter_kind"].as_i64(), Some(0x00));
+        assert_eq!(controls[0]["motion"], controls[1]["motion"]);
+        assert_eq!(controls[0]["inject"]["frame"].as_f64(), Some(7.0));
+    }
+
+    #[test]
+    fn plugin_live_matchers_require_fighter_kind() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("plugins/slight_replica/src/slight");
+        let hitbox = std::fs::read_to_string(root.join("hitbox_viewer/mod.rs")).unwrap();
+        let spawn = std::fs::read_to_string(root.join("effect_viewer/spawn_rules.rs")).unwrap();
+        let control = std::fs::read_to_string(root.join("effect_viewer/control_rules.rs")).unwrap();
+        let hooks = std::fs::read_to_string(root.join("effect_viewer/acmd_hooks.rs")).unwrap();
+        assert!(hitbox.contains("self.fighter_kind == Some(fighter_kind)"));
+        assert!(hitbox.contains("r.fighter_kind == Some(fighter_kind)"));
+        assert!(spawn.contains("self.fighter_kind == Some(fighter_kind)"));
+        assert!(control.contains("self.fighter_kind == Some(fighter_kind)"));
+        assert!(hooks.contains("live_fighter_kind(boma)"));
+    }
+
+    #[test]
+    fn scoped_rules_keep_identical_motions_separate() {
+        let link = GameLink::default();
+        // attack_hi3 has the same motion hash for Ganondorf and Donkey Kong.
+        let rate = HitboxRuleWire {
+            motion: 0xacbfc42e6,
+            category: CAT_MOTION_RATE,
+            hitbox_id: None,
+            suppress: false,
+            frame_start: Some(2.0),
+            frame_end: Some(2.0),
+            overrides: Some(HbOverridesWire {
+                motion_rate: Some(0.5),
+                ..Default::default()
+            }),
+            inject: None,
+            func: None,
+        };
+        // A second shared name, attack_11, also covers injected ATTACK rules.
+        let injection = HitboxRuleWire {
+            motion: 0x99c52257e,
+            category: 0,
+            hitbox_id: Some(0),
+            suppress: false,
+            frame_start: None,
+            frame_end: None,
+            overrides: None,
+            inject: Some(InjectRuleWire {
+                frame: 3.0,
+                args: vec![LuaArgWire::Int(0)],
+                command: None,
+            }),
+            func: None,
+        };
+        link.send_scoped_hitbox_rules(&[(0x18, &rate), (0x01, &rate), (0x19, &injection)]);
+        let frame = link.shared.lock().unwrap().outbox[0].clone();
+        let inner = &frame["<TCP_MESSAGE>".len()..frame.len() - "</TCP_MESSAGE>".len()];
+        let value: serde_json::Value = serde_json::from_str(inner).unwrap();
+        let rules = value["hitbox_rules"].as_array().unwrap();
+        assert_eq!(rules.len(), 3);
+        assert_eq!(rules[0]["fighter_kind"], 0x18);
+        assert_eq!(rules[1]["fighter_kind"], 0x01);
+        assert_eq!(rules[2]["fighter_kind"], 0x19);
+        assert_eq!(rules[0]["motion"], rules[1]["motion"]);
+        assert_eq!(rules[0]["overrides"]["motion_rate"], 0.5);
+        assert!(rules[2]["inject"].is_object());
+        assert_eq!(value.as_object().unwrap().len(), 1);
     }
 
     #[test]

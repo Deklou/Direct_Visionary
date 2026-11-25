@@ -4245,27 +4245,9 @@ impl VisionaryApp {
         // Replace the plugin's full rule lists so the forgotten fighter's rules disappear while
         // every other fighter's rules remain live. The alias/carrier publication is coalesced
         // and flushed later in the normal update loop.
-        let spawn: Vec<crate::game_link::SpawnRuleWire> = self
-            .effect_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        self.game_link.send_spawn_rules(&spawn);
-        let controls: Vec<crate::game_link::EffectControlRuleWire> = self
-            .effect_control_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        self.game_link.send_effect_control_rules(&controls);
-        let hitboxes: Vec<crate::game_link::HitboxRuleWire> = self
-            .hitbox_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        self.game_link.send_hitbox_rules(&hitboxes);
+        self.send_live_spawn_rules();
+        self.send_live_effect_control_rules();
+        self.send_live_hitbox_rules();
         self.push_effect_aliases();
 
         self.forgotten_fighters.insert(fighter.to_ascii_lowercase());
@@ -9917,13 +9899,7 @@ impl VisionaryApp {
                 self.hitbox_watch = Some((key.clone(), self.state.hitboxes.clone()));
                 self.hitbox_dirty_at = None;
             }
-            let all: Vec<crate::game_link::HitboxRuleWire> = self
-                .hitbox_rules_store
-                .values()
-                .flatten()
-                .cloned()
-                .collect();
-            self.game_link.send_hitbox_rules(&all);
+            self.send_live_hitbox_rules();
             self.state.status = format!("Restored {f}/{m} hitboxes to the source data.");
         }
         if let Some(f) = remove_fighter {
@@ -9942,13 +9918,7 @@ impl VisionaryApp {
                 }
                 self.hitbox_dirty_at = None;
             }
-            let all: Vec<crate::game_link::HitboxRuleWire> = self
-                .hitbox_rules_store
-                .values()
-                .flatten()
-                .cloned()
-                .collect();
-            self.game_link.send_hitbox_rules(&all);
+            self.send_live_hitbox_rules();
             self.state.status = format!("Restored all {f} hitboxes to their source data.");
         }
         if let Some(key) = remove_call_key {
@@ -11952,13 +11922,7 @@ impl VisionaryApp {
         } else {
             self.hitbox_rules_store.insert(key, rules);
         }
-        let all: Vec<crate::game_link::HitboxRuleWire> = self
-            .hitbox_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        self.game_link.send_hitbox_rules(&all);
+        self.send_live_hitbox_rules();
         if structural {
             self.state.status = if structural_live_supported {
                 "Sound structural edit staged for export, source sync, and live suppress/inject rules."
@@ -12617,13 +12581,7 @@ impl VisionaryApp {
         } else {
             self.hitbox_rules_store.insert(frame_key, frame_rules);
         }
-        let all: Vec<crate::game_link::HitboxRuleWire> = self
-            .hitbox_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        self.game_link.send_hitbox_rules(&all);
+        self.send_live_hitbox_rules();
         if unrepresentable > 0 || partial_unrepresentable > 0 || frame_unrepresentable > 0 {
             if unrepresentable > 0 {
                 self.note_live_replay_capture_limit("expression");
@@ -18308,31 +18266,33 @@ If you step every basis for a                          type and NONE of them mat
         }
     }
 
+    fn send_live_spawn_rules(&self) {
+        // The old fighter/move store has no verified logical owner yet. Keep the saved edits,
+        // but never publish them before the costume-scoped store is connected.
+        self.game_link.send_scoped_spawn_rules(&[]);
+    }
+
+    fn send_live_effect_control_rules(&self) {
+        // The old fighter/move store has no verified logical owner yet. Keep the saved edits,
+        // but never publish them before the costume-scoped store is connected.
+        self.game_link.send_scoped_effect_control_rules(&[]);
+    }
+
+    /// Send live ACMD rules with the fighter kind belonging to each stored move.
+    /// Project replay also uses this path, even when the selected fighter has changed.
+    fn send_live_hitbox_rules(&self) {
+        // The old fighter/move store has no verified logical owner yet. Keep the saved edits,
+        // but never publish them before the costume-scoped store is connected.
+        self.game_link.send_scoped_hitbox_rules(&[]);
+    }
+
     /// Publish the complete flattened ACMD live-rule union currently staged in the keyed stores.
     /// Project loading calls this only after its all-family send barrier is lifted; ordinary
     /// rebuilds use it after their narrower rule batch ends.
     fn publish_live_rule_union(&self) {
-        let hitboxes: Vec<_> = self
-            .hitbox_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        let effects: Vec<_> = self
-            .effect_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        let controls: Vec<_> = self
-            .effect_control_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        self.game_link.send_hitbox_rules(&hitboxes);
-        self.game_link.send_spawn_rules(&effects);
-        self.game_link.send_effect_control_rules(&controls);
+        self.send_live_hitbox_rules();
+        self.send_live_spawn_rules();
+        self.send_live_effect_control_rules();
         self.publish_cancel_rules();
     }
 
@@ -21418,9 +21378,9 @@ If you step every basis for a                          type and NONE of them mat
         self.cancel_rules_store.clear();
         self.game_link.clear_cancel_rules();
         self.game_link.send_trait_rules(&[]);
-        self.game_link.send_spawn_rules(&[]);
-        self.game_link.send_effect_control_rules(&[]);
-        self.game_link.send_hitbox_rules(&[]);
+        self.send_live_spawn_rules();
+        self.send_live_effect_control_rules();
+        self.send_live_hitbox_rules();
         self.game_link.send_effect_aliases(&[]);
         // Asset-bundle callbacks are a distinct full snapshot from the effect carrier. Clear it
         // on project replacement too, otherwise a later genuine fighter load could read files
@@ -21606,13 +21566,7 @@ If you step every basis for a                          type and NONE of them mat
         } else {
             self.hitbox_rules_store.insert(key, rules);
         }
-        let all: Vec<crate::game_link::HitboxRuleWire> = self
-            .hitbox_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        self.game_link.send_hitbox_rules(&all);
+        self.send_live_hitbox_rules();
     }
 
     /// The authoritative `motion_list.bin` hash for a visible move (what
@@ -24372,13 +24326,7 @@ If you step every basis for a                          type and NONE of them mat
         } else {
             self.hitbox_rules_store.insert(mv_key, rules);
         }
-        let all: Vec<crate::game_link::HitboxRuleWire> = self
-            .hitbox_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        self.game_link.send_hitbox_rules(&all);
+        self.send_live_hitbox_rules();
         if missing_donor {
             self.state.status =
                 "Added/retimed hitbox needs live capture args — perform the move in game once."
@@ -24781,13 +24729,7 @@ If you step every basis for a                          type and NONE of them mat
         } else {
             self.hitbox_rules_store.insert(key, rules);
         }
-        let all: Vec<crate::game_link::HitboxRuleWire> = self
-            .hitbox_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        self.game_link.send_hitbox_rules(&all);
+        self.send_live_hitbox_rules();
     }
 
     /// Send this move's `FT_MOTION_RATE` values to the running game.
@@ -24850,13 +24792,7 @@ If you step every basis for a                          type and NONE of them mat
         } else {
             self.hitbox_rules_store.insert(key, rules);
         }
-        let all: Vec<crate::game_link::HitboxRuleWire> = self
-            .hitbox_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        self.game_link.send_hitbox_rules(&all);
+        self.send_live_hitbox_rules();
         // Says whether the game is even listening. "Sent" and "the plugin is not connected" are
         // the two outcomes a user cannot tell apart from the game side, and confusing them is
         // what makes a live feature feel broken when it is merely unplugged.
@@ -24964,13 +24900,7 @@ If you step every basis for a                          type and NONE of them mat
         } else {
             self.hitbox_rules_store.insert(key, rules);
         }
-        let all: Vec<crate::game_link::HitboxRuleWire> = self
-            .hitbox_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        self.game_link.send_hitbox_rules(&all);
+        self.send_live_hitbox_rules();
         if unrepresentable > 0 {
             self.note_live_replay_capture_limit("SET_SPEED");
             self.state.status = format!(
@@ -25084,13 +25014,7 @@ If you step every basis for a                          type and NONE of them mat
         } else {
             self.hitbox_rules_store.insert(key, rules);
         }
-        let all: Vec<crate::game_link::HitboxRuleWire> = self
-            .hitbox_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        self.game_link.send_hitbox_rules(&all);
+        self.send_live_hitbox_rules();
         if unrepresentable > 0 {
             self.note_live_replay_capture_limit("SET_SPEED_EX");
             self.state.status = format!(
@@ -25199,13 +25123,7 @@ If you step every basis for a                          type and NONE of them mat
         } else {
             self.hitbox_rules_store.insert(key, rules);
         }
-        let all: Vec<crate::game_link::HitboxRuleWire> = self
-            .hitbox_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        self.game_link.send_hitbox_rules(&all);
+        self.send_live_hitbox_rules();
         if unrepresentable > 0 {
             self.note_live_replay_capture_limit("ADD_SPEED_NO_LIMIT");
             self.state.status = format!(
@@ -25323,13 +25241,7 @@ If you step every basis for a                          type and NONE of them mat
         } else {
             self.hitbox_rules_store.insert(key, rules);
         }
-        let all: Vec<crate::game_link::HitboxRuleWire> = self
-            .hitbox_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        self.game_link.send_hitbox_rules(&all);
+        self.send_live_hitbox_rules();
         if unrepresentable > 0 {
             self.note_live_replay_capture_limit("CORRECT");
             self.state.status = format!(
@@ -25451,13 +25363,7 @@ If you step every basis for a                          type and NONE of them mat
         } else {
             self.hitbox_rules_store.insert(key, rules);
         }
-        let all: Vec<crate::game_link::HitboxRuleWire> = self
-            .hitbox_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        self.game_link.send_hitbox_rules(&all);
+        self.send_live_hitbox_rules();
         if unrepresentable > 0 {
             self.note_live_replay_capture_limit("FT_CATCH_STOP");
             self.state.status = format!(
@@ -25573,13 +25479,7 @@ If you step every basis for a                          type and NONE of them mat
         } else {
             self.hitbox_rules_store.insert(key, rules);
         }
-        let all: Vec<crate::game_link::HitboxRuleWire> = self
-            .hitbox_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        self.game_link.send_hitbox_rules(&all);
+        self.send_live_hitbox_rules();
         if unrepresentable > 0 {
             self.note_live_replay_capture_limit("FT_START_ADJUST_MOTION_FRAME_arg1");
             self.state.status = format!(
@@ -25702,13 +25602,7 @@ If you step every basis for a                          type and NONE of them mat
         } else {
             self.hitbox_rules_store.insert(key, rules);
         }
-        let all: Vec<crate::game_link::HitboxRuleWire> = self
-            .hitbox_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        self.game_link.send_hitbox_rules(&all);
+        self.send_live_hitbox_rules();
         if unrepresentable > 0 {
             self.note_live_replay_capture_limit("MotionModule::set_rate");
             self.state.status = format!(
@@ -25828,13 +25722,7 @@ If you step every basis for a                          type and NONE of them mat
         } else {
             self.hitbox_rules_store.insert(key, rules);
         }
-        let all: Vec<crate::game_link::HitboxRuleWire> = self
-            .hitbox_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        self.game_link.send_hitbox_rules(&all);
+        self.send_live_hitbox_rules();
         if unrepresentable > 0 {
             self.note_live_replay_capture_limit("MotionModule::set_helper_calculation");
             self.state.status = format!(
@@ -26136,13 +26024,7 @@ If you step every basis for a                          type and NONE of them mat
         } else {
             self.hitbox_rules_store.insert(key, rules);
         }
-        let all: Vec<crate::game_link::HitboxRuleWire> = self
-            .hitbox_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        self.game_link.send_hitbox_rules(&all);
+        self.send_live_hitbox_rules();
         if unrepresentable > 0 {
             self.note_live_replay_capture_limit("MotionModule::set_frame_partial");
             self.state.status = format!(
@@ -26181,13 +26063,7 @@ If you step every basis for a                          type and NONE of them mat
         } else {
             self.hitbox_rules_store.insert(key, rules);
         }
-        let all: Vec<crate::game_link::HitboxRuleWire> = self
-            .hitbox_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        self.game_link.send_hitbox_rules(&all);
+        self.send_live_hitbox_rules();
         if unrepresentable > 0 {
             self.note_live_replay_capture_limit("expression partial frame");
             self.state.status = format!(
@@ -26494,13 +26370,7 @@ If you step every basis for a                          type and NONE of them mat
         } else {
             self.hitbox_rules_store.insert(key, rules);
         }
-        let all: Vec<crate::game_link::HitboxRuleWire> = self
-            .hitbox_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        self.game_link.send_hitbox_rules(&all);
+        self.send_live_hitbox_rules();
         if unrepresentable > 0 {
             self.note_live_replay_capture_limit("MotionModule::set_rate_partial");
             self.state.status = format!(
@@ -26539,13 +26409,7 @@ If you step every basis for a                          type and NONE of them mat
         } else {
             self.hitbox_rules_store.insert(key, rules);
         }
-        let all: Vec<crate::game_link::HitboxRuleWire> = self
-            .hitbox_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        self.game_link.send_hitbox_rules(&all);
+        self.send_live_hitbox_rules();
         if unrepresentable > 0 {
             self.note_live_replay_capture_limit("expression partial rate");
             self.state.status = format!(
@@ -26665,13 +26529,7 @@ If you step every basis for a                          type and NONE of them mat
         } else {
             self.hitbox_rules_store.insert(key, rules);
         }
-        let all: Vec<crate::game_link::HitboxRuleWire> = self
-            .hitbox_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        self.game_link.send_hitbox_rules(&all);
+        self.send_live_hitbox_rules();
         if unrepresentable > 0 {
             self.note_live_replay_capture_limit("CLR_SPEED");
             self.state.status = format!(
@@ -26792,13 +26650,7 @@ If you step every basis for a                          type and NONE of them mat
         } else {
             self.hitbox_rules_store.insert(key, rules);
         }
-        let all: Vec<crate::game_link::HitboxRuleWire> = self
-            .hitbox_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        self.game_link.send_hitbox_rules(&all);
+        self.send_live_hitbox_rules();
         if unrepresentable > 0 {
             self.note_live_replay_capture_limit("change_kinetic");
             self.state.status = format!(
@@ -26935,13 +26787,7 @@ If you step every basis for a                          type and NONE of them mat
         } else {
             self.hitbox_rules_store.insert(key, rules);
         }
-        let all: Vec<crate::game_link::HitboxRuleWire> = self
-            .hitbox_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        self.game_link.send_hitbox_rules(&all);
+        self.send_live_hitbox_rules();
         if unrepresentable > 0 {
             self.note_live_replay_capture_limit("KineticModule energy");
             self.state.status = format!(
@@ -27071,13 +26917,7 @@ If you step every basis for a                          type and NONE of them mat
         } else {
             self.hitbox_rules_store.insert(key, rules);
         }
-        let all: Vec<crate::game_link::HitboxRuleWire> = self
-            .hitbox_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        self.game_link.send_hitbox_rules(&all);
+        self.send_live_hitbox_rules();
         if unrepresentable > 0 {
             self.note_live_replay_capture_limit("KineticModule::add_speed");
             self.state.status = format!(
@@ -27204,13 +27044,7 @@ If you step every basis for a                          type and NONE of them mat
         } else {
             self.hitbox_rules_store.insert(key, rules);
         }
-        let all: Vec<crate::game_link::HitboxRuleWire> = self
-            .hitbox_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        self.game_link.send_hitbox_rules(&all);
+        self.send_live_hitbox_rules();
         if unrepresentable > 0 {
             self.note_live_replay_capture_limit("WorkModule::inc_int");
             self.state.status = format!(
@@ -27336,13 +27170,7 @@ If you step every basis for a                          type and NONE of them mat
         } else {
             self.hitbox_rules_store.insert(key, rules);
         }
-        let all: Vec<crate::game_link::HitboxRuleWire> = self
-            .hitbox_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        self.game_link.send_hitbox_rules(&all);
+        self.send_live_hitbox_rules();
         if unrepresentable > 0 {
             self.note_live_replay_capture_limit("WorkModule flag");
             self.state.status = format!(
@@ -27475,13 +27303,7 @@ If you step every basis for a                          type and NONE of them mat
         } else {
             self.hitbox_rules_store.insert(key, rules);
         }
-        let all: Vec<crate::game_link::HitboxRuleWire> = self
-            .hitbox_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        self.game_link.send_hitbox_rules(&all);
+        self.send_live_hitbox_rules();
         if unrepresentable > 0 {
             self.note_live_replay_capture_limit("WorkModule transition term");
             self.state.status = format!(
@@ -27717,13 +27539,7 @@ If you step every basis for a                          type and NONE of them mat
         } else {
             self.hitbox_rules_store.insert(key, rules);
         }
-        let all: Vec<crate::game_link::HitboxRuleWire> = self
-            .hitbox_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        self.game_link.send_hitbox_rules(&all);
+        self.send_live_hitbox_rules();
         if unrepresentable > 0 {
             self.note_live_replay_capture_limit("WorkModule value");
             self.state.status = format!(
@@ -27827,13 +27643,7 @@ If you step every basis for a                          type and NONE of them mat
         } else {
             self.hitbox_rules_store.insert(key, rules);
         }
-        let all: Vec<crate::game_link::HitboxRuleWire> = self
-            .hitbox_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        self.game_link.send_hitbox_rules(&all);
+        self.send_live_hitbox_rules();
     }
 
     fn kinetic_clear_speed_all_rules_for(
@@ -27931,13 +27741,7 @@ If you step every basis for a                          type and NONE of them mat
         } else {
             self.hitbox_rules_store.insert(key, rules);
         }
-        let all: Vec<crate::game_link::HitboxRuleWire> = self
-            .hitbox_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        self.game_link.send_hitbox_rules(&all);
+        self.send_live_hitbox_rules();
     }
 
     fn kinetic_set_consider_ground_friction_capture_for<'a>(
@@ -28163,13 +27967,7 @@ If you step every basis for a                          type and NONE of them mat
         } else {
             self.hitbox_rules_store.insert(key, rules);
         }
-        let all: Vec<crate::game_link::HitboxRuleWire> = self
-            .hitbox_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        self.game_link.send_hitbox_rules(&all);
+        self.send_live_hitbox_rules();
         if unrepresentable > 0 {
             self.note_live_replay_capture_limit("set_consider_ground_friction");
             self.state.status = format!(
@@ -28235,13 +28033,7 @@ If you step every basis for a                          type and NONE of them mat
         } else {
             self.hitbox_rules_store.insert(key, rules);
         }
-        let all: Vec<crate::game_link::HitboxRuleWire> = self
-            .hitbox_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        self.game_link.send_hitbox_rules(&all);
+        self.send_live_hitbox_rules();
     }
 
     /// Rebuild live hitbox rules for every move in a loaded project, not just the move currently
@@ -28465,13 +28257,7 @@ If you step every basis for a                          type and NONE of them mat
                 self.hitbox_rules_store.insert(key, rules);
             }
         }
-        let all: Vec<_> = self
-            .hitbox_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        self.game_link.send_hitbox_rules(&all);
+        self.send_live_hitbox_rules();
         incomplete
     }
 
@@ -29903,20 +29689,8 @@ If you step every basis for a                          type and NONE of them mat
             self.apply_effect_call_edits_to_current();
             self.push_effect_rules();
         } else if !affected_moves.is_empty() {
-            let all: Vec<crate::game_link::SpawnRuleWire> = self
-                .effect_rules_store
-                .values()
-                .flatten()
-                .cloned()
-                .collect();
-            self.game_link.send_spawn_rules(&all);
-            let all_controls: Vec<crate::game_link::EffectControlRuleWire> = self
-                .effect_control_rules_store
-                .values()
-                .flatten()
-                .cloned()
-                .collect();
-            self.game_link.send_effect_control_rules(&all_controls);
+            self.send_live_spawn_rules();
+            self.send_live_effect_control_rules();
         }
     }
 
@@ -31715,13 +31489,7 @@ If you step every basis for a                          type and NONE of them mat
             }
         }
         // Flush the union of all moves' rules so cross-move redirects apply live at once.
-        let all: Vec<crate::game_link::SpawnRuleWire> = self
-            .effect_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        self.game_link.send_spawn_rules(&all);
+        self.send_live_spawn_rules();
         // Live parity: the copy doesn't exist in the running game yet, but the plugin
         // aliases its hash to the donor's, so redirected spawns show in-game NOW and
         // match the export (a fresh copy is content-identical to its donor).
@@ -32630,20 +32398,8 @@ If you step every basis for a                          type and NONE of them mat
             self.effect_control_rules_store
                 .insert(mv_key, control_rules);
         }
-        let all: Vec<crate::game_link::SpawnRuleWire> = self
-            .effect_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        self.game_link.send_spawn_rules(&all);
-        let all_controls: Vec<crate::game_link::EffectControlRuleWire> = self
-            .effect_control_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        self.game_link.send_effect_control_rules(&all_controls);
+        self.send_live_spawn_rules();
+        self.send_live_effect_control_rules();
         if unsupported_flip_axis {
             self.state.status =
                 "This flip-axis/control token is preserved for source/export, but live preview \
@@ -36066,32 +35822,14 @@ impl eframe::App for VisionaryApp {
             if client.is_some() {
                 // Re-push the authoritative live state after every fresh plugin connection.
                 // This also restores state when the game restarted between socket sessions.
-                let spawn: Vec<crate::game_link::SpawnRuleWire> = self
-                    .effect_rules_store
-                    .values()
-                    .flatten()
-                    .cloned()
-                    .collect();
-                if !spawn.is_empty() {
-                    self.game_link.send_spawn_rules(&spawn);
+                if !self.effect_rules_store.is_empty() {
+                    self.send_live_spawn_rules();
                 }
-                let controls: Vec<crate::game_link::EffectControlRuleWire> = self
-                    .effect_control_rules_store
-                    .values()
-                    .flatten()
-                    .cloned()
-                    .collect();
-                if !controls.is_empty() {
-                    self.game_link.send_effect_control_rules(&controls);
+                if !self.effect_control_rules_store.is_empty() {
+                    self.send_live_effect_control_rules();
                 }
-                let hit: Vec<crate::game_link::HitboxRuleWire> = self
-                    .hitbox_rules_store
-                    .values()
-                    .flatten()
-                    .cloned()
-                    .collect();
-                if !hit.is_empty() {
-                    self.game_link.send_hitbox_rules(&hit);
+                if !self.hitbox_rules_store.is_empty() {
+                    self.send_live_hitbox_rules();
                 }
                 self.push_effect_aliases();
                 self.publish_cancel_rules();
