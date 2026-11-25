@@ -3345,6 +3345,8 @@ pub struct VisionaryApp {
     /// Debounced live-pin push for an edited effect call (index, last edit time).
     /// Shared per-kind runtime overrides (Effects panel + Eff Editor game panel).
     live_overrides: crate::game_link::LiveOverrides,
+    // Old kind-global tweaks remain under their original saved fighter; never infer a new owner.
+    parked_legacy_tweaks: HashMap<String, Vec<crate::mod_project::LiveTweak>>,
     /// Authored .eff edits per fighter (project store; synced from the eff editor).
     eff_mods: HashMap<String, crate::mod_project::EffMod>,
     /// Call sites that asked to publish a donor/carrier snapshot this UI frame. Publication is
@@ -3742,6 +3744,7 @@ impl VisionaryApp {
             cancel_base_slots: BTreeMap::new(),
             last_live_trait_rules: Vec::new(),
             live_overrides: crate::game_link::LiveOverrides::default(),
+            parked_legacy_tweaks: HashMap::new(),
             eff_mods: HashMap::new(),
             carrier_push_callers: Vec::new(),
             project_name: "unnamed_mod".into(),
@@ -9511,6 +9514,20 @@ impl VisionaryApp {
                 ui.add_space(6.0);
             }
 
+            if !self.parked_legacy_tweaks.is_empty() {
+                ui.weak("Legacy global effect tweaks are saved but inactive; no character owner can be verified.");
+                let mut fighters: Vec<_> = self.parked_legacy_tweaks.keys().cloned().collect();
+                fighters.sort();
+                for fighter in fighters {
+                    let count = self.parked_legacy_tweaks[&fighter].len();
+                    ui.horizontal(|ui| {
+                        ui.label(format!("{fighter}: {count} inactive effect tweak(s)"));
+                        if ui.small_button("Remove saved tweaks").clicked() {
+                            self.parked_legacy_tweaks.remove(&fighter);
+                        }
+                    });
+                }
+            }
             // ── Live color/speed tweaks (kind-global runtime multipliers) ──
             let tweaks = self.live_overrides.tweaked();
             if !tweaks.is_empty() {
@@ -19028,6 +19045,9 @@ If you step every basis for a                          type and NONE of them mat
             }
             project.fighters.entry(fighter.clone()).or_default().eff = Some(eff.clone());
         }
+        for (fighter, tweaks) in &self.parked_legacy_tweaks {
+            project.fighters.entry(fighter.clone()).or_default().live_tweaks = tweaks.clone();
+        }
         // User-set live color×/speed multipliers → LiveTweaks, attached to every fighter
         // whose spawn lists use the effect (falls back to the selected fighter).
         let tweaks = self.live_overrides.tweaked();
@@ -19479,6 +19499,7 @@ If you step every basis for a                          type and NONE of them mat
         self.source_mismatch_prompt = None;
         self.eff_mods.clear();
         self.live_overrides = crate::game_link::LiveOverrides::default();
+        self.parked_legacy_tweaks.clear();
         self.roster.project = crate::mod_project::RosterMod::default();
         self.roster.clear_edit_target();
         self.roster.params.clear();
@@ -20853,6 +20874,7 @@ If you step every basis for a                          type and NONE of them mat
         self.rebuilding_project_live = false;
         self.eff_mods.clear();
         self.live_overrides = crate::game_link::LiveOverrides::default();
+        self.parked_legacy_tweaks.clear();
         self.state.hitboxes = self.state.hitboxes_pristine.clone();
         if let Some(relative) = previously_loaded_eff {
             let base = self.resolve_eff_source(&relative);
@@ -20988,7 +21010,13 @@ If you step every basis for a                          type and NONE of them mat
                     + eff.entry_edits.len();
                 self.eff_mods.insert(fighter.clone(), eff);
             }
-            // Live color/speed tweaks: restore into the override store and re-send.
+            // No ownership can be recovered from a legacy kind-global multiplier.
+            if !crate::game_link::LEGACY_GLOBAL_EFFECTS_ENABLED {
+                if !fm.live_tweaks.is_empty() {
+                    self.parked_legacy_tweaks.insert(fighter.clone(), fm.live_tweaks);
+                }
+                continue;
+            }
             for t in fm.live_tweaks {
                 let hash = effect_name_hash(&t.effect_name);
                 let mut init = crate::game_link::RpmEffectData {
@@ -21288,6 +21316,10 @@ If you step every basis for a                          type and NONE of them mat
     ///
     /// Called once at startup. Loading a project re-publishes everything it needs.
     fn clear_stale_live_state() {
+        // The new plugin ignores legacy manifests/pins. Keep existing SD files untouched.
+        if !crate::game_link::LEGACY_GLOBAL_EFFECTS_ENABLED {
+            return;
+        }
         let Some(sd) = crate::scratch_dirs::emulator_sd_root() else {
             return;
         };
@@ -21310,6 +21342,9 @@ If you step every basis for a                          type and NONE of them mat
     /// Remove one fighter's app-owned live EFF manifest entry and merged payload. The source
     /// dump/mod EFF is deliberately outside this path and is never touched here.
     fn remove_live_eff_for_fighter(&mut self, fighter: &str) -> bool {
+        if !crate::game_link::LEGACY_GLOBAL_EFFECTS_ENABLED {
+            return false;
+        }
         let mut changed = false;
         self.live_eff_deployed.retain(|name| {
             let keep = !name.eq_ignore_ascii_case(fighter);
@@ -21413,28 +21448,32 @@ If you step every basis for a                          type and NONE of them mat
         self.game_link.send_donor_bytes(&[]);
         self.game_link.send_donor_effs(&[]);
         self.carrier_push_callers.clear();
-        // Stop serving merged eff files: wipe the SD-side manifest + files (the plugin's
-        // registrations stay for this boot but resolve to nothing → vanilla files load).
-        if let Some(dir) = crate::scratch_dirs::emulator_sd_root()
-            .map(|sd| sd.join("effect_viewer").join("live_eff"))
-            .filter(|d| d.is_dir())
-        {
-            let _ = std::fs::remove_dir_all(&dir);
-            self.game_link.send_live_eff_reload();
-        }
-        // Also remove the guaranteed-fallback Arcropolis mod staged by deploy_live_eff
-        // (takes effect on the next boot — the off-switch mirror of the staged mod).
-        if let Some(dir) = crate::scratch_dirs::emulator_sd_root()
-            .map(|sd| sd.join("ultimate").join("mods").join("effect_viewer_live"))
-            .filter(|d| d.is_dir())
-        {
-            let _ = std::fs::remove_dir_all(&dir);
+        if crate::game_link::LEGACY_GLOBAL_EFFECTS_ENABLED {
+            // Stop serving merged eff files: wipe the SD-side manifest + files (the plugin's
+            // registrations stay for this boot but resolve to nothing → vanilla files load).
+            if let Some(dir) = crate::scratch_dirs::emulator_sd_root()
+                .map(|sd| sd.join("effect_viewer").join("live_eff"))
+                .filter(|d| d.is_dir())
+            {
+                let _ = std::fs::remove_dir_all(&dir);
+                self.game_link.send_live_eff_reload();
+            }
+            // Also remove the guaranteed-fallback Arcropolis mod staged by deploy_live_eff
+            // (takes effect on the next boot — the off-switch mirror of the staged mod).
+            if let Some(dir) = crate::scratch_dirs::emulator_sd_root()
+                .map(|sd| sd.join("ultimate").join("mods").join("effect_viewer_live"))
+                .filter(|d| d.is_dir())
+            {
+                let _ = std::fs::remove_dir_all(&dir);
+            }
         }
         self.live_eff_deployed.clear();
         self.pin_sync_prompt = None;
-        self.state.status = "Cleared all in-game edits (saved pins + live rules + aliases + \
-             live carrier + live eff files)."
-            .into();
+        self.state.status = if crate::game_link::LEGACY_GLOBAL_EFFECTS_ENABLED {
+            "Cleared all in-game edits (saved pins + live rules + aliases + live carrier + live eff files)."
+        } else {
+            "Cleared scoped live rules; legacy global effect files were not changed."
+        }.into();
     }
 
     // ── Live ACMD capture + live hitbox rules ─────────────────────────────────
@@ -29960,6 +29999,12 @@ If you step every basis for a                          type and NONE of them mat
             return;
         }
         let caller = std::mem::take(&mut self.carrier_push_callers).join(",");
+        if !crate::game_link::LEGACY_GLOBAL_EFFECTS_ENABLED {
+            self.game_link.send_effect_aliases(&[]);
+            self.game_link.send_donor_bytes(&[]);
+            self.game_link.send_donor_effs(&[]);
+            return;
+        }
         let mut aliases: Vec<crate::game_link::EffectAliasWire> = Vec::new();
         // The carrier attaches to the fighter the user currently has selected — that is the
         // one whose effects are on screen and being edited. (This was hardcoded to Kirby
@@ -30868,6 +30913,10 @@ If you step every basis for a                          type and NONE of them mat
     /// Cross-fighter donor content thereby loads WITH the fighter — no export, no donor
     /// fighter in the match; re-entering the match picks it up. Returns success.
     fn deploy_live_eff(&mut self, fighter: &str) -> bool {
+        if !crate::game_link::LEGACY_GLOBAL_EFFECTS_ENABLED {
+            self.state.status = "Live EFF resources are inactive in scoped editing; saved EFF edits are preserved.".into();
+            return false;
+        }
         if self.exclusive_fighter_slots(fighter).is_none() {
             self.state.status = "Live EFF deploy refused: shared or unverified costume ownership.".into();
             return false;
@@ -30966,6 +31015,11 @@ If you step every basis for a                          type and NONE of them mat
         // Fold the editor's current diff into the project store first: the carrier snapshot
         // is built from `eff_mods`, not from the editor's working copy.
         self.sync_eff_mods_from_editor();
+        if !crate::game_link::LEGACY_GLOBAL_EFFECTS_ENABLED {
+            self.eff_editor.carrier_expected = false;
+            self.push_effect_aliases();
+            return "EFF edits saved locally; live resource loading is disabled in scoped editing.".into();
+        }
         let fighter = crate::mod_project::fighter_from_source_rel(&rel);
         if self.exclusive_fighter_slots(&fighter).is_none() {
             self.push_effect_aliases();
@@ -35865,7 +35919,9 @@ impl eframe::App for VisionaryApp {
         if client != self.pin_sync_client {
             self.pin_sync_client = client;
             self.pin_sync_prompt = None;
-            self.pin_sync_wait = client.map(|_| std::time::Instant::now());
+            self.pin_sync_wait = if crate::game_link::LEGACY_GLOBAL_EFFECTS_ENABLED {
+                client.map(|_| std::time::Instant::now())
+            } else { None };
             if client.is_some() {
                 // Re-push the authoritative live state after every fresh plugin connection.
                 // This also restores state when the game restarted between socket sessions.

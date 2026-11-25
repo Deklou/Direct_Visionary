@@ -1151,6 +1151,10 @@ impl LiveOverrides {
     /// never inferred from this kind-level form. Transform fields are omitted for the same
     /// reason — ACMD position/rotation are per spawn.
     pub fn flush_due(&mut self, link: &GameLink) -> usize {
+        if !LEGACY_GLOBAL_EFFECTS_ENABLED {
+            for entry in self.entries.values_mut() { entry.dirty_at = None; }
+            return 0;
+        }
         let mut sent = 0;
         for (hash, e) in self.entries.iter_mut() {
             if let Some(t) = e.dirty_at {
@@ -1168,6 +1172,10 @@ impl LiveOverrides {
     /// Project loading is an explicit state restore rather than a live drag, so waiting for a
     /// timer would leave the game temporarily different from the loaded project.
     pub fn flush_all(&mut self, link: &GameLink) -> usize {
+        if !LEGACY_GLOBAL_EFFECTS_ENABLED {
+            for entry in self.entries.values_mut() { entry.dirty_at = None; }
+            return 0;
+        }
         let mut sent = 0;
         for (hash, entry) in self.entries.iter_mut() {
             if entry.dirty_at.take().is_some() {
@@ -1182,6 +1190,9 @@ impl LiveOverrides {
     /// not an application acknowledgement: the plugin may restart before its game thread
     /// applies the edit, so each handshake replays the editor's authoritative state.
     pub fn resend_tweaks(&self, link: &GameLink) -> usize {
+        if !LEGACY_GLOBAL_EFFECTS_ENABLED {
+            return 0;
+        }
         let mut sent = 0;
         for (hash, entry) in &self.entries {
             if entry.user_tweaked {
@@ -1867,6 +1878,9 @@ impl GameLink {
     /// Cross-fighter donor eff files the plugin co-loads with each target fighter's
     /// effects (smashline-transplant mechanism), so donor content is spawnable live.
     pub fn send_donor_effs(&self, specs: &[DonorEffWire]) {
+        if !LEGACY_GLOBAL_EFFECTS_ENABLED && !specs.is_empty() {
+            return;
+        }
         if self.sends_suppressed() {
             return;
         }
@@ -1883,6 +1897,9 @@ impl GameLink {
     /// Stripped donor eff bytes for the plugin to inject as resident data (live
     /// cross-character transplant). Sent whenever the referenced donor set changes.
     pub fn send_donor_bytes(&self, donors: &[DonorBytesWire]) {
+        if !LEGACY_GLOBAL_EFFECTS_ENABLED && !donors.is_empty() {
+            return;
+        }
         if self.sends_suppressed() {
             return;
         }
@@ -1960,6 +1977,9 @@ impl GameLink {
     /// Ask the plugin to clear ALL its pinned edits (incl. the SD save) and re-notify
     /// pristine values.
     pub fn send_reset_pins(&self) {
+        if !LEGACY_GLOBAL_EFFECTS_ENABLED {
+            return;
+        }
         if self.sends_suppressed() {
             return;
         }
@@ -1973,6 +1993,9 @@ impl GameLink {
     /// Tell the plugin the live-eff manifest / merged files on the Eden SD changed —
     /// it refreshes its Arcropolis file-provider registrations.
     pub fn send_live_eff_reload(&self) {
+        if !LEGACY_GLOBAL_EFFECTS_ENABLED {
+            return;
+        }
         if self.sends_suppressed() {
             return;
         }
@@ -2297,9 +2320,17 @@ impl GameLink {
     /// transplant is physically world-space, so accidentally pinning them moves it to the
     /// stage origin. Authored EFF modifiers may additionally include kind-global scale.
     pub fn send_modifier_edit(&self, id: u64, data: &RpmEffectData, include_scale: bool) {
-        if self.sends_suppressed() {
+        if !LEGACY_GLOBAL_EFFECTS_ENABLED || self.sends_suppressed() {
             return;
         }
+        let frame = Self::modifier_edit_frame(id, data, include_scale);
+        if let Ok(mut s) = self.shared.lock() {
+            push_outbox_capped(&mut s.outbox, frame);
+            s.edits_tx += 1;
+        }
+    }
+
+    fn modifier_edit_frame(id: u64, data: &RpmEffectData, include_scale: bool) -> String {
         let mut value = serde_json::json!({
             "speed": data.speed,
             "rainbow": {
@@ -2310,11 +2341,7 @@ impl GameLink {
             value["scale"] = serde_json::json!(data.scale);
         }
         let payload = serde_json::json!({ "id": id, "newValue": value.to_string() });
-        let frame = format!("<TCP_MESSAGE>{payload}</TCP_MESSAGE>");
-        if let Ok(mut s) = self.shared.lock() {
-            push_outbox_capped(&mut s.outbox, frame);
-            s.edits_tx += 1;
-        }
+        format!("<TCP_MESSAGE>{payload}</TCP_MESSAGE>")
     }
 }
 
@@ -2886,9 +2913,10 @@ fn handle_frame(shared: &Arc<Mutex<Shared>>, payload: &str) {
     }
 }
 
-#[cfg(test)]
+#[allow(dead_code)]
 #[path = "../plugins/slight_replica/src/slight/rule_scope.rs"]
 mod plugin_rule_scope;
+pub(crate) use plugin_rule_scope::LEGACY_GLOBAL_EFFECTS_ENABLED;
 
 #[cfg(test)]
 mod tests {
@@ -3868,7 +3896,6 @@ mod tests {
 
     #[test]
     fn outbound_live_tweak_omits_spawn_transform_fields() {
-        let link = GameLink::default();
         let mut data = RpmEffectData {
             pos: Point3D {
                 x: 6.0,
@@ -3885,9 +3912,7 @@ mod tests {
             ..Default::default()
         };
         data.rainbow.color.red = 0.5;
-        link.send_modifier_edit(0x1311e844a4, &data, false);
-
-        let frame = link.shared.lock().unwrap().outbox[0].clone();
+        let frame = GameLink::modifier_edit_frame(0x1311e844a4, &data, false);
         let inner = &frame["<TCP_MESSAGE>".len()..frame.len() - "</TCP_MESSAGE>".len()];
         let outer: serde_json::Value = serde_json::from_str(inner).unwrap();
         let edit: serde_json::Value =
@@ -3902,15 +3927,12 @@ mod tests {
 
     #[test]
     fn outbound_authored_modifiers_only_add_scale() {
-        let link = GameLink::default();
         let mut data = RpmEffectData {
             scale: 1.75,
             ..Default::default()
         };
         data.pos.x = 99.0;
-        link.send_modifier_edit(0x109297479a, &data, true);
-
-        let frame = link.shared.lock().unwrap().outbox[0].clone();
+        let frame = GameLink::modifier_edit_frame(0x109297479a, &data, true);
         let inner = &frame["<TCP_MESSAGE>".len()..frame.len() - "</TCP_MESSAGE>".len()];
         let outer: serde_json::Value = serde_json::from_str(inner).unwrap();
         let edit: serde_json::Value =
@@ -6468,8 +6490,8 @@ mod tests {
         link.send_modifier_edit(0x1234, &RpmEffectData::default(), false);
         assert_eq!(
             link.shared.lock().unwrap().outbox.len(),
-            12,
-            "the finished import can publish one message per protocol family"
+            9,
+            "the finished import publishes only enabled protocol families"
         );
     }
 
@@ -6762,24 +6784,33 @@ mod tests {
     }
 
     #[test]
-    fn reconnect_replays_authoritative_user_tweaks() {
-        let link = GameLink::default();
+    fn scoped_acmd_legacy_pins_are_preserved_but_not_replayed() {
+        let link = scoped_acmd_link();
         let mut overrides = LiveOverrides::default();
         overrides.restore_tweak(
             0x1234,
-            RpmEffectData {
-                effect_name: "sys_test".to_string(),
-                speed: 1.5,
-                ..Default::default()
-            },
+            RpmEffectData { effect_name: "sys_test".into(), speed: 1.5, ..Default::default() },
         );
-        assert_eq!(overrides.flush_all(&link), 1);
-        link.shared.lock().unwrap().outbox.clear();
+        assert_eq!(overrides.flush_all(&link), 0);
+        assert_eq!(overrides.resend_tweaks(&link), 0);
+        assert_eq!(overrides.tweaked()[0].1.speed, 1.5);
+        assert!(!overrides.any_dirty());
+        assert!(link.shared.lock().unwrap().outbox.is_empty());
+    }
 
-        assert_eq!(overrides.resend_tweaks(&link), 1);
-        let outbox = &link.shared.lock().unwrap().outbox;
-        assert_eq!(outbox.len(), 1);
-        assert!(outbox[0].contains("\\\"speed\\\":1.5"));
+    #[test]
+    fn scoped_acmd_global_resources_cannot_be_published() {
+        let link = scoped_acmd_link();
+        link.send_modifier_edit(0x1234, &RpmEffectData::default(), false);
+        link.send_reset_pins();
+        link.send_live_eff_reload();
+        link.send_donor_effs(&[DonorEffWire { target: "effect/fighter/mario/ef_mario.eff".into(), donors: vec!["donor.eff".into()] }]);
+        link.send_donor_bytes(&[DonorBytesWire { path: "donor.eff".into(), b64: "AAAA".into(), file: String::new() }]);
+        assert!(link.shared.lock().unwrap().outbox.is_empty());
+        link.send_donor_bytes(&[]);
+        link.send_donor_effs(&[]);
+        assert_eq!(link.shared.lock().unwrap().outbox.len(), 2);
+        assert!(link.send_scoped_hitbox_rules(&[]));
     }
 
     #[test]

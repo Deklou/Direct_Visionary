@@ -165,6 +165,9 @@ pub fn reload() {
 }
 
 fn reload_inner(apply_live: bool) {
+    if !crate::slight::rule_scope::LEGACY_GLOBAL_EFFECTS_ENABLED {
+        return;
+    }
     let text = match std::fs::read_to_string(MANIFEST) {
         Ok(t) => t,
         Err(_) => {

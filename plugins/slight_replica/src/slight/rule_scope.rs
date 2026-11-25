@@ -1,4 +1,9 @@
 //! Runtime identity shared by all scoped live ACMD rule families.
+
+// The effect manager's kind table, legacy pins and EFF carrier have no verified
+// per-character resource identity. Keep their saved data, but do not activate
+// them in the scoped editing build. ACMD rules and ordinary exported files are separate.
+pub const LEGACY_GLOBAL_EFFECTS_ENABLED: bool = false;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RuntimeTarget {
     pub fighter_kind: i32,

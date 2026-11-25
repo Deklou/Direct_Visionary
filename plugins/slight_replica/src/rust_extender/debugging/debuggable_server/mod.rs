@@ -283,6 +283,11 @@ pub fn apply_timing_rules_from_network(raw: &str) -> bool {
 
 fn parse_tcp_payload(raw: &str) -> Option<ParsedEdit> {
     let v: serde_json::Value = serde_json::from_str(raw).ok()?;
+    if !crate::slight::rule_scope::LEGACY_GLOBAL_EFFECTS_ENABLED
+        && (v.get("donor_effs").is_some() || v.get("donor_bytes").is_some())
+    {
+        return None;
+    }
 
     // Editor commands (no effect-edit payload).
     if let Some(cmd) = v.get("command").and_then(|c| c.as_str()) {
@@ -594,6 +599,11 @@ fn parse_tcp_payload(raw: &str) -> Option<ParsedEdit> {
         return None;
     }
 
+    // Legacy effect edits have no verified character owner.
+    if !crate::slight::rule_scope::LEGACY_GLOBAL_EFFECTS_ENABLED {
+        return None;
+    }
+
     if let (Some(id), Some(nv)) = (v.get("id"), v.get("newValue")) {
         let val = if let Some(s) = nv.as_str() {
             serde_json::from_str(s).unwrap_or(nv.clone())
@@ -685,6 +695,9 @@ pub fn finish_transaction(path: &std::path::Path, applied: bool) {
 }
 
 pub fn poll_transactions() -> Vec<(ParsedEdit, std::path::PathBuf)> {
+    if !crate::slight::rule_scope::LEGACY_GLOBAL_EFFECTS_ENABLED {
+        return Vec::new();
+    }
     smash_utils::ensure_slight_dirs();
     let Ok(entries) = std::fs::read_dir(smash_utils::DEBUGGABLES_DIR) else {
         return Vec::new();
