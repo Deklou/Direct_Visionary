@@ -10018,6 +10018,7 @@ impl VisionaryApp {
         project: crate::mod_project::ModProjectFile,
         selected_move: Option<(&str, &str)>,
     ) {
+        if !self.validate_acmd_export_bindings(&project) { return; }
         let generated = match crate::mod_export::source_project(&project) {
             Ok(Some(generated)) => generated,
             Ok(None) => {
@@ -20482,6 +20483,7 @@ If you step every basis for a                          type and NONE of them mat
             return;
         }
         let project = self.build_project();
+        if !self.validate_acmd_export_bindings(&project) { return; }
         // The manual workspace overlay is a first-class export even when there are no serialized
         // ACMD/EFF edits. This is the common model/animation iteration case.
         let has_workspace_overlay = self

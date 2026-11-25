@@ -77,6 +77,17 @@ impl VisionaryApp {
         self.current_cancel_binding(&binding.scope.fighter, &binding.scope.key).as_ref() == Some(binding)
     }
 
+    pub(super) fn validate_acmd_export_bindings(&mut self, project: &ModProjectFile) -> bool {
+        for bank in project.fighters.values().flat_map(|fighter| &fighter.scoped_acmd) {
+            if bank.edits.has_edits() && !self.verified_acmd_binding(&bank.binding) {
+                self.state.status = format!("Export refused: {} no longer has its saved costume ownership.",
+                    bank.binding.scope.key);
+                return false;
+            }
+        }
+        true
+    }
+
     pub(super) fn verified_acmd_donors(
         &self, fighter: &str, motion: u64, captures: &[crate::game_link::CaptureLine],
     ) -> Vec<crate::game_link::CaptureLine> {

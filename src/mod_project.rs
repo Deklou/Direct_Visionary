@@ -152,6 +152,16 @@ pub fn scope_acmd_project(project: &ModProjectFile, scope: AcmdProjectScope<'_>)
         }
     }
 
+    // Global pins can affect an edited scoped script even when saved under another fighter.
+    // Keep them visible to the exporter until it supports a safe combination; never silently
+    // remove them from a source-only or partial export.
+    if scoped.fighters.values().any(|fighter| fighter.scoped_acmd.iter().any(|bank| bank.edits.has_edits())) {
+        for (name, fighter) in &project.fighters {
+            if !fighter.live_tweaks.is_empty() {
+                scoped.fighters.entry(name.clone()).or_default().live_tweaks = fighter.live_tweaks.clone();
+            }
+        }
+    }
     scoped
 }
 
