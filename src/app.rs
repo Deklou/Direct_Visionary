@@ -15067,7 +15067,13 @@ impl VisionaryApp {
 
         // Geometry is intentionally session-only until the native call is tested on Ryujinx.
         // It does not change the fighter's PRC or the authored HIT_NO range.
-        let mut geometry_action: Option<bool> = None; // true: restore vanilla values
+        let kind = self.state.selected_fighter
+            .and_then(|i| self.state.fighters.get(i))
+            .and_then(|fighter| fighter_kind_id(&fighter.name));
+        let disabled_now = kind
+            .and_then(|kind| self.hurtbox_geometry_rules.get(&(kind, volume.index as u32)))
+            .is_some_and(|rule| rule.disabled);
+        let mut geometry_action: Option<u8> = None; // 0: apply, 1: restore, 2: disable, 3: enable
         ui.group(|ui| {
             ui.label("Live capsule geometry (experimental)");
             ui.small("One-shot live preview on Smash 13.0.5. No project/export changes.");
@@ -15088,19 +15094,26 @@ impl VisionaryApp {
             }
             ui.horizontal(|ui| {
                 if ui.button("Apply geometry live").clicked() {
-                    geometry_action = Some(false);
+                    geometry_action = Some(0);
                 }
                 if ui.button("Restore original geometry").clicked() {
-                    geometry_action = Some(true);
+                    geometry_action = Some(1);
                 }
             });
+            ui.horizontal(|ui| {
+                if ui.button(if disabled_now {
+                    "Enable joint globally"
+                } else {
+                    "Disable joint globally"
+                }).clicked() {
+                    geometry_action = Some(if disabled_now { 3 } else { 2 });
+                }
+                ui.small("All animations; temporary statuses may override until the next frame.");
+            });
         });
-        if let Some(restore) = geometry_action {
-            if let Some(kind) = self.state.selected_fighter
-                .and_then(|i| self.state.fighters.get(i))
-                .and_then(|fighter| fighter_kind_id(&fighter.name))
-            {
-                if restore {
+        if let Some(action) = geometry_action {
+            if let Some(kind) = kind {
+                if action == 1 {
                     if let Some(original) = self.hurtbox_original_volumes.iter()
                         .find(|v| v.index == volume.index).cloned()
                     {
@@ -15116,6 +15129,11 @@ impl VisionaryApp {
                     crate::data::HurtboxStatus::Unknown(_) => None,
                 };
                 if let Some(status) = default_status {
+                    let disabled = match action {
+                        2 => true,
+                        3 => false,
+                        _ => disabled_now,
+                    };
                     let rule = crate::game_link::HurtboxGeometryWire {
                         fighter_kind: kind,
                         index: edited.index as u32,
@@ -15124,14 +15142,16 @@ impl VisionaryApp {
                         endpoint2: edited.endpoint2,
                         radius: edited.radius,
                         status,
+                        disabled,
                     };
                     self.hurtbox_geometry_rules.insert((kind, rule.index), rule);
                     let all: Vec<_> = self.hurtbox_geometry_rules.values().cloned().collect();
                     self.game_link.send_hurtbox_geometry_rules(&all);
-                    self.state.status = if restore {
-                        "Original hurtbox geometry queued for live preview.".into()
-                    } else {
-                        "Experimental hurtbox geometry queued; verify the result in Ryujinx.".into()
+                    self.state.status = match action {
+                        1 => "Original hurtbox geometry queued for live preview.".into(),
+                        2 => "Joint OFF for all animations queued; verify real collisions in Ryujinx.".into(),
+                        3 => "Joint re-enabled; verify recovery in Ryujinx.".into(),
+                        _ => "Experimental hurtbox geometry queued; verify the result in Ryujinx.".into(),
                     };
                 } else {
                     self.state.status =
