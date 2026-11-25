@@ -67,6 +67,7 @@ pub struct GeneratedSource {
 /// project. Effect-call deltas are not sufficient by themselves because the generated script
 /// replaces the entire original effect script.
 pub fn source_project(project: &ModProjectFile) -> Result<Option<GeneratedSource>> {
+    validate_authored_owners(project)?;
     let mut acmd_edits = Vec::new();
     let mut effect_edits = Vec::new();
     let mut sound_edits = Vec::new();
@@ -101,6 +102,7 @@ pub fn source_project(project: &ModProjectFile) -> Result<Option<GeneratedSource
                 );
             }
             if !scopes.is_empty() {
+                validate_record_owner(project, fighter, move_name, &scopes)?;
                 let original = original_category(edits, move_name, "game", fighter)?;
                 slot_gates.insert(
                     (fighter.clone(), move_name.clone()),
@@ -271,6 +273,57 @@ pub fn source_project(project: &ModProjectFile) -> Result<Option<GeneratedSource
         project: built,
         warnings,
     }))
+}
+
+/// Reject conflicting authored characters even when the selection screen can display both.
+fn validate_authored_owners(project: &ModProjectFile) -> Result<()> {
+    let mut occupied = std::collections::BTreeMap::<(String, u8), String>::new();
+    for entry in &project.roster.authored {
+        let donor = entry.donor.to_ascii_lowercase();
+        if donor.is_empty() || entry.key != crate::roster::RosterKey::slot(&donor, entry.slot) {
+            bail!("invalid authored character identity: {}", entry.key);
+        }
+        let mut owned = std::collections::BTreeSet::new();
+        for slot in std::iter::once(entry.slot).chain(entry.slots.iter().copied()) {
+            if !owned.insert(slot) {
+                bail!("{} declares costume c{slot:02} more than once", entry.key);
+            }
+            if let Some(first) = occupied.insert((donor.clone(), slot), entry.key.to_string()) {
+                bail!(
+                    "{first} and {} both claim {donor} costume c{slot:02}",
+                    entry.key,
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// An exported move may not change its authored character by silently changing slots.
+fn validate_record_owner(
+    project: &ModProjectFile,
+    fighter: &str,
+    move_name: &str,
+    scopes: &[u8],
+) -> Result<()> {
+    let owners: Vec<_> = project
+        .roster
+        .authored
+        .iter()
+        .filter(|entry| entry.donor.eq_ignore_ascii_case(fighter))
+        .collect();
+    if owners.is_empty() {
+        // Historical slot-scoped projects can lack a roster identity; preserve
+        // their explicit gate while never inferring an unscoped owner from it.
+        return Ok(());
+    }
+    if !owners.iter().any(|entry| entry.all_slots() == scopes) {
+        bail!(
+            "{fighter}/{move_name}: scoped costumes do not match any authored character. \
+             Recheck the target before exporting; no other costumes were changed."
+        );
+    }
+    Ok(())
 }
 
 /// A shared-fighter category must have the donor's matching original as fallback.
@@ -1361,6 +1414,76 @@ mod slot_gate_tests {
             );
         }
         assert_eq!(source.matches("if color == 8 {").count(), 4, "{source}");
+    }
+
+    #[test]
+    fn a_partial_export_preserves_ownership_and_refuses_an_unscoped_move() {
+        use crate::mod_project::{scope_acmd_project, AcmdProjectScope};
+
+        let mut original = project(None, None);
+        original.roster.authored.push(crate::mod_project::AuthoredEntry {
+            key: crate::roster::RosterKey::slot("mario", 8),
+            donor: "mario".into(),
+            slot: 8,
+            slots: vec![9],
+            display_name: "My Mario".into(),
+            name_id: "my_mario".into(),
+            moveset_scaffolded: false,
+            files_root: None,
+        });
+        let partial = scope_acmd_project(
+            &original,
+            AcmdProjectScope::Move { fighter: "mario", move_name: "attack_11" },
+        );
+        assert_eq!(partial.roster.authored.len(), 1);
+        let error = match source_project(&partial) {
+            Ok(_) => panic!("a partial export must retain the scope safety metadata"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("no verified per-move costume scope"), "{error}");
+    }
+
+    #[test]
+    fn a_mod_moved_to_other_slots_invalidates_old_move_scope() {
+        let mut project = project(Some(8), Some(ORIGINAL));
+        project.roster.authored.push(crate::mod_project::AuthoredEntry {
+            key: crate::roster::RosterKey::slot("mario", 16),
+            donor: "mario".into(),
+            slot: 16,
+            slots: vec![17],
+            display_name: "My Mario".into(),
+            name_id: "my_mario".into(),
+            moveset_scaffolded: false,
+            files_root: None,
+        });
+        let error = match source_project(&project) {
+            Ok(_) => panic!("stale scope must never reach the export"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("do not match any authored character"), "{error}");
+    }
+
+    #[test]
+    fn two_authored_characters_cannot_own_the_same_costume() {
+        let mut project = project(None, None);
+        project.fighters.clear();
+        for (primary, more) in [(8, 9), (9, 10)] {
+            project.roster.authored.push(crate::mod_project::AuthoredEntry {
+                key: crate::roster::RosterKey::slot("mario", primary),
+                donor: "mario".into(),
+                slot: primary,
+                slots: vec![more],
+                display_name: "Custom".into(),
+                name_id: format!("mod_{primary}"),
+                moveset_scaffolded: false,
+                files_root: None,
+            });
+        }
+        let error = match source_project(&project) {
+            Ok(_) => panic!("two mods cannot silently share costume c09"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("both claim mario costume c09"), "{error}");
     }
 
     #[test]
