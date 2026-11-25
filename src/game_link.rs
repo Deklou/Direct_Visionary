@@ -1082,6 +1082,13 @@ impl LiveOverride {
 /// The float is `MotionModule::frame` at call time and differs in the low bits between
 /// performances; that only matters for a resend within a run, but comparing what is actually
 /// displayed is the honest test either way.
+fn capture_costume(value: &serde_json::Value) -> Option<Option<u8>> {
+    match value.get("costume") {
+        None => Some(None), // Legacy archive records are never scoped donors.
+        Some(slot) => Some(Some(u8::try_from(slot.as_u64()?).ok()?)),
+    }
+}
+
 fn same_capture(a: &CaptureLine, b: &CaptureLine) -> bool {
     a.run == b.run
         && a.kind == b.kind
@@ -1296,7 +1303,7 @@ struct Shared {
     captures: BTreeMap<u64, Vec<CaptureLine>>,
     /// First run observed for each fighter-kind + motion. Later runs are rejected even if an
     /// old or mismatched plugin tries to send them.
-    capture_claimed_runs: BTreeMap<(i32, u64), u32>,
+    capture_claimed_runs: BTreeMap<(i32, u64, Option<u8>), u32>,
     /// Bumped on every new capture line — lets the app cheaply notice new data.
     captures_seq: u64,
     /// Compact outcome rows keyed exactly like the plugin capture cache.
@@ -2002,6 +2009,39 @@ impl GameLink {
         v
     }
 
+    /// The exact captured costume, not a guess based on the newest run of the engine fighter.
+    pub fn latest_run_for_costume(&self, motion: u64, kind: i32, costume: u8) -> Vec<CaptureLine> {
+        let Ok(s) = self.shared.lock() else { return Vec::new(); };
+        let Some(&run) = s.capture_claimed_runs.get(&(kind, motion, Some(costume))) else {
+            return Vec::new();
+        };
+        let mut lines: Vec<_> = s.captures.get(&motion).into_iter().flatten()
+            .filter(|line| line.kind == kind && line.run == run)
+            .cloned().collect();
+        lines.sort_by(|a, b| a.frame.partial_cmp(&b.frame).unwrap_or(std::cmp::Ordering::Equal));
+        lines
+    }
+
+    pub fn latest_run_id_for_costume(&self, motion: u64, kind: i32, costume: u8) -> Option<u32> {
+        self.shared.lock().ok()?.capture_claimed_runs.get(&(kind, motion, Some(costume))).copied()
+    }
+
+    pub fn captures_count_for_costume(&self, motion: u64, kind: i32, costume: u8) -> usize {
+        self.shared.lock().ok().and_then(|s| {
+            let run = s.capture_claimed_runs.get(&(kind, motion, Some(costume)))?;
+            Some(s.captures.get(&motion)?.iter().filter(|line| line.kind == kind && line.run == *run).count())
+        }).unwrap_or(0)
+    }
+
+    pub fn all_captures_for_costume(&self, kind: i32, costume: u8) -> Vec<(u64, CaptureLine)> {
+        let Ok(s) = self.shared.lock() else { return Vec::new(); };
+        s.captures.iter().flat_map(|(&motion, lines)| {
+            let run = s.capture_claimed_runs.get(&(kind, motion, Some(costume))).copied();
+            lines.iter().filter(move |line| line.kind == kind && Some(line.run) == run)
+                .map(move |line| (motion, line.clone()))
+        }).collect()
+    }
+
     /// Forget every captured line locally and ask the plugin to release its per-move ownership
     /// claims. A game-thread acknowledgement clears any old line already in flight.
     pub fn clear_captures(&self) {
@@ -2031,7 +2071,7 @@ impl GameLink {
             }
             s.captures.retain(|_, lines| !lines.is_empty());
             s.capture_claimed_runs
-                .retain(|(capture_kind, _), _| *capture_kind != kind);
+                .retain(|(capture_kind, _, _), _| *capture_kind != kind);
             s.capture_debug
                 .retain(|(capture_kind, _), _| *capture_kind != kind);
             s.capture_ends
@@ -2598,9 +2638,16 @@ fn handle_frame(shared: &Arc<Mutex<Shared>>, payload: &str) {
             if s.ignored_capture_kinds.contains(&line.kind) {
                 return;
             }
+            let Some(costume) = capture_costume(c) else { return; };
+            // A playback cannot be reassigned to a different costume by a replayed line.
+            if s.capture_claimed_runs.range(
+                (line.kind, line.motion, None)..=(line.kind, line.motion, Some(u8::MAX))
+            ).any(|(&(_, _, slot), &run)| run == line.run && slot != costume) {
+                return;
+            }
             let claim = s
                 .capture_claimed_runs
-                .entry((line.kind, line.motion))
+                .entry((line.kind, line.motion, costume))
                 .or_insert(line.run);
             if *claim != line.run {
                 return;
@@ -2633,7 +2680,8 @@ fn handle_frame(shared: &Arc<Mutex<Shared>>, payload: &str) {
                 return;
             }
             let run = e.get("run").and_then(|value| value.as_u64()).unwrap_or(0) as u32;
-            if s.capture_claimed_runs.get(&(kind as i32, motion)).copied() != Some(run) {
+            let Some(costume) = capture_costume(e) else { return; };
+            if s.capture_claimed_runs.get(&(kind as i32, motion, costume)).copied() != Some(run) {
                 return;
             }
             if s.capture_completed_runs.insert((kind as i32, motion, run)) {
@@ -3239,6 +3287,56 @@ mod tests {
 
     /// A plugin build without run ids sends no `run` field at all. Everything then shares run
     /// 0 and behaves exactly as it did before — one bucket, no crash, no empty load.
+    #[test]
+    fn scoped_acmd_captures_keep_costume_runs_separate() {
+        let link = GameLink::default();
+        let motion = 0x1234;
+        let line = |costume: Option<u8>, run: u32, frame: f32| {
+            let mut payload = serde_json::json!({
+                "kind": 0, "motion": motion, "frame": frame,
+                "func": "EFFECT", "args": [], "run": run
+            });
+            if let Some(costume) = costume { payload["costume"] = costume.into(); }
+            plugin_frame("AcmdCapture", &serde_json::json!({"AcmdCapture": payload}))
+        };
+        feed(&link, &[line(None, 1, 1.0), line(Some(0), 2, 2.0), line(Some(8), 3, 8.0),
+                       line(Some(9), 4, 9.0), line(Some(8), 5, 50.0), line(Some(16), 3, 60.0)]);
+        for (slot, run, frame) in [(0, 2, 2.0), (8, 3, 8.0), (9, 4, 9.0)] {
+            let lines = link.latest_run_for_costume(motion, 0, slot);
+            assert_eq!(lines.len(), 1);
+            assert_eq!(lines[0].frame, frame);
+            assert_eq!(link.latest_run_id_for_costume(motion, 0, slot), Some(run));
+            assert_eq!(link.captures_count_for_costume(motion, 0, slot), 1);
+            assert_eq!(link.all_captures_for_costume(0, slot).len(), 1);
+        }
+        assert!(link.latest_run_for_costume(motion, 0, 16).is_empty());
+        assert!(link.latest_run_for_costume(motion, 1, 8).is_empty());
+
+        let end = |slot| plugin_frame("AcmdCaptureEnd", &serde_json::json!({
+            "AcmdCaptureEnd": {"kind": 0, "motion": motion, "run": 3, "costume": slot}
+        }));
+        feed(&link, &[end(9)]);
+        assert!(!link.capture_run_complete(Some(0), motion, 3));
+        feed(&link, &[end(8)]);
+        assert!(link.capture_run_complete(Some(0), motion, 3));
+    }
+
+    #[test]
+    fn scoped_acmd_capture_refuses_unknown_or_invalid_costume() {
+        let link = GameLink::default();
+        let motion = 0x1234;
+        let frame = |costume: serde_json::Value| plugin_frame("AcmdCapture", &serde_json::json!({
+            "AcmdCapture": {"kind": 0, "motion": motion, "run": 1, "frame": 2.0,
+                            "func": "EFFECT", "args": [], "costume": costume}
+        }));
+        feed(&link, &[frame(serde_json::json!(-1)), frame(serde_json::json!(256)),
+                      frame(serde_json::json!(null)), frame(serde_json::json!("8"))]);
+        assert!(link.latest_run_for(motion, Some(0)).is_empty());
+        feed(&link, &[capture_run(0, motion, 2.0, 1, 42)]);
+        assert_eq!(link.latest_run_for(motion, Some(0)).len(), 1);
+        assert!(link.latest_run_for_costume(motion, 0, 0).is_empty());
+    }
+
     #[test]
     fn captures_without_run_ids_still_load() {
         let link = GameLink::default();

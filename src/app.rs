@@ -4828,6 +4828,7 @@ impl VisionaryApp {
         self.pending_project_move_selection = None;
         self.commit_current_edits();
         self.park_acmd_workspace();
+        self.pending_capture = None;
         self.selected_costume_slot = slot;
         let fighter_name = self.state.fighters[idx].name.clone();
         self.open_acmd_workspace(&fighter_name, slot);
@@ -21650,9 +21651,27 @@ If you step every basis for a                          type and NONE of them mat
     ///   * run — the plugin tags each playback, and only the newest is loaded. Without it,
     ///     performing a move grounded and then aerial left the union of both branches and the
     ///     editor showed spawns that never occur together.
+    fn scoped_capture_target(&self) -> Option<(i32, u8)> {
+        let fighter = &self.state.fighters.get(self.state.selected_fighter?)?.name;
+        let slot = self.selected_costume_slot;
+        let binding = self.acmd_binding_for_slot(fighter, slot)?;
+        if self.active_acmd_binding.as_ref() != Some(&binding) {
+            return None;
+        }
+        Some((fighter_kind_id(fighter)?, slot))
+    }
+
+    fn selected_scoped_live_captures(&self, motion: u64) -> Vec<crate::game_link::CaptureLine> {
+        let Some((kind, slot)) = self.scoped_capture_target() else { return Vec::new(); };
+        self.game_link.latest_run_for_costume(motion, kind, slot)
+    }
+
     fn captures_for_move(&self, fighter: &str, motion: u64) -> Vec<crate::game_link::CaptureLine> {
-        self.game_link
-            .latest_run_for(motion, fighter_kind_id(fighter))
+        if self.state.selected_fighter.and_then(|index| self.state.fighters.get(index))
+            .is_none_or(|entry| !entry.name.eq_ignore_ascii_case(fighter)) {
+            return Vec::new();
+        }
+        self.selected_scoped_live_captures(motion)
     }
 
     /// Forget the persisted donor for the current move as well as the plugin's in-memory
@@ -21706,8 +21725,7 @@ If you step every basis for a                          type and NONE of them mat
                     && self.replay_live_fallback_key.as_deref() != Some(key.as_str())
             });
         select_donor_captures(stored_is_authoritative, snapshot_captures, || {
-            self.game_link
-                .latest_run_for(motion, self.current_fighter_kind())
+            self.selected_scoped_live_captures(motion)
         })
     }
 
@@ -21771,15 +21789,16 @@ If you step every basis for a                          type and NONE of them mat
         let Some(motion) = self.current_motion_hash() else {
             return;
         };
-        let kind = self.current_fighter_kind();
-        let lines = self.game_link.captures_count(motion, kind);
+        let Some((kind, costume)) = self.scoped_capture_target() else { return; };
+        let Some(run) = self.game_link.latest_run_id_for_costume(motion, kind, costume) else { return; };
+        let lines = self.game_link.captures_count_for_costume(motion, kind, costume);
         if lines == 0 {
             return;
         }
         let now = std::time::Instant::now();
         match &mut self.pending_capture {
             // Same locked playback, more lines: the script is still running — keep waiting.
-            Some(p) if p.motion == motion => {
+            Some(p) if p.motion == motion && p.kind == kind && p.costume == costume && p.run == run => {
                 if lines != p.lines {
                     p.lines = lines;
                     p.last_line = now;
@@ -21805,7 +21824,8 @@ If you step every basis for a                          type and NONE of them mat
                     self.pending_capture = Some(PendingCapture {
                         motion,
                         kind,
-                        run: self.game_link.latest_run_id(motion, kind).unwrap_or(0),
+                        costume,
+                        run,
                         lines,
                         first_line: now,
                         last_line: now,
@@ -21825,21 +21845,23 @@ If you step every basis for a                          type and NONE of them mat
         let Some(p) = self.pending_capture.as_ref() else {
             return;
         };
-        let (motion, kind, run, first_line, last_line) =
-            (p.motion, p.kind, p.run, p.first_line, p.last_line);
+        let (motion, kind, costume, run, first_line, last_line) =
+            (p.motion, p.kind, p.costume, p.run, p.first_line, p.last_line);
 
         // Moved off the move, or real data arrived from elsewhere (GitHub fetch) — drop it.
         // A manual "⟳ Live" click mid-window is deliberately NOT a cancel: letting the window
         // run to completion means the click still works and then self-corrects to the full
         // script instead of leaving the truncated one in place.
         if self.current_motion_hash() != Some(motion)
+            || self.scoped_capture_target() != Some((kind, costume))
+            || self.game_link.latest_run_id_for_costume(motion, kind, costume) != Some(run)
             || (!self.state.acmd_source.is_empty() && self.state.acmd_source != "Live capture")
         {
             self.pending_capture = None;
             return;
         }
 
-        let ended = self.game_link.capture_run_complete(kind, motion, run);
+        let ended = self.game_link.capture_run_complete(Some(kind), motion, run);
         if ended || last_line.elapsed() >= CAPTURE_QUIET || first_line.elapsed() >= CAPTURE_MAX_WAIT
         {
             self.pending_capture = None;
@@ -21865,9 +21887,7 @@ If you step every basis for a                          type and NONE of them mat
         let captures = if self.rebuilding_project_live {
             self.captures_for_selected_fighter(motion)
         } else {
-            let live = self
-                .game_link
-                .latest_run_for(motion, self.current_fighter_kind());
+            let live = self.selected_scoped_live_captures(motion);
             if live.is_empty() {
                 self.captures_for_selected_fighter(motion)
             } else {
@@ -28113,8 +28133,7 @@ If you step every basis for a                          type and NONE of them mat
                     let allow_live = !self.rebuilding_project_live
                         || self.replay_live_fallback_key.as_deref() == Some(key.as_str());
                     if allow_live {
-                        self.game_link
-                            .latest_run_for(motion, fighter_kind_id(&fighter))
+                        self.captures_for_move(&fighter, motion)
                     } else {
                         Vec::new()
                     }
@@ -31107,15 +31126,14 @@ If you step every basis for a                          type and NONE of them mat
                 .collect();
             let bone_rev = self.bone_reverse_map();
             let eff_rev = self.effect_reverse_map();
-            let fighter_kind = self.current_fighter_kind();
-            let mut motions: Vec<u64> = self
-                .game_link
-                .all_captures()
-                .into_iter()
+            let captures = self.scoped_capture_target()
+                .filter(|(kind, _)| Some(*kind) == fighter_kind_id(fighter))
+                .map(|(kind, costume)| self.game_link.all_captures_for_costume(kind, costume))
+                .unwrap_or_default();
+            let mut motions: Vec<u64> = captures.into_iter()
                 .filter(|(_, l)| {
-                    fighter_kind.is_none_or(|kind| l.kind == kind)
-                        // Status feedback is not a use of the donor the editor can redirect.
-                        && !l.common
+                    // Status feedback is not a use of the donor the editor can redirect.
+                    !l.common
                         && effect_capture_layout(&l.func).is_some()
                         && l.args.first().and_then(|a| a.as_hash()) == Some(donor_hash)
                 })
@@ -38842,8 +38860,9 @@ struct RedirectPrompt {
 /// until the move has actually finished.
 struct PendingCapture {
     motion: u64,
-    /// Fighter kind the capture is filtered to (None = unknown fighter).
-    kind: Option<i32>,
+    /// Exact engine fighter and costume of the captured playback.
+    kind: i32,
+    costume: u8,
     /// Exact claimed playback. Only its matching end marker can complete this snapshot.
     run: u32,
     /// Lines held for this motion at the last observed growth.

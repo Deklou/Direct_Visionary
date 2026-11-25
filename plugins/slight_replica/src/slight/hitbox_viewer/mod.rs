@@ -300,6 +300,7 @@ const KINETIC_KEY_CLEAR_SPEED_ALL: u64 = u64::MAX - 3;
 
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct CaptureLine {
+    pub costume: u8,
     /// Fighter kind (smash::app::utility::get_kind) of the performing agent.
     pub kind: i32,
     /// MotionModule::motion_kind (hash40 of the motion name, e.g. "attack_air_n").
@@ -328,6 +329,7 @@ pub struct CaptureLine {
 /// script instead of whatever had arrived a few frames into the move.
 #[derive(Clone, Copy, Debug, serde::Serialize)]
 pub struct CaptureEnd {
+    pub costume: u8,
     pub kind: i32,
     pub motion: u64,
     /// The playback that finished — pairs with [`CaptureLine::run`].
@@ -341,7 +343,7 @@ pub struct CaptureEnd {
 /// aerial, a cancel, a branch that only fires sometimes — left the UNION of those runs in the
 /// bucket and the editor showed spawns that never occur together.
 ///
-/// Ids are global and strictly increasing. A `(fighter kind, motion)` is claimed by the first
+/// Ids are global and strictly increasing. A `(fighter kind, costume, motion)` is claimed by the first
 /// battle object that produces a capture line and is never assigned another run until captures
 /// are explicitly cleared. This keeps another instance, replay, cancel follow-up, or reconnect
 /// from replacing a completed snapshot.
@@ -351,7 +353,7 @@ fn next_run() -> u32 {
     NEXT_RUN.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
-/// One immutable capture owner per fighter-kind + motion. The claim exists as soon as the first
+/// One immutable capture owner per fighter-kind + costume + motion. The claim exists as soon as the first
 /// line lands, so another battle object cannot interleave a second run while the move is still
 /// executing. It remains after completion so later activity cannot supersede the snapshot.
 #[derive(Clone, Copy)]
@@ -382,6 +384,7 @@ static CLEAR_CAPTURES_REQUESTED: std::sync::atomic::AtomicBool =
 /// What one battle object is currently playing, for end-of-motion detection.
 #[derive(Clone, Copy)]
 struct MotionWatch {
+    costume: u8,
     motion: u64,
     kind: i32,
     /// Last MotionModule::frame seen — a decrease means the motion restarted.
@@ -415,7 +418,7 @@ struct CaptureState {
     seen: HashMap<u32, HashSet<u64>>,
     pending: Vec<CaptureLine>,
     ends: Vec<CaptureEnd>,
-    claims: HashMap<(i32, u64), CaptureClaim>,
+    claims: HashMap<(i32, u8, u64), CaptureClaim>,
     watch: HashMap<u32, MotionWatch>,
 }
 
@@ -426,8 +429,7 @@ static CAPTURE_STATE: LazyLock<Mutex<CaptureState>> =
 static CAPTURE_CONTENTION_DROPS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-/// Compact, lock-free capture accounting keyed exactly like the capture cache: fighter kind +
-/// motion. Hook workers only touch atomics; the low-frequency network facade snapshots changed
+/// Compact, lock-free capture accounting aggregated by fighter kind + motion (diagnostics only). Hook workers only touch atomics; the low-frequency network facade snapshots changed
 /// rows for the desktop. This must never acquire `CAPTURE_STATE`, especially on the failure path
 /// whose whole purpose is reporting that `CAPTURE_STATE` was contended.
 const CAPTURE_DEBUG_SLOTS: usize = 256;
@@ -848,6 +850,9 @@ unsafe fn record_for_boma_inner(
     let motion = smash::app::lua_bind::MotionModule::motion_kind(boma);
     let frame = smash::app::lua_bind::MotionModule::frame(boma);
     let kind = smash::app::utility::get_kind(&mut *boma);
+    let Ok(costume) = u8::try_from(smash::app::lua_bind::WorkModule::get_int(
+        boma, *smash::lib::lua_const::FIGHTER_INSTANCE_WORK_ID_INT_COLOR,
+    )) else { return; };
     let boid = (*boma).battle_object_id;
     let debug = capture_debug_attempt(kind, motion, frame);
 
@@ -878,7 +883,7 @@ unsafe fn record_for_boma_inner(
 
         // Resolve the run BEFORE dedupe — the key is scoped to it, and a new playback must not
         // be silently folded into the previous one's key set.
-        let (run, completed) = mark_capture_motion(&mut state, boid, motion, kind, frame, func);
+        let (run, completed) = mark_capture_motion(&mut state, boid, motion, kind, costume, frame, func);
         if let Some(run) = run {
             // Arm the clear-all gate: a clear is only worth capturing once something is out to
             // clear.
@@ -888,6 +893,7 @@ unsafe fn record_for_boma_inner(
 
             if state.seen.entry(run).or_default().insert(key) {
                 let line = CaptureLine {
+                    costume,
                     kind,
                     motion,
                     frame,
@@ -1047,7 +1053,7 @@ pub fn archive_replay_active() -> bool {
     capture_archive::replay_active()
 }
 
-/// Claim the first playback of `(kind, motion)` for one battle object and return its run id.
+/// Claim the first playback of `(kind, costume, motion)` for one battle object and return its run id.
 /// Existing claims are immutable: later performances and other instances are ignored.
 ///
 /// This can be the first thing to observe a motion change (an ACMD script can run before the
@@ -1059,12 +1065,13 @@ fn mark_capture_motion(
     boid: u32,
     motion: u64,
     kind: i32,
+    costume: u8,
     frame: f32,
     // Only for the drop report below — a claim collision is far easier to read when it names
     // the call that was discarded.
     func: &'static str,
 ) -> (Option<u32>, Option<CaptureEnd>) {
-    let mut finished: Option<(i32, u64, u32)> = None;
+    let mut finished: Option<(i32, u8, u64, u32)> = None;
     // Battle object ids are reused across matches; keep the map from growing unbounded.
     if state.watch.len() > 128 {
         state.watch.clear();
@@ -1072,7 +1079,7 @@ fn mark_capture_motion(
     let continuing = state
         .watch
         .get(&boid)
-        .is_some_and(|w| w.motion == motion && !w.ended && frame + 0.5 >= w.frame);
+        .is_some_and(|w| w.kind == kind && w.costume == costume && w.motion == motion && !w.ended && frame + 0.5 >= w.frame);
     if continuing {
         let w = state
             .watch
@@ -1085,7 +1092,7 @@ fn mark_capture_motion(
     }
     if let Some(w) = state.watch.remove(&boid) {
         if w.captured && !w.ended {
-            finished = Some((w.kind, w.motion, w.run));
+            finished = Some((w.kind, w.costume, w.motion, w.run));
         }
     }
     MOTION_WATCH_ACTIVE.store(
@@ -1093,11 +1100,11 @@ fn mark_capture_motion(
         std::sync::atomic::Ordering::Relaxed,
     );
     let completed =
-        finished.and_then(|(kind, motion, run)| finish_capture(state, boid, kind, motion, run));
+        finished.and_then(|(kind, costume, motion, run)| finish_capture(state, boid, kind, costume, motion, run));
 
     // Copied out so the refusal arm can read the holder while the insert arms take a mutable
     // borrow.
-    let held = state.claims.get(&(kind, motion)).copied();
+    let held = state.claims.get(&(kind, costume, motion)).copied();
     let run = match held {
         // **The same object returning to a motion it already owns — resume its run.**
         //
@@ -1130,7 +1137,7 @@ fn mark_capture_motion(
         Some(h) if h.boid == boid => {
             let run = next_run();
             state.claims.insert(
-                (kind, motion),
+                (kind, costume, motion),
                 CaptureClaim {
                     boid,
                     run,
@@ -1155,7 +1162,7 @@ fn mark_capture_motion(
         None => {
             let run = next_run();
             state.claims.insert(
-                (kind, motion),
+                (kind, costume, motion),
                 CaptureClaim {
                     boid,
                     run,
@@ -1169,6 +1176,7 @@ fn mark_capture_motion(
     state.watch.insert(
         boid,
         MotionWatch {
+            costume,
             motion,
             kind,
             frame,
@@ -1214,13 +1222,13 @@ fn close_collision_if_open(boid: u32) -> bool {
     note_collision(&mut state, boid, false)
 }
 
-fn push_end(state: &mut CaptureState, kind: i32, motion: u64, run: u32) -> Option<CaptureEnd> {
+fn push_end(state: &mut CaptureState, kind: i32, costume: u8, motion: u64, run: u32) -> Option<CaptureEnd> {
     // Collapse duplicate completion paths for the same claimed run (end frame and motion switch
     // can be observed on adjacent callbacks).
     if state.ends.iter().any(|e| e.run == run) {
         return None;
     }
-    let end = CaptureEnd { kind, motion, run };
+    let end = CaptureEnd { kind, costume, motion, run };
     state.ends.push(end);
     Some(end)
 }
@@ -1229,11 +1237,12 @@ fn finish_capture(
     state: &mut CaptureState,
     boid: u32,
     kind: i32,
+    costume: u8,
     motion: u64,
     run: u32,
 ) -> Option<CaptureEnd> {
     let (naturally_ended, should_emit) = {
-        let Some(claim) = state.claims.get_mut(&(kind, motion)) else {
+        let Some(claim) = state.claims.get_mut(&(kind, costume, motion)) else {
             return None;
         };
         if claim.boid != boid || claim.run != run {
@@ -1245,7 +1254,7 @@ fn finish_capture(
         (naturally_ended, should_emit)
     };
     let end = should_emit
-        .then(|| push_end(state, kind, motion, run))
+        .then(|| push_end(state, kind, costume, motion, run))
         .flatten();
     // A naturally completed run can never receive another authored line. Drop only its
     // in-memory dedupe set; an interrupted run may resume on the same motion and still needs its
@@ -1290,13 +1299,19 @@ pub unsafe fn capture_tick(lua_state: u64) {
     let Some(watched) = watched else {
         return;
     };
+    if smash::app::utility::get_category(&mut *boma)
+        != *smash::lib::lua_const::BATTLE_OBJECT_CATEGORY_FIGHTER { return; }
+    let kind = smash::app::utility::get_kind(&mut *boma);
+    let Ok(costume) = u8::try_from(smash::app::lua_bind::WorkModule::get_int(
+        boma, *smash::lib::lua_const::FIGHTER_INSTANCE_WORK_ID_INT_COLOR,
+    )) else { return; };
     let motion = smash::app::lua_bind::MotionModule::motion_kind(boma);
     let frame = smash::app::lua_bind::MotionModule::frame(boma);
     let end = smash::app::lua_bind::MotionModule::end_frame(boma);
 
-    let mut finished: Option<(i32, u64, u32)> = None;
+    let mut finished: Option<(i32, u8, u64, u32)> = None;
     // Set only when the playback reached `end_frame` — a charge hold must not look like this.
-    let mut ended_naturally: Option<(i32, u64, u32)> = None;
+    let mut ended_naturally: Option<(i32, u8, u64, u32)> = None;
     let completed = {
         let Some(mut state) = try_capture_state() else {
             return;
@@ -1309,10 +1324,10 @@ pub unsafe fn capture_tick(lua_state: u64) {
         if current.run != watched.run || current.motion != watched.motion {
             return;
         }
-        if current.motion != motion || frame + 0.5 < current.frame {
+        if current.kind != kind || current.costume != costume || current.motion != motion || frame + 0.5 < current.frame {
             // Switched away (or looped back to frame 0): the previous playback is over.
             if current.captured && !current.ended {
-                finished = Some((current.kind, current.motion, current.run));
+                finished = Some((current.kind, current.costume, current.motion, current.run));
             }
             state.watch.remove(&boid);
         } else {
@@ -1325,8 +1340,8 @@ pub unsafe fn capture_tick(lua_state: u64) {
             // last frame still gets recorded before the editor is told to adopt.
             if w.captured && !w.ended && end > 0.0 && frame >= end {
                 w.ended = true;
-                ended_naturally = Some((w.kind, w.motion, w.run));
-                finished = Some((w.kind, w.motion, w.run));
+                ended_naturally = Some((w.kind, w.costume, w.motion, w.run));
+                finished = Some((w.kind, w.costume, w.motion, w.run));
             }
         }
         MOTION_WATCH_ACTIVE.store(
@@ -1337,14 +1352,14 @@ pub unsafe fn capture_tick(lua_state: u64) {
         // The claim outlives the watch entry, and that is the point: the entry is dropped the
         // moment the motion frame steps backwards, so only the claim can distinguish a finished
         // playback from one suspended by a charge hold.
-        if let Some((kind, motion, run)) = ended_naturally {
-            if let Some(claim) = state.claims.get_mut(&(kind, motion)) {
+        if let Some((kind, costume, motion, run)) = ended_naturally {
+            if let Some(claim) = state.claims.get_mut(&(kind, costume, motion)) {
                 if claim.run == run {
                     claim.ended = true;
                 }
             }
         }
-        finished.and_then(|(kind, motion, run)| finish_capture(&mut state, boid, kind, motion, run))
+        finished.and_then(|(kind, costume, motion, run)| finish_capture(&mut state, boid, kind, costume, motion, run))
     };
     if let Some(end) = completed {
         capture_archive::append_end(end);
