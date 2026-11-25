@@ -2121,7 +2121,7 @@ impl GameLink {
             .iter()
             .map(|(fighter_kind, rule)| ScopedHitboxRuleWire {
                 fighter_kind: *fighter_kind,
-                rule,
+                rule: *rule,
             })
             .collect();
         self.send_hitbox_payload(&scoped);
@@ -3177,6 +3177,82 @@ mod tests {
         assert_eq!(link.captures_count(0x1234, None), 3);
         assert_eq!(link.captures_count(0x5678, Some(8)), 1);
         assert_eq!(link.captures_count(0xdead, Some(8)), 0);
+    }
+
+    #[test]
+    fn scoped_effects_and_controls_keep_identical_motions_separate() {
+        let link = GameLink::default();
+        let effect = SpawnRuleWire {
+            eff_hash: 0x123,
+            suppress: false,
+            stop_func: None,
+            motion: Some(hash40::hash40("attack_hi3").0),
+            frame_start: None,
+            frame_end: None,
+            pos: None,
+            rot: None,
+            scale: None,
+            rate: Some(1.5),
+            camera_offset: None,
+            tint: None,
+            particle_tint: None,
+            alpha: None,
+            scale_w: None,
+            color: None,
+            transition: None,
+            inject: None,
+            color_inject: None,
+        };
+        link.send_scoped_spawn_rules(&[(0x18, &effect), (0x01, &effect)]);
+        let frame = link.shared.lock().unwrap().outbox.last().unwrap().clone();
+        let body = &frame["<TCP_MESSAGE>".len()..frame.len() - "</TCP_MESSAGE>".len()];
+        let json: serde_json::Value = serde_json::from_str(body).unwrap();
+        let effects = json["spawn_rules"].as_array().unwrap();
+        assert_eq!(effects.len(), 2);
+        assert_eq!(effects[0]["fighter_kind"].as_i64(), Some(0x18));
+        assert_eq!(effects[1]["fighter_kind"].as_i64(), Some(0x01));
+        assert_eq!(effects[0]["motion"], effects[1]["motion"]);
+        assert_eq!(effects[0]["rate"].as_f64(), Some(1.5));
+
+        let control = EffectControlRuleWire {
+            motion: Some(hash40::hash40("attack_11").0),
+            func: "ENABLE_AREA".into(),
+            args: vec![LuaArgWire::Int(2)],
+            suppress: true,
+            frame_start: Some(5.0),
+            frame_end: Some(5.0),
+            work_slot: None,
+            inject: Some(EffectControlInjectWire {
+                frame: 7.0,
+                func: "ENABLE_AREA".into(),
+                args: vec![LuaArgWire::Int(3)],
+            }),
+        };
+        link.send_scoped_effect_control_rules(&[(0x19, &control), (0x00, &control)]);
+        let frame = link.shared.lock().unwrap().outbox.last().unwrap().clone();
+        let body = &frame["<TCP_MESSAGE>".len()..frame.len() - "</TCP_MESSAGE>".len()];
+        let json: serde_json::Value = serde_json::from_str(body).unwrap();
+        let controls = json["effect_control_rules"].as_array().unwrap();
+        assert_eq!(controls.len(), 2);
+        assert_eq!(controls[0]["fighter_kind"].as_i64(), Some(0x19));
+        assert_eq!(controls[1]["fighter_kind"].as_i64(), Some(0x00));
+        assert_eq!(controls[0]["motion"], controls[1]["motion"]);
+        assert_eq!(controls[0]["inject"]["frame"].as_f64(), Some(7.0));
+    }
+
+    #[test]
+    fn plugin_live_matchers_require_fighter_kind() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("plugins/slight_replica/src/slight");
+        let hitbox = std::fs::read_to_string(root.join("hitbox_viewer/mod.rs")).unwrap();
+        let spawn = std::fs::read_to_string(root.join("effect_viewer/spawn_rules.rs")).unwrap();
+        let control = std::fs::read_to_string(root.join("effect_viewer/control_rules.rs")).unwrap();
+        let hooks = std::fs::read_to_string(root.join("effect_viewer/acmd_hooks.rs")).unwrap();
+        assert!(hitbox.contains("self.fighter_kind == Some(fighter_kind)"));
+        assert!(hitbox.contains("r.fighter_kind == Some(fighter_kind)"));
+        assert!(spawn.contains("self.fighter_kind == Some(fighter_kind)"));
+        assert!(control.contains("self.fighter_kind == Some(fighter_kind)"));
+        assert!(hooks.contains("live_fighter_kind(boma)"));
     }
 
     #[test]
