@@ -82,10 +82,24 @@ pub fn scope_acmd_project(project: &ModProjectFile, scope: AcmdProjectScope<'_>)
         version: project.version,
         name: project.name.clone(),
         fighters: HashMap::new(),
-        // Roster edits are dropped here for the same reason EFF records are: a Smashline
-        // source export cannot carry a character select screen. They ship through the mod
-        // folder path instead.
-        roster: RosterMod::default(),
+        // Keep only authored-character identities as export safety metadata. The
+        // source exporter needs them to prevent an unscoped ACMD replacement from
+        // leaking onto a costume-backed character. No CSS edits are emitted.
+        roster: RosterMod {
+            authored: project
+                .roster
+                .authored
+                .iter()
+                .filter(|entry| match scope {
+                    AcmdProjectScope::All => project.fighters.contains_key(&entry.donor),
+                    AcmdProjectScope::Move { fighter, .. } => {
+                        entry.donor.eq_ignore_ascii_case(fighter)
+                    }
+                })
+                .cloned()
+                .collect(),
+            ..Default::default()
+        },
     };
 
     // A whole-project export may have a tweak stored under one fighter while the corresponding
@@ -1258,6 +1272,38 @@ unsafe extern "C" fn expression_fixture(agent: &mut L2CAgentBase) {
         assert!(fighter.acmd.contains_key("mixed"));
         assert_eq!(fighter.live_tweaks.len(), 1);
         assert_eq!(fighter.live_tweaks[0].effect_name, "SYS_SMASH_FLASH");
+    }
+
+    #[test]
+    fn scoped_acmd_keeps_character_ownership_without_exporting_css_edits() {
+        let mut project = ModProjectFile::default();
+        project.fighters.insert("mario".into(), FighterMod::default());
+        project.fighters.insert("luigi".into(), FighterMod::default());
+        project.roster.names.insert(
+            crate::roster::RosterKey::fighter("mario"), "Mario renamed".into(),
+        );
+        for (donor, slot) in [("mario", 8), ("luigi", 12)] {
+            project.roster.authored.push(AuthoredEntry {
+                key: crate::roster::RosterKey::slot(donor, slot),
+                donor: donor.into(),
+                slot,
+                slots: vec![slot + 1],
+                display_name: format!("{donor} custom"),
+                name_id: format!("custom_{donor}"),
+                moveset_scaffolded: true,
+                files_root: None,
+            });
+        }
+        let scoped = scope_acmd_project(
+            &project,
+            AcmdProjectScope::Move { fighter: "mario", move_name: "attack_11" },
+        );
+        assert_eq!(scoped.roster.authored.len(), 1);
+        assert_eq!(scoped.roster.authored[0].all_slots(), vec![8, 9]);
+        assert_eq!(scoped.roster.authored[0].donor, "mario");
+        assert!(scoped.roster.names.is_empty());
+        assert!(scoped.roster.order.is_empty());
+        assert!(scoped.roster.ui_images.is_empty());
     }
 
     /// Version 3 and older stored effect-call rotations reversed; the script text was right, so
