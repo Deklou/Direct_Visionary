@@ -515,6 +515,9 @@ pub fn integer_point_key(func: &str, args: &[i64]) -> u64 {
 /// One captured ACMD call, as streamed by the plugin (`AcmdCapture`).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CaptureLine {
+    /// Exact costume observed in game; absent in historical snapshots.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub costume: Option<u8>,
     /// Fighter kind of the performing agent.
     pub kind: i32,
     /// hash40 of the motion name (e.g. "attack_air_n").
@@ -541,6 +544,22 @@ pub struct CaptureLine {
     /// which is the pre-tag behaviour.
     #[serde(default)]
     pub common: bool,
+}
+
+/// Accept persisted donors only from one verified playback within the saved character's slots.
+/// Never infer a costume from the fighter kind, the current preview, or a legacy capture.
+pub fn verified_saved_captures(
+    captures: &[CaptureLine], kind: i32, motion: u64, slots: &[u8],
+) -> Vec<CaptureLine> {
+    let mut matching = captures.iter().filter(|line| line.motion == motion);
+    let Some(first) = matching.next() else { return Vec::new(); };
+    let Some(slot) = first.costume else { return Vec::new(); };
+    if first.kind != kind || first.run == 0 || !slots.contains(&slot)
+        || matching.any(|line| line.kind != kind || line.costume != Some(slot) || line.run != first.run)
+    {
+        return Vec::new();
+    }
+    captures.iter().filter(|line| line.motion == motion).cloned().collect()
 }
 
 /// Aggregate capture outcomes for one cache key. Counts are cumulative for the current plugin
@@ -1092,6 +1111,7 @@ fn capture_costume(value: &serde_json::Value) -> Option<Option<u8>> {
 fn same_capture(a: &CaptureLine, b: &CaptureLine) -> bool {
     a.run == b.run
         && a.kind == b.kind
+        && a.costume == b.costume
         && a.motion == b.motion
         && a.func == b.func
         && a.frame.max(0.0).round() == b.frame.max(0.0).round()
@@ -1551,7 +1571,7 @@ impl GameLink {
         self.project_send_suppressed.store(false, Ordering::SeqCst);
     }
 
-    fn sends_suppressed(&self) -> bool {
+    pub(crate) fn sends_suppressed(&self) -> bool {
         self.project_send_suppressed.load(Ordering::SeqCst)
             || self.rule_send_suppressed.load(Ordering::SeqCst)
     }
@@ -2016,7 +2036,7 @@ impl GameLink {
             return Vec::new();
         };
         let mut lines: Vec<_> = s.captures.get(&motion).into_iter().flatten()
-            .filter(|line| line.kind == kind && line.run == run)
+            .filter(|line| line.kind == kind && line.costume == Some(costume) && line.run == run)
             .cloned().collect();
         lines.sort_by(|a, b| a.frame.partial_cmp(&b.frame).unwrap_or(std::cmp::Ordering::Equal));
         lines
@@ -2029,7 +2049,7 @@ impl GameLink {
     pub fn captures_count_for_costume(&self, motion: u64, kind: i32, costume: u8) -> usize {
         self.shared.lock().ok().and_then(|s| {
             let run = s.capture_claimed_runs.get(&(kind, motion, Some(costume)))?;
-            Some(s.captures.get(&motion)?.iter().filter(|line| line.kind == kind && line.run == *run).count())
+            Some(s.captures.get(&motion)?.iter().filter(|line| line.kind == kind && line.costume == Some(costume) && line.run == *run).count())
         }).unwrap_or(0)
     }
 
@@ -2037,7 +2057,7 @@ impl GameLink {
         let Ok(s) = self.shared.lock() else { return Vec::new(); };
         s.captures.iter().flat_map(|(&motion, lines)| {
             let run = s.capture_claimed_runs.get(&(kind, motion, Some(costume))).copied();
-            lines.iter().filter(move |line| line.kind == kind && Some(line.run) == run)
+            lines.iter().filter(move |line| line.kind == kind && line.costume == Some(costume) && Some(line.run) == run)
                 .map(move |line| (motion, line.clone()))
         }).collect()
     }
@@ -3113,6 +3133,7 @@ mod tests {
         {
             let mut s = link.shared.lock().unwrap();
             s.captures.entry(0x1234).or_default().push(CaptureLine {
+                costume: None,
                 kind: 8,
                 motion: 0x1234,
                 frame: 1.0,
@@ -3319,6 +3340,29 @@ mod tests {
         assert!(!link.capture_run_complete(Some(0), motion, 3));
         feed(&link, &[end(8)]);
         assert!(link.capture_run_complete(Some(0), motion, 3));
+    }
+
+    #[test]
+    fn scoped_acmd_saved_capture_requires_exact_provenance() {
+        let link = GameLink::default();
+        let motion = 0x1234;
+        let frame = |costume: u8, run: u32| plugin_frame("AcmdCapture", &serde_json::json!({
+            "AcmdCapture": {"kind": 0, "motion": motion, "run": run, "frame": 2.0,
+                            "func": "EFFECT", "args": [], "costume": costume}
+        }));
+        feed(&link, &[frame(8, 1), frame(16, 2)]);
+        let first = link.latest_run_for_costume(motion, 0, 8);
+        assert_eq!(first[0].costume, Some(8));
+        let saved: Vec<CaptureLine> = serde_json::from_str(&serde_json::to_string(&first).unwrap()).unwrap();
+        assert_eq!(verified_saved_captures(&saved, 0, motion, &[8, 9]), first);
+        assert!(verified_saved_captures(&saved, 0, motion, &[16]).is_empty());
+        assert!(verified_saved_captures(&saved, 1, motion, &[8]).is_empty());
+        let mut mixed = saved.clone();
+        mixed.extend(link.latest_run_for_costume(motion, 0, 16));
+        assert!(verified_saved_captures(&mixed, 0, motion, &[8, 16]).is_empty());
+        let mut legacy = saved;
+        legacy[0].costume = None;
+        assert!(verified_saved_captures(&legacy, 0, motion, &[8]).is_empty());
     }
 
     #[test]

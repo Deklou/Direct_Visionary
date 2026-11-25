@@ -1149,6 +1149,7 @@ mod tests {
         let snapshot = MoveSourceSnapshot {
             body: "unsafe extern \"C\" fn game_fixture(...) {}".into(),
             captures: vec![crate::game_link::CaptureLine {
+                costume: None,
                 kind: 7,
                 motion: 0x1234,
                 frame: 3.5,

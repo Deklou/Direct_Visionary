@@ -6,6 +6,45 @@ use crate::cancel_rules::CancelBinding;
 use crate::mod_project::{AcmdEdits, ModProjectFile, ScopedAcmdEdits, take_acmd_bank};
 use crate::roster::RosterKey;
 use std::collections::HashMap;
+use crate::game_link::{HitboxRuleWire, SpawnRuleWire, EffectControlRuleWire};
+
+/// Generated rules are session data. Keep them with their exact owner while its
+/// editing workspace is parked, rather than merging two fighter/move namespaces.
+pub(super) struct ScopedLiveAcmd {
+    pub(super) binding: CancelBinding,
+    pub(super) hitboxes: HashMap<String, Vec<HitboxRuleWire>>,
+    pub(super) spawns: HashMap<String, Vec<SpawnRuleWire>>,
+    pub(super) controls: HashMap<String, Vec<EffectControlRuleWire>>,
+}
+
+fn collect_scoped_rules<'a, T>(
+    active: Option<(&'a CancelBinding, &'a HashMap<String, Vec<T>>)>,
+    parked: impl Iterator<Item = (&'a CancelBinding, &'a HashMap<String, Vec<T>>)>,
+    valid: impl Fn(&CancelBinding) -> bool,
+) -> Vec<(i32, &'a [u8], &'a T)> {
+    let owners: Vec<_> = active.into_iter().map(|(binding, rules)| (binding, rules, true))
+        .chain(parked.map(|(binding, rules)| (binding, rules, false)))
+        .filter(|(binding, _, _)| valid(binding) && !binding.scope.slots.is_empty())
+        .collect();
+    let mut result = Vec::new();
+    for &(binding, rules, is_active) in &owners {
+        // Duplicate or overlapping verified owners must not both reach the runtime.
+        if owners.iter().filter(|(other, _, _)| {
+            other.scope.fighter.eq_ignore_ascii_case(&binding.scope.fighter)
+                && other.scope.slots.iter().any(|slot| binding.scope.slots.contains(slot))
+        }).count() != 1 {
+            continue;
+        }
+        let Some(kind) = super::fighter_kind_id(&binding.scope.fighter) else { continue; };
+        let mut moves: Vec<_> = rules.iter().filter(|(key, _)|
+            !is_active || super::fighter_key_matches(key, &binding.scope.fighter)).collect();
+        moves.sort_by(|a, b| a.0.cmp(b.0));
+        for (_, rules) in moves {
+            result.extend(rules.iter().map(|rule| (kind, binding.scope.slots.as_slice(), rule)));
+        }
+    }
+    result
+}
 
 fn take_fighter_moves<V>(map: &mut HashMap<String, V>, fighter: &str) -> HashMap<String, V> {
     let keys: Vec<_> = map.keys().filter(|key| {
@@ -34,6 +73,59 @@ fn clone_fighter_moves<V: Clone>(map: &HashMap<String, V>, fighter: &str) -> Has
 }
 
 impl VisionaryApp {
+    pub(super) fn verified_acmd_binding(&self, binding: &CancelBinding) -> bool {
+        self.current_cancel_binding(&binding.scope.fighter, &binding.scope.key).as_ref() == Some(binding)
+    }
+
+    pub(super) fn verified_acmd_donors(
+        &self, fighter: &str, motion: u64, captures: &[crate::game_link::CaptureLine],
+    ) -> Vec<crate::game_link::CaptureLine> {
+        let Some(binding) = self.active_acmd_binding.as_ref() else { return Vec::new(); };
+        if !binding.scope.fighter.eq_ignore_ascii_case(fighter) || !self.verified_acmd_binding(binding) {
+            return Vec::new();
+        }
+        let Some(kind) = super::fighter_kind_id(fighter) else { return Vec::new(); };
+        crate::game_link::verified_saved_captures(captures, kind, motion, &binding.scope.slots)
+    }
+
+    // The active rule maps still have fighter/move keys; isolate them before flattening,
+    // including all point-family suffixes. Parked maps contain only that owner's moves.
+    pub(super) fn send_scoped_acmd_union<'a, T>(
+        &'a self, active: &'a HashMap<String, Vec<T>>,
+        parked: impl Fn(&'a ScopedLiveAcmd) -> &'a HashMap<String, Vec<T>>,
+        send: impl FnOnce(&[(i32, &[u8], &T)]),
+    ) {
+        if self.game_link.sends_suppressed() { return; }
+        let active = self.active_acmd_binding.as_ref().map(|binding| (binding, active));
+        let rules = collect_scoped_rules(active,
+            self.parked_live_acmd.iter().map(|bank| (&bank.binding, parked(bank))),
+            |binding| self.verified_acmd_binding(binding));
+        send(&rules);
+    }
+
+    fn park_live_acmd(&mut self, binding: &CancelBinding) {
+        let fighter = &binding.scope.fighter;
+        self.parked_live_acmd.retain(|bank| &bank.binding != binding);
+        let bank = ScopedLiveAcmd {
+            binding: binding.clone(),
+            hitboxes: take_fighter_moves(&mut self.hitbox_rules_store, fighter),
+            spawns: take_fighter_moves(&mut self.effect_rules_store, fighter),
+            controls: take_fighter_moves(&mut self.effect_control_rules_store, fighter),
+        };
+        if !bank.hitboxes.is_empty() || !bank.spawns.is_empty() || !bank.controls.is_empty() {
+            self.parked_live_acmd.push(bank);
+        }
+    }
+
+    fn restore_live_acmd(&mut self, binding: &CancelBinding) {
+        let Some(index) = self.parked_live_acmd.iter().position(|bank| &bank.binding == binding) else { return; };
+        let bank = self.parked_live_acmd.remove(index);
+        let fighter = &binding.scope.fighter;
+        put_fighter_moves(&mut self.hitbox_rules_store, fighter, bank.hitboxes);
+        put_fighter_moves(&mut self.effect_rules_store, fighter, bank.spawns);
+        put_fighter_moves(&mut self.effect_control_rules_store, fighter, bank.controls);
+    }
+
     /// The previewed slot must belong to exactly one fully verified logical character.
     /// Selecting c08 or c09 of one authored character opens the same bank; an unknown
     /// imported slot, or a conflict, never inherits another character's bank.
@@ -98,6 +190,7 @@ impl VisionaryApp {
         let Some(binding) = self.active_acmd_binding.take() else { return; };
         let fighter = binding.scope.fighter.clone();
         let edits = self.take_acmd_workspace(&fighter);
+        self.park_live_acmd(&binding);
         if !edits.is_empty() {
             self.scoped_acmd_banks.entry(fighter.clone()).or_default()
                 .push(ScopedAcmdEdits { binding, edits });
@@ -126,8 +219,9 @@ impl VisionaryApp {
         };
         self.parked_legacy_acmd = Some(self.take_acmd_workspace(fighter));
         self.restore_acmd_workspace(fighter, edits);
-        self.active_acmd_binding = Some(binding);
         self.clear_acmd_workspace_caches(fighter);
+        self.restore_live_acmd(&binding);
+        self.active_acmd_binding = Some(binding);
     }
 
     /// Before saving, separate the active editor maps from the legacy maps. Parked banks
@@ -158,6 +252,7 @@ impl VisionaryApp {
         self.active_acmd_binding = None;
         self.parked_legacy_acmd = None;
         self.scoped_acmd_banks.clear();
+        self.parked_live_acmd.clear();
         self.legacy_acmd_costumes.clear();
     }
 
@@ -243,6 +338,47 @@ impl VisionaryApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn binding(slot: u8) -> CancelBinding {
+        CancelBinding {
+            scope: crate::roster::edit_scope::EditScope {
+                key: if slot == 0 { RosterKey::fighter("mario") } else { RosterKey::slot("mario", slot) },
+                fighter: "mario".into(),
+                slots: vec![slot, slot + 1],
+            },
+            authored_name_id: (slot != 0).then(|| format!("mod_{slot}")),
+        }
+    }
+
+    #[test]
+    fn scoped_acmd_live_union_preserves_parked_owners_and_removals() {
+        let base = binding(0);
+        let first = binding(8);
+        let second = binding(16);
+        let a = HashMap::from([("attack_11".to_string(), vec![1])]);
+        let mut b = HashMap::from([("mario/attack_11".to_string(), vec![2]), ("luigi/attack_11".to_string(), vec![99])]);
+        let c = HashMap::from([("attack_11".to_string(), vec![3])]);
+        let union = collect_scoped_rules(Some((&first, &b)), [(&base, &a), (&second, &c)].into_iter(), |_| true);
+        assert_eq!(union.iter().map(|(_, slots, rule)| (slots[0], **rule)).collect::<Vec<_>>(),
+            vec![(8, 2), (0, 1), (16, 3)]);
+        b.clear();
+        let union = collect_scoped_rules(Some((&first, &b)), [(&base, &a), (&second, &c)].into_iter(), |_| true);
+        assert_eq!(union.iter().map(|(_, slots, rule)| (slots[0], **rule)).collect::<Vec<_>>(),
+            vec![(0, 1), (16, 3)]);
+    }
+
+    #[test]
+    fn scoped_acmd_live_union_rejects_stale_and_duplicate_owners() {
+        let first = binding(8);
+        let second = binding(16);
+        let rules = HashMap::from([("mario/attack_11".to_string(), vec![1])]);
+        let union = collect_scoped_rules(Some((&first, &rules)), [(&second, &rules)].into_iter(), |b| b == &second);
+        assert_eq!(union.len(), 1);
+        assert_eq!(union[0].1, &[16, 17]);
+        let union = collect_scoped_rules(Some((&first, &rules)), [(&first, &rules), (&second, &rules)].into_iter(), |_| true);
+        assert_eq!(union.len(), 1);
+        assert_eq!(union[0].1, &[16, 17]);
+    }
 
     #[test]
     fn scoped_acmd_workspace_switch_does_not_take_other_fighters() {
