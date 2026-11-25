@@ -1418,6 +1418,7 @@ impl Default for Shared {
         Self {
             status: LinkStatus::Disconnected,
             client_id: None,
+            scoped_cancels_supported: false,
             connection_epoch: 0,
             collision_requests: BTreeMap::new(),
             kinds: BTreeMap::new(),
