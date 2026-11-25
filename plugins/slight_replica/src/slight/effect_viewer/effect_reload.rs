@@ -441,10 +441,11 @@ unsafe fn finish_private_clone(manager: *mut u64, buffer: usize, result: u32) {
     if slot == 0 {
         // The private pointer was never given to the engine. Do not touch any
         // unexpected native handle that may have caused an early return.
-        PRIVATE_CLONE_BUFFER.store(0, Ordering::Release);
+        if PRIVATE_CLONE_BUFFER.compare_exchange(buffer, 0, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+            game_effect_free(manager, buffer as *mut u8);
+            skyline::println!("[SLight] PRIVATE_CLONE not substituted result={result}");
+        }
         PRIVATE_CLONE_PHASE.store(4, Ordering::Release);
-        game_effect_free(manager, buffer as *mut u8);
-        skyline::println!("[SLight] PRIVATE_CLONE not substituted result={result}");
         return;
     }
     let mutex = (manager as usize + 0x19498) as *mut u8;
@@ -459,8 +460,8 @@ unsafe fn finish_private_clone(manager: *mut u64, buffer: usize, result: u32) {
     {
         return;
     }
-    PRIVATE_CLONE_PHASE.store(3, Ordering::Release);
-    if owned && result == 1 {
+    let _ = PRIVATE_CLONE_PHASE.compare_exchange(1, 3, Ordering::AcqRel, Ordering::Acquire);
+    if owned && result == 1 && PRIVATE_CLONE_PHASE.load(Ordering::Acquire) == 3 {
         unload_effects(manager, PRIVATE_CLONE_HANDLE);
     }
     // A failed construction may have retained native references. Keep the
