@@ -1304,6 +1304,11 @@ unsafe extern "C" fn expression_fixture(agent: &mut L2CAgentBase) {
         assert!(scoped.roster.names.is_empty());
         assert!(scoped.roster.order.is_empty());
         assert!(scoped.roster.ui_images.is_empty());
+        let reloaded: ModProjectFile = serde_json::from_str(
+            &serde_json::to_string(&scoped).unwrap(),
+        ).unwrap();
+        assert_eq!(reloaded.roster.authored[0].key, scoped.roster.authored[0].key);
+        assert_eq!(reloaded.roster.authored[0].all_slots(), vec![8, 9]);
     }
 
     /// Version 3 and older stored effect-call rotations reversed; the script text was right, so
