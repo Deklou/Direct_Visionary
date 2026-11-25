@@ -1324,6 +1324,69 @@ mod slot_gate_tests {
         assert!(message.contains("attack_11"), "{message}");
     }
 
+    const FOUR_CATEGORIES: &str = concat!(
+        "unsafe extern \"C\" fn game_attack11(agent: &mut L2CAgentBase) {\n",
+        "    frame(agent.lua_state_agent, 2.0);\n}\n",
+        "unsafe extern \"C\" fn effect_attack11(agent: &mut L2CAgentBase) {\n",
+        "    frame(agent.lua_state_agent, 3.0);\n}\n",
+        "unsafe extern \"C\" fn sound_attack11(agent: &mut L2CAgentBase) {\n",
+        "    frame(agent.lua_state_agent, 4.0);\n}\n",
+        "unsafe extern \"C\" fn expression_attack11(agent: &mut L2CAgentBase) {\n",
+        "    frame(agent.lua_state_agent, 5.0);\n}\n",
+    );
+
+    #[test]
+    fn all_four_categories_are_costume_gated_with_original_fallbacks() {
+        let mut project = project(Some(8), Some(FOUR_CATEGORIES));
+        let fighter = project.fighters.get_mut("mario").unwrap();
+        fighter.effect_calls_full.insert("attack_11".into(), Vec::new());
+        fighter.sound_scripts.insert("attack_11".into(), Default::default());
+        fighter.expression_scripts.insert("attack_11".into(), Default::default());
+
+        let source = generated(&project);
+        for prefix in ["game", "effect", "sound", "expression"] {
+            assert!(
+                source.contains(&format!("fn {prefix}_attack11_original(")),
+                "{prefix} must preserve the original script: {source}"
+            );
+            assert!(
+                source.contains(&format!("fn {prefix}_attack11_costume(")),
+                "{prefix} must have a costume arm: {source}"
+            );
+        }
+        assert_eq!(source.matches("if color == 8 {").count(), 4, "{source}");
+    }
+
+    #[test]
+    fn a_scoped_secondary_category_without_original_is_refused() {
+        let mut project = project(Some(8), Some(ORIGINAL));
+        project
+            .fighters
+            .get_mut("mario")
+            .unwrap()
+            .sound_scripts
+            .insert("attack_11".into(), Default::default());
+        let error = match source_project(&project) {
+            Ok(_) => panic!("the original sound script is required"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("original sound_"), "{error}");
+    }
+
+    #[test]
+    fn an_ambiguous_effect_only_edit_is_not_exported_globally() {
+        let mut project = project(None, None);
+        let fighter = project.fighters.get_mut("mario").unwrap();
+        fighter.acmd.clear();
+        fighter.costume_slots = vec![8, 9];
+        fighter.effect_calls_full.insert("attack_11".into(), Vec::new());
+        let error = match source_project(&project) {
+            Ok(_) => panic!("an unbound effect would affect all costumes"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("no verified per-move costume scope"), "{error}");
+    }
+
     /// An empty stored body is the same problem as a missing one, and is what a project saved
     /// from a move that never loaded its source actually contains.
     #[test]
