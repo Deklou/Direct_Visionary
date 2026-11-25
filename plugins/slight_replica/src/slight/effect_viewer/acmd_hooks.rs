@@ -1090,7 +1090,7 @@ unsafe fn control_suppressed(
     }
     let frame = smash::app::lua_bind::MotionModule::frame(boma);
     let motion = resolve_injection_motion(boma, CoroutineBoundary::Control, frame).0;
-    crate::slight::effect_viewer::control_rules::suppressed(live_fighter_kind(boma), func, args, motion, frame)
+    crate::slight::effect_viewer::control_rules::suppressed(live_rule_target(boma), func, args, motion, frame)
 }
 
 // `EFFECT_DETACH_KIND` is deliberately NOT hooked at its shared game entry point.
@@ -1493,7 +1493,7 @@ macro_rules! effect_hook {
                     let preserve_authored = !crate::slight::hitbox_viewer::is_injecting()
                         && preserve_authored_effect(source_boma, args.eff_hash, motion, frame);
                     if !crate::slight::hitbox_viewer::is_injecting()
-                        && crate::slight::effect_viewer::spawn_rules::suppressed(live_fighter_kind(boma), 
+                        && crate::slight::effect_viewer::spawn_rules::suppressed(live_rule_target(boma), 
                             args.eff_hash, motion, frame,
                         )
                         && !preserve_authored
@@ -1502,7 +1502,7 @@ macro_rules! effect_hook {
                     }
                     // Scoped transform wins over the global pin for THIS spawn only.
                     if let Some((pos, rot, scale)) =
-                        crate::slight::effect_viewer::spawn_rules::transform_for(live_fighter_kind(boma), 
+                        crate::slight::effect_viewer::spawn_rules::transform_for(live_rule_target(boma), 
                             args.eff_hash,
                             motion,
                             frame,
@@ -1530,19 +1530,19 @@ macro_rules! effect_hook {
                     }
                     // Looked up separately from the transform: a spawn can be retuned without
                     // being moved, so these must not sit inside the branch above.
-                    set_pending_rate(crate::slight::effect_viewer::spawn_rules::rate_for(live_fighter_kind(boma), 
+                    set_pending_rate(crate::slight::effect_viewer::spawn_rules::rate_for(live_rule_target(boma), 
                         args.eff_hash,
                         motion,
                         frame,
                     ));
                     set_pending_camera_offset(
-                        crate::slight::effect_viewer::spawn_rules::camera_offset_for(live_fighter_kind(boma), 
+                        crate::slight::effect_viewer::spawn_rules::camera_offset_for(live_rule_target(boma), 
                             args.eff_hash,
                             motion,
                             frame,
                         ),
                     );
-                    let (tint, alpha) = crate::slight::effect_viewer::spawn_rules::tint_for(live_fighter_kind(boma), 
+                    let (tint, alpha) = crate::slight::effect_viewer::spawn_rules::tint_for(live_rule_target(boma), 
                         args.eff_hash,
                         motion,
                         frame,
@@ -1550,14 +1550,14 @@ macro_rules! effect_hook {
                     .unwrap_or((None, None));
                     set_pending_tint(tint, alpha);
                     set_pending_particle_tint(
-                        crate::slight::effect_viewer::spawn_rules::particle_tint_for(live_fighter_kind(boma), 
+                        crate::slight::effect_viewer::spawn_rules::particle_tint_for(live_rule_target(boma), 
                             args.eff_hash,
                             motion,
                             frame,
                         ),
                     );
                     set_pending_scale_w(
-                        crate::slight::effect_viewer::spawn_rules::scale_w_for(live_fighter_kind(boma), 
+                        crate::slight::effect_viewer::spawn_rules::scale_w_for(live_rule_target(boma), 
                             args.eff_hash,
                             motion,
                             frame,
@@ -1900,12 +1900,9 @@ fn trail_arg_hash(arg: &crate::slight::hitbox_viewer::LuaArg) -> Option<u64> {
     }
 }
 
-unsafe fn live_fighter_kind(boma: *mut smash::app::BattleObjectModuleAccessor) -> i32 {
-    if is_fighter_boma(boma) {
-        smash::app::utility::get_kind(&mut *boma)
-    } else {
-        -1
-    }
+unsafe fn live_rule_target(boma: *mut smash::app::BattleObjectModuleAccessor) -> crate::slight::rule_scope::RuntimeTarget {
+    crate::slight::hitbox_viewer::rule_target(boma)
+        .unwrap_or(crate::slight::rule_scope::RuntimeTarget::UNKNOWN)
 }
 
 unsafe fn is_fighter_boma(boma: *mut smash::app::BattleObjectModuleAccessor) -> bool {
@@ -1934,7 +1931,7 @@ unsafe fn trail_suppressed(lua_state: u64, hash: Option<u64>) -> bool {
     }
     let frame = smash::app::lua_bind::MotionModule::frame(boma);
     let motion = resolve_injection_motion(boma, CoroutineBoundary::Effect, frame).0;
-    crate::slight::effect_viewer::spawn_rules::suppressed(live_fighter_kind(boma), hash, motion, frame)
+    crate::slight::effect_viewer::spawn_rules::suppressed(live_rule_target(boma), hash, motion, frame)
         && !preserve_authored_effect(boma, hash, motion, frame)
 }
 
@@ -1952,7 +1949,7 @@ unsafe fn lifetime_stop_suppressed(lua_state: u64, func: &str, eff_hash: u64) ->
     }
     let frame = smash::app::lua_bind::MotionModule::frame(boma);
     let motion = resolve_injection_motion(boma, CoroutineBoundary::Effect, frame).0;
-    crate::slight::effect_viewer::spawn_rules::stop_suppressed(live_fighter_kind(boma), func, eff_hash, motion, frame)
+    crate::slight::effect_viewer::spawn_rules::stop_suppressed(live_rule_target(boma), func, eff_hash, motion, frame)
         && !preserve_authored_effect(boma, eff_hash, motion, frame)
 }
 
@@ -2093,7 +2090,7 @@ macro_rules! color_hook {
                     let preserve_authored = !crate::slight::hitbox_viewer::is_injecting()
                         && preserve_authored_effect(boma, cmd_hash, motion, frame);
                     if !crate::slight::hitbox_viewer::is_injecting()
-                        && crate::slight::effect_viewer::spawn_rules::suppressed(live_fighter_kind(boma), 
+                        && crate::slight::effect_viewer::spawn_rules::suppressed(live_rule_target(boma), 
                             cmd_hash, motion, frame,
                         )
                         && !preserve_authored
@@ -2101,7 +2098,7 @@ macro_rules! color_hook {
                         return;
                     }
                     if let Some((color, transition)) =
-                        crate::slight::effect_viewer::spawn_rules::color_for(live_fighter_kind(boma), 
+                        crate::slight::effect_viewer::spawn_rules::color_for(live_rule_target(boma), 
                             cmd_hash, motion, frame,
                         )
                     {
@@ -2594,8 +2591,8 @@ unsafe fn resolve_injection_motion(
     let boid = (*boma).battle_object_id;
     let hint = motion_hint_atomic(boid);
     let hint_has_rules = hint.is_some_and(|hint| {
-        crate::slight::effect_viewer::spawn_rules::has_inject_for(live_fighter_kind(boma), hint)
-            || crate::slight::effect_viewer::control_rules::has_inject_for(live_fighter_kind(boma), hint)
+        crate::slight::effect_viewer::spawn_rules::has_inject_for(live_rule_target(boma), hint)
+            || crate::slight::effect_viewer::control_rules::has_inject_for(live_rule_target(boma), hint)
     });
     let resolved = choose_motion_hint(
         observed,
@@ -2951,7 +2948,7 @@ pub unsafe fn preserve_authored_effect(
     }
     let boid = (*boma).battle_object_id;
     let candidates =
-        crate::slight::effect_viewer::spawn_rules::replacement_injections_for_suppression(live_fighter_kind(boma), 
+        crate::slight::effect_viewer::spawn_rules::replacement_injections_for_suppression(live_rule_target(boma), 
             authored_hash,
             motion,
             frame,
@@ -3163,7 +3160,7 @@ unsafe fn inject_control(
         return;
     }
     let boid = (*boma).battle_object_id;
-    for (idx, injection, work_slot, rule_fingerprint) in control_rules::injections_for(live_fighter_kind(boma), motion) {
+    for (idx, injection, work_slot, rule_fingerprint) in control_rules::injections_for(live_rule_target(boma), motion) {
         let key = (boid, idx);
         let latch = {
             let mut fired = CONTROL_FIRED.lock();
@@ -3267,7 +3264,7 @@ unsafe fn inject_effect(
     if !spawn_rules::any_inject() {
         return;
     }
-    let injections = spawn_rules::injections_for(live_fighter_kind(boma), motion);
+    let injections = spawn_rules::injections_for(live_rule_target(boma), motion);
     if injections.is_empty() {
         return;
     }

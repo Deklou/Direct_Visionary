@@ -16,10 +16,14 @@ pub struct ControlInject {
     pub args: Vec<LuaArg>,
 }
 
+use crate::slight::rule_scope::RuntimeTarget;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ControlRule {
     #[serde(default)]
     pub fighter_kind: Option<i32>,
+    #[serde(default)]
+    pub costume_slots: Option<Vec<u8>>,
     pub motion: Option<u64>,
     pub func: String,
     #[serde(default)]
@@ -43,8 +47,8 @@ pub struct ControlRule {
 }
 
 impl ControlRule {
-    fn matches(&self, fighter_kind: i32, func: &str, args: &[LuaArg], motion: u64, frame: f32) -> bool {
-        self.fighter_kind == Some(fighter_kind)
+    fn matches(&self, target: RuntimeTarget, func: &str, args: &[LuaArg], motion: u64, frame: f32) -> bool {
+        target.matches(self.fighter_kind, self.costume_slots.as_deref())
             && self.func == func
             && self.motion.map(|m| m == motion).unwrap_or(true)
             && self.args == args
@@ -60,10 +64,11 @@ mod fighter_scope_tests {
     #[test]
     fn same_motion_and_control_args_do_not_match_another_fighter() {
         let rule: ControlRule = serde_json::from_str(
-            r#"{"fighter_kind":25,"motion":42,"func":"EFFECT_DETACH_KIND","args":[]}"#
+            r#"{"fighter_kind":25,"costume_slots":[8,9],"motion":42,"func":"EFFECT_DETACH_KIND","args":[]}"#
         ).unwrap();
-        assert!(rule.matches(25, "EFFECT_DETACH_KIND", &[], 42, 3.0));
-        assert!(!rule.matches(24, "EFFECT_DETACH_KIND", &[], 42, 3.0));
+        assert!(rule.matches(RuntimeTarget { fighter_kind: 25, costume: 8 }, "EFFECT_DETACH_KIND", &[], 42, 3.0));
+        assert!(!rule.matches(RuntimeTarget { fighter_kind: 24, costume: 8 }, "EFFECT_DETACH_KIND", &[], 42, 3.0));
+        assert!(!rule.matches(RuntimeTarget { fighter_kind: 25, costume: 0 }, "EFFECT_DETACH_KIND", &[], 42, 3.0));
     }
 }
 
@@ -174,14 +179,14 @@ pub fn any_for(func: &str) -> bool {
         .unwrap_or(false)
 }
 
-pub fn suppressed(fighter_kind: i32, func: &str, args: &[LuaArg], motion: u64, frame: f32) -> bool {
+pub fn suppressed(target: RuntimeTarget, func: &str, args: &[LuaArg], motion: u64, frame: f32) -> bool {
     service_pending();
     RULES
         .try_lock()
         .map(|rules| {
             rules
                 .iter()
-                .any(|rule| rule.suppress && rule.matches(fighter_kind, func, args, motion, frame))
+                .any(|rule| rule.suppress && rule.matches(target, func, args, motion, frame))
         })
         .unwrap_or(false)
 }
@@ -197,20 +202,20 @@ pub fn any_inject() -> bool {
 /// Whether this motion has at least one point-control replacement.  This is used while the
 /// native motion transition is publishing its new hash and the ACMD boundary may still expose
 /// the previous motion.
-pub fn has_inject_for(fighter_kind: i32, motion: u64) -> bool {
+pub fn has_inject_for(target: RuntimeTarget, motion: u64) -> bool {
     service_pending();
     RULES
         .try_lock()
         .map(|rules| {
             rules.iter().any(|rule| {
-                rule.inject.is_some() && rule.fighter_kind == Some(fighter_kind)
+                rule.inject.is_some() && target.matches(rule.fighter_kind, rule.costume_slots.as_deref())
                     && rule.motion.map(|wanted| wanted == motion).unwrap_or(true)
             })
         })
         .unwrap_or(false)
 }
 
-pub fn injections_for(fighter_kind: i32, motion: u64) -> Vec<(usize, ControlInject, Option<i32>, u64)> {
+pub fn injections_for(target: RuntimeTarget, motion: u64) -> Vec<(usize, ControlInject, Option<i32>, u64)> {
     service_pending();
     let Some(rules) = RULES.try_lock() else {
         return Vec::new();
@@ -219,7 +224,7 @@ pub fn injections_for(fighter_kind: i32, motion: u64) -> Vec<(usize, ControlInje
         .iter()
         .enumerate()
         .filter(|(_, rule)| {
-            rule.inject.is_some() && rule.fighter_kind == Some(fighter_kind)
+            rule.inject.is_some() && target.matches(rule.fighter_kind, rule.costume_slots.as_deref())
                 && rule.motion.map(|wanted| wanted == motion).unwrap_or(true)
         })
         .map(|(index, rule)| {

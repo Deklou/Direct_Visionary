@@ -71,8 +71,8 @@ fn rate_arg(arg: &LuaArg) -> Option<f32> {
 /// exposed to. A rate rule can miss on the motion or on the frame window, and from outside the
 /// two are indistinguishable: both look like "the edit did not apply". This is the third time
 /// that shape has cost a game boot on this project.
-fn rate_action(fighter_kind: i32, motion: u64, frame: f32) -> Option<(bool, Option<HbOverrides>)> {
-    let hit = super::action_for_kind(fighter_kind, CAT_MOTION_RATE, motion, 0, frame);
+fn rate_action(target: super::RuntimeTarget, motion: u64, frame: f32) -> Option<(bool, Option<HbOverrides>)> {
+    let hit = super::action_for_target(target, CAT_MOTION_RATE, motion, 0, frame);
     if hit.is_none() && MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < MISS_BUDGET {
         let loaded: Vec<String> = {
             let rules = super::RULES.lock();
@@ -134,12 +134,12 @@ unsafe fn rate_action_for_call(lua_state: u64, args: &[LuaArg]) -> bool {
         ));
         return false;
     };
-    let Some(fighter_kind) = super::rule_fighter_kind(boma) else {
+    let Some(target) = super::rule_target(boma) else {
         return false;
     };
     let motion = smash::app::lua_bind::MotionModule::motion_kind(boma);
     let frame = smash::app::lua_bind::MotionModule::frame(boma);
-    let Some((suppress, overrides)) = rate_action(fighter_kind, motion, frame) else {
+    let Some((suppress, overrides)) = rate_action(target, motion, frame) else {
         return false;
     };
     crate::slight::diag::note(format!(

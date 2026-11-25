@@ -1492,11 +1492,15 @@ pub struct InjectRule {
     pub command: Option<String>,
 }
 
+use crate::slight::rule_scope::RuntimeTarget;
+
 #[derive(Clone, Debug, serde::Deserialize)]
 pub struct HitboxRule {
     /// Runtime fighter kind. Missing in older TCP messages: safe no-op, never a wildcard.
     #[serde(default)]
     pub fighter_kind: Option<i32>,
+    #[serde(default)]
+    pub costume_slots: Option<Vec<u8>>,
     /// hash40 of the motion name ("attack_air_n").
     pub motion: u64,
     /// Collision family this rule targets (0 attack / 1 grab / 2 wind). Old editors omit
@@ -1535,8 +1539,8 @@ pub struct HitboxRule {
 }
 
 impl HitboxRule {
-    fn matches(&self, fighter_kind: i32, category: u8, motion: u64, id: u64, frame: f32) -> bool {
-        self.fighter_kind == Some(fighter_kind)
+    fn matches(&self, target: RuntimeTarget, category: u8, motion: u64, id: u64, frame: f32) -> bool {
+        target.matches(self.fighter_kind, self.costume_slots.as_deref())
             && self.category == category
             && self.motion == motion
             && self.hitbox_id.map(|h| h == id).unwrap_or(true)
@@ -1553,14 +1557,15 @@ mod fighter_scope_tests {
     fn identical_attack_hi3_and_attack_11_names_are_fighter_scoped() {
         for motion in [0xacbfc42e6, 0x99c52257e] {
             let rule: HitboxRule = serde_json::from_str(&format!(
-                r#"{{"fighter_kind":24,"motion":{motion},"category":9}}"#
+                r#"{{"fighter_kind":24,"costume_slots":[8,9],"motion":{motion},"category":9}}"#
             )).unwrap();
-            assert!(rule.matches(24, CAT_MOTION_RATE, motion, 0, 2.0));
-            assert!(!rule.matches(1, CAT_MOTION_RATE, motion, 0, 2.0));
+            assert!(rule.matches(RuntimeTarget { fighter_kind: 24, costume: 8 }, CAT_MOTION_RATE, motion, 0, 2.0));
+            assert!(!rule.matches(RuntimeTarget { fighter_kind: 1, costume: 8 }, CAT_MOTION_RATE, motion, 0, 2.0));
+            assert!(!rule.matches(RuntimeTarget { fighter_kind: 24, costume: 0 }, CAT_MOTION_RATE, motion, 0, 2.0));
             let unscoped: HitboxRule = serde_json::from_str(&format!(
                 r#"{{"motion":{motion},"category":9}}"#
             )).unwrap();
-            assert!(!unscoped.matches(24, CAT_MOTION_RATE, motion, 0, 2.0));
+            assert!(!unscoped.matches(RuntimeTarget { fighter_kind: 24, costume: 8 }, CAT_MOTION_RATE, motion, 0, 2.0));
         }
     }
 }
@@ -1651,19 +1656,24 @@ fn any_rules() -> bool {
 }
 
 /// Runtime identity is required before any live rule can change a fighter.
-unsafe fn rule_fighter_kind(boma: *mut smash::app::BattleObjectModuleAccessor) -> Option<i32> {
+pub(crate) unsafe fn rule_target(boma: *mut smash::app::BattleObjectModuleAccessor) -> Option<RuntimeTarget> {
     if boma.is_null()
         || smash::app::utility::get_category(&mut *boma)
             != *smash::lib::lua_const::BATTLE_OBJECT_CATEGORY_FIGHTER
     {
         return None;
     }
-    Some(smash::app::utility::get_kind(&mut *boma))
+    Some(RuntimeTarget {
+        fighter_kind: smash::app::utility::get_kind(&mut *boma),
+        costume: smash::app::lua_bind::WorkModule::get_int(
+            boma, *smash::lib::lua_const::FIGHTER_INSTANCE_WORK_ID_INT_COLOR,
+        ),
+    })
 }
 
 /// Pure matcher shared by sv_animcmd hooks and direct Module hooks.
-fn action_for_kind(
-    fighter_kind: i32,
+fn action_for_target(
+    target: RuntimeTarget,
     category: u8,
     motion: u64,
     id: u64,
@@ -1672,7 +1682,7 @@ fn action_for_kind(
     let rules = RULES.lock();
     rules
         .iter()
-        .find(|r| r.inject.is_none() && r.matches(fighter_kind, category, motion, id, frame))
+        .find(|r| r.inject.is_none() && r.matches(target, category, motion, id, frame))
         .map(|r| (r.suppress, r.overrides.clone()))
 }
 
@@ -1683,7 +1693,7 @@ unsafe fn action_for(
     id: u64,
     frame: f32,
 ) -> Option<(bool, Option<HbOverrides>)> {
-    action_for_kind(rule_fighter_kind(boma)?, category, motion, id, frame)
+    action_for_target(rule_target(boma)?, category, motion, id, frame)
 }
 
 /// As action_for, with the exact direct-call name as a second discriminator.
@@ -1695,13 +1705,13 @@ unsafe fn action_for_func(
     frame: f32,
     func: &str,
 ) -> Option<(bool, Option<HbOverrides>)> {
-    let fighter_kind = rule_fighter_kind(boma)?;
+    let target = rule_target(boma)?;
     let rules = RULES.lock();
     rules
         .iter()
         .find(|r| {
             r.inject.is_none()
-                && r.matches(fighter_kind, category, motion, id, frame)
+                && r.matches(target, category, motion, id, frame)
                 && r.func.as_deref().is_none_or(|candidate| candidate == func)
         })
         .map(|r| (r.suppress, r.overrides.clone()))
@@ -1777,7 +1787,7 @@ unsafe fn expression_action(
     func: &str,
     args: &[LuaArg],
 ) -> Option<(bool, Option<HbOverrides>)> {
-    let fighter_kind = rule_fighter_kind(boma)?;
+    let target = rule_target(boma)?;
     let key = expression_key(func, args);
     let rules = RULES.lock();
     rules
@@ -1786,7 +1796,7 @@ unsafe fn expression_action(
             rule.inject.is_none()
                 && rule.category == CAT_EXPRESSION
                 && rule.func.as_deref() == Some(func)
-                && rule.matches(fighter_kind, CAT_EXPRESSION, motion, key, frame)
+                && rule.matches(target, CAT_EXPRESSION, motion, key, frame)
         })
         .map(|rule| (rule.suppress, rule.overrides.clone()))
 }
@@ -2759,13 +2769,14 @@ unsafe fn hook_control_set_rumble(
 
 /// Inject rules for a motion, tagged with the collision family to fire through.
 fn injection_fingerprint(
-    fighter_kind: i32,
+    target: RuntimeTarget,
     motion: u64,
     category: u8,
     injection_key: Option<u64>,
     injection: &InjectRule,
 ) -> u64 {
-    let mut hash = fnv(0xcbf2_9ce4_8422_2325, fighter_kind as u64);
+    let mut hash = fnv(0xcbf2_9ce4_8422_2325, target.fighter_kind as u64);
+    hash = fnv(hash, target.costume as u64);
     hash = fnv(hash, motion);
     hash = fnv(hash, category as u64);
     // `hitbox_id` is a per-call discriminator for sound and expression additions. Keep it out of
@@ -2784,12 +2795,12 @@ fn injection_fingerprint(
     hash
 }
 
-fn injections_for(fighter_kind: i32, motion: u64, frame: f32) -> Vec<(u64, u8, InjectRule)> {
+fn injections_for(target: RuntimeTarget, motion: u64, frame: f32) -> Vec<(u64, u8, InjectRule)> {
     let rules = RULES.lock();
     rules
         .iter()
         .filter(|r| {
-            r.fighter_kind == Some(fighter_kind)
+            target.matches(r.fighter_kind, r.costume_slots.as_deref())
                 && r.motion == motion
                 && r.inject.is_some()
                 && (!matches!(r.category, CAT_MOTION_MODULE_SET_RATE | CAT_ATTACK_LIFETIME)
@@ -2798,7 +2809,7 @@ fn injections_for(fighter_kind: i32, motion: u64, frame: f32) -> Vec<(u64, u8, I
         .map(|rule| {
             let injection = rule.inject.clone().unwrap();
             (
-                injection_fingerprint(fighter_kind, rule.motion, rule.category, rule.hitbox_id, &injection),
+                injection_fingerprint(target, rule.motion, rule.category, rule.hitbox_id, &injection),
                 rule.category,
                 injection,
             )
@@ -3794,8 +3805,8 @@ pub unsafe fn inject_tick(lua_state: u64) {
     }
     let motion = smash::app::lua_bind::MotionModule::motion_kind(boma);
     let frame = smash::app::lua_bind::MotionModule::frame(boma);
-    let fighter_kind = smash::app::utility::get_kind(&mut *boma);
-    let injections = injections_for(fighter_kind, motion, frame);
+    let Some(target) = rule_target(boma) else { return; };
+    let injections = injections_for(target, motion, frame);
     if injections.is_empty() {
         return;
     }
