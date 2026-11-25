@@ -77,10 +77,16 @@ pub fn source_project(project: &ModProjectFile) -> Result<Option<GeneratedSource
     let mut exported_effect_names = HashSet::new();
     let mut capture_warnings = Vec::new();
     let mut slot_gates = crate::acmd::SlotGates::new();
+    let mut category_gates = crate::acmd::CategorySlotGates::new();
 
     let mut fighters: Vec<_> = project.fighters.iter().collect();
     fighters.sort_by(|a, b| a.0.cmp(b.0));
     for (fighter, edits) in fighters {
+        let has_shared_fighter = project
+            .roster
+            .authored
+            .iter()
+            .any(|entry| entry.donor.eq_ignore_ascii_case(fighter));
         let mut moves: Vec<_> = edits.acmd.iter().collect();
         moves.sort_by(|a, b| a.0.cmp(b.0));
         for (move_name, record) in moves {
@@ -89,31 +95,24 @@ pub fn source_project(project: &ModProjectFile) -> Result<Option<GeneratedSource
             // of the fighter, so a missing original is refused rather than exported wide.
             let scopes = record.effective_scopes();
             if !scopes.is_empty() {
-                match edits
-                    .move_sources
-                    .get(move_name)
-                    .map(|snapshot| snapshot.body.trim())
-                    .filter(|body| !body.is_empty())
-                {
-                    Some(body) => {
-                        slot_gates.insert(
-                            (fighter.clone(), move_name.clone()),
-                            (scopes.clone(), body.to_string()),
+                let original = original_category(edits, move_name, "game", fighter)?;
+                slot_gates.insert(
+                    (fighter.clone(), move_name.clone()),
+                    (scopes.clone(), original),
+                );
+                for (category, edited) in [
+                    ("effect", edits.effect_calls_full.contains_key(move_name)),
+                    ("sound", edits.sound_scripts.contains_key(move_name)),
+                    ("expression", edits.expression_scripts.contains_key(move_name)),
+                ] {
+                    if edited {
+                        category_gates.insert(
+                            (fighter.clone(), move_name.clone(), category.to_string()),
+                            (
+                                scopes.clone(),
+                                original_category(edits, move_name, category, fighter)?,
+                            ),
                         );
-                    }
-                    None => {
-                        let slot_list = scopes
-                            .iter()
-                            .map(|slot| format!("c{slot:02}"))
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        bail!(
-                            "{fighter}'s {move_name} is set to costume(s) {slot_list} only, but the \
-                             fighter's own version of it was not saved with the project. Exporting \
-                             it now would remove {move_name} from every other costume of \
-                             {fighter}. Open the move in the editor once so its original is \
-                             recorded, then export again."
-                        )
                     }
                 }
             }
@@ -123,6 +122,9 @@ pub fn source_project(project: &ModProjectFile) -> Result<Option<GeneratedSource
         let mut effect_moves: Vec<_> = edits.effect_calls_full.iter().collect();
         effect_moves.sort_by(|a, b| a.0.cmp(b.0));
         for (move_name, calls) in effect_moves {
+            ensure_category_scope(
+                edits, fighter, move_name, "effect", has_shared_fighter, &category_gates,
+            )?;
             let calls = calls
                 .iter()
                 .cloned()
@@ -158,11 +160,17 @@ pub fn source_project(project: &ModProjectFile) -> Result<Option<GeneratedSource
         let mut sound_moves: Vec<_> = edits.sound_scripts.iter().collect();
         sound_moves.sort_by(|a, b| a.0.cmp(b.0));
         for (move_name, script) in sound_moves {
+            ensure_category_scope(
+                edits, fighter, move_name, "sound", has_shared_fighter, &category_gates,
+            )?;
             sound_edits.push((fighter.clone(), move_name.clone(), script.clone()));
         }
         let mut expression_moves: Vec<_> = edits.expression_scripts.iter().collect();
         expression_moves.sort_by(|a, b| a.0.cmp(b.0));
         for (move_name, script) in expression_moves {
+            ensure_category_scope(
+                edits, fighter, move_name, "expression", has_shared_fighter, &category_gates,
+            )?;
             expression_edits.push((fighter.clone(), move_name.clone(), script.clone()));
         }
 
@@ -220,7 +228,7 @@ pub fn source_project(project: &ModProjectFile) -> Result<Option<GeneratedSource
     {
         return Ok(None);
     }
-    let built = crate::acmd::build_mod_project_with_slot_gates(
+    let built = crate::acmd::build_mod_project_with_all_slot_gates(
         &acmd_edits,
         &effect_edits,
         &sound_edits,
@@ -228,6 +236,7 @@ pub fn source_project(project: &ModProjectFile) -> Result<Option<GeneratedSource
         &tweaks,
         &plugin_name(project),
         &slot_gates,
+        &category_gates,
     );
 
     // Nothing reaches disk until the generated code has been read back and matched against the
@@ -256,6 +265,49 @@ pub fn source_project(project: &ModProjectFile) -> Result<Option<GeneratedSource
         project: built,
         warnings,
     }))
+}
+
+/// A shared-fighter category must have the donor's matching original as fallback.
+fn original_category(
+    edits: &crate::mod_project::FighterMod,
+    move_name: &str,
+    category: &str,
+    fighter: &str,
+) -> Result<String> {
+    let original = edits
+        .move_sources
+        .get(move_name)
+        .and_then(|snapshot| crate::acmd::extract_function(&snapshot.body, &format!("{category}_")));
+    original.ok_or_else(|| {
+        anyhow::anyhow!(
+            "{fighter}/{move_name}: missing original {category}_ function. Exporting this edit \
+             would change or remove the move on every other costume. Reload the original move \
+             with all ACMD categories before exporting."
+        )
+    })
+}
+
+/// A fighter-level scope does not prove which particular move owns a secondary category.
+/// Never silently widen an edited effect, sound or expression script.
+fn ensure_category_scope(
+    edits: &crate::mod_project::FighterMod,
+    fighter: &str,
+    move_name: &str,
+    category: &str,
+    has_shared_fighter: bool,
+    gates: &crate::acmd::CategorySlotGates,
+) -> Result<()> {
+    let key = (fighter.to_string(), move_name.to_string(), category.to_string());
+    if gates.contains_key(&key) {
+        return Ok(());
+    }
+    if has_shared_fighter || !edits.costume_slots.is_empty() {
+        bail!(
+            "{fighter}/{move_name}: {category}_ edit has no verified per-move costume scope. \
+             Export refused to protect other costumes."
+        );
+    }
+    Ok(())
 }
 
 /// Materialize a generated Cargo project at exactly `root` (without adding another surprise
