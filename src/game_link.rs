@@ -1262,6 +1262,8 @@ pub struct LiveKind {
 struct Shared {
     status: LinkStatus,
     client_id: Option<u64>,
+    /// Only a matching plugin can consume the scoped-cancel wire format.
+    scoped_cancels_supported: bool,
     connection_epoch: u64,
     collision_requests: BTreeMap<i32, u64>,
     kinds: BTreeMap<u64, LiveKind>,
@@ -1329,6 +1331,7 @@ const FULL_REPLACE_MARKERS: &[&str] = &[
     "\"spawn_rules\":",
     "\"hitbox_rules\":",
     "\"cancel_rules\":",
+    "\"cancel_rules_scoped\":",
     "\"effect_control_rules\":",
     "\"effect_aliases\":",
     "\"donor_effs\":",
@@ -1647,6 +1650,51 @@ impl GameLink {
             queue_latest_full_replace(&mut s.outbox, frame);
             s.edits_tx += 1;
         }
+    }
+
+    /// The new scoped wire has its own key, so an older plugin cannot read it as an
+    /// unscoped legacy cancel rule. Refuse before handshake or on scope ambiguity.
+    pub fn send_scoped_cancel_rules(
+        &self,
+        rules: &[crate::cancel_rules::CancelRuleWire],
+    ) -> bool {
+        if self.sends_suppressed()
+            || rules.iter().any(|rule| {
+                rule.costume_slots
+                    .as_ref()
+                    .is_none_or(|slots| slots.is_empty())
+            })
+        {
+            return false;
+        }
+        let Ok(payload) = serde_json::to_string(&serde_json::json!({
+            "cancel_rules_scoped": rules
+        })) else {
+            return false;
+        };
+        let frame = format!("<TCP_MESSAGE>{payload}</TCP_MESSAGE>");
+        let Ok(mut shared) = self.shared.lock() else {
+            return false;
+        };
+        if shared.status != LinkStatus::Connected
+            || shared.client_id.is_none()
+            || !shared.scoped_cancels_supported
+        {
+            return false;
+        }
+        // A pending legacy full-replace must never overwrite this scoped payload.
+        shared.outbox.retain(|frame| !frame.contains("\"cancel_rules\":"));
+        queue_latest_full_replace(&mut shared.outbox, frame);
+        shared.edits_tx += 1;
+        true
+    }
+
+    pub fn supports_scoped_cancels(&self) -> bool {
+        self.shared.lock().is_ok_and(|s| {
+            s.status == LinkStatus::Connected
+                && s.client_id.is_some()
+                && s.scoped_cancels_supported
+        })
     }
 
     /// Replace the plugin's live spawn-rule list (suppress/retime ACMD effect spawns).
@@ -2125,6 +2173,7 @@ fn link_thread(shared: Arc<Mutex<Shared>>) {
             let mut s = shared.lock().unwrap();
             s.status = LinkStatus::Connecting;
             s.client_id = None;
+            s.scoped_cancels_supported = false;
             s.last_rx = None;
         }
         let addr = plugin_addr();
@@ -2143,6 +2192,7 @@ fn link_thread(shared: Arc<Mutex<Shared>>) {
                 s.status = LinkStatus::Disconnected;
                 s.last_error = reason;
                 s.client_id = None;
+                s.scoped_cancels_supported = false;
                 s.last_rx = None;
             }
             Err(e) => {
@@ -2151,6 +2201,7 @@ fn link_thread(shared: Arc<Mutex<Shared>>) {
                 s.status = LinkStatus::Disconnected;
                 s.last_error = Some(format!("connect to {addr}: {e}{hint}"));
                 s.client_id = None;
+                s.scoped_cancels_supported = false;
                 s.last_rx = None;
             }
         }
@@ -2615,6 +2666,12 @@ fn handle_frame(shared: &Arc<Mutex<Shared>>, payload: &str) {
                 s.connection_epoch = s.connection_epoch.wrapping_add(1).max(1);
             }
             s.client_id = client_id;
+            s.scoped_cancels_supported = client_id.is_some()
+                && body
+                    .get("GiveClientId")
+                    .and_then(|data| data.get("scoped_cancels"))
+                    .and_then(|value| value.as_bool())
+                    == Some(true);
         }
         _ => {}
     }
@@ -2629,6 +2686,68 @@ mod tests {
         let body_str = serde_json::to_string(body).unwrap();
         let body_esc = serde_json::to_string(&body_str).unwrap();
         format!("<TCP_MESSAGE>{{\"header\":\"{header}\",\"body\":{body_esc}}}</TCP_MESSAGE>")
+    }
+
+    #[test]
+    fn scoped_cancels_require_a_current_capability_handshake() {
+        let link = GameLink::default();
+        {
+            let mut s = link.shared.lock().unwrap();
+            s.status = LinkStatus::Connected;
+        }
+        assert!(!link.send_scoped_cancel_rules(&[]));
+
+        feed(&link, &[plugin_frame("GiveClientId", &serde_json::json!({
+            "GiveClientId": { "client_id": 4, "scoped_cancels": true }
+        }))]);
+        assert!(link.supports_scoped_cancels());
+        assert!(link.send_scoped_cancel_rules(&[]));
+        let pending = link.shared.lock().unwrap().outbox.clone();
+        assert_eq!(pending.len(), 1);
+        assert!(pending[0].contains("\"cancel_rules_scoped\":"));
+
+        // Reconnecting to an old NRO must invalidate the new capability.
+        feed(&link, &[plugin_frame("GiveClientId", &serde_json::json!({
+            "GiveClientId": { "client_id": 5 }
+        }))]);
+        assert!(!link.supports_scoped_cancels());
+        assert!(!link.send_scoped_cancel_rules(&[]));
+    }
+
+    #[test]
+    fn scoped_cancels_reject_legacy_rules_and_replace_pending_legacy_payload() {
+        let link = GameLink::default();
+        let mut rule = crate::cancel_rules::CancelRule::default();
+        rule.enabled = true;
+        let store = std::collections::HashMap::from([(
+            "mario".to_string(),
+            std::collections::HashMap::from([("attack_11".to_string(), vec![rule])]),
+        )]);
+        let legacy = crate::cancel_rules::enabled_wires(&store);
+        {
+            let mut s = link.shared.lock().unwrap();
+            s.status = LinkStatus::Connected;
+        }
+        feed(&link, &[plugin_frame("GiveClientId", &serde_json::json!({
+            "GiveClientId": { "client_id": 6, "scoped_cancels": true }
+        }))]);
+        assert!(!link.send_scoped_cancel_rules(&legacy));
+        link.send_cancel_rules(&legacy);
+        let scope = crate::roster::edit_scope::EditScope {
+            key: crate::roster::RosterKey::slot("mario", 8),
+            fighter: "mario".into(),
+            slots: vec![8, 9],
+        };
+        let scoped = crate::cancel_rules::scoped_wires(
+            "mario", "attack_11",
+            &store["mario"]["attack_11"],
+            &scope,
+        ).unwrap();
+        assert!(link.send_scoped_cancel_rules(&scoped));
+        let pending = link.shared.lock().unwrap().outbox.clone();
+        assert_eq!(pending.len(), 1);
+        assert!(pending[0].contains("\"costume_slots\":[8,9]"));
+        assert!(!pending[0].contains("\"cancel_rules\":"));
     }
 
     #[test]
