@@ -7,7 +7,7 @@ use std::sync::LazyLock;
 
 use parking_lot::{Mutex, RwLock};
 use serde::Deserialize;
-use smash::app::{self, BattleObjectModuleAccessor};
+use smash::app::{self, lua_bind::HitModule, BattleObjectModuleAccessor};
 use smash::phx::{Hash40, Vector3f};
 
 #[derive(Clone, Debug, Deserialize)]
@@ -19,13 +19,15 @@ pub struct GeometryRule {
     pub endpoint2: [f32; 3],
     pub radius: f32,
     pub status: i32,
+    #[serde(default)]
+    pub disabled: bool,
 }
 
 impl GeometryRule {
     fn valid(&self) -> bool {
         (0..=127).contains(&self.fighter_kind)
             && self.index < 128
-            && self.bone <= 0xffffffffff
+            && self.bone > 0 && self.bone <= 0xffffffffff
             && self.radius.is_finite()
             && self.radius > 0.0
             && self.radius <= 50.0
@@ -69,11 +71,12 @@ pub unsafe fn tick(boma: *mut BattleObjectModuleAccessor) {
     let boid = (*boma).battle_object_id;
     let revision = REVISION.load(Ordering::Acquire);
     let previous = APPLIED.lock().get(&boid).copied();
-    if previous == Some((kind, revision)) {
-        return;
-    }
     let rules: Vec<_> = RULES.read().iter()
         .filter(|r| r.fighter_kind == kind).cloned().collect();
+    let already_applied = previous == Some((kind, revision));
+    if already_applied && !rules.iter().any(|r| r.disabled) {
+        return;
+    }
     if rules.is_empty() {
         if previous.is_some_and(|(old_kind, _)| old_kind == kind) {
             app::FighterUtil::reset_hit_data(boma);
@@ -83,6 +86,15 @@ pub unsafe fn tick(boma: *mut BattleObjectModuleAccessor) {
     }
 
     for rule in &rules {
+        if rule.disabled {
+            // Status by joint avoids assuming that a PRC list index is a native index.
+            // Keep enforcing OFF because an ACMD animation can restore that joint.
+            HitModule::set_status_joint(boma, Hash40::new_raw(rule.bone), app::HitStatus(3), 0);
+            continue;
+        }
+        if already_applied {
+            continue;
+        }
         let start = Vector3f {
             x: rule.endpoint1[0], y: rule.endpoint1[1], z: rule.endpoint1[2],
         };
@@ -105,11 +117,13 @@ pub unsafe fn tick(boma: *mut BattleObjectModuleAccessor) {
             app::CollisionShapeType(2),
         );
     }
-    APPLIED.lock().insert(boid, (kind, revision));
-    crate::slight::diag::note(format!(
+    if !already_applied {
+        APPLIED.lock().insert(boid, (kind, revision));
+        crate::slight::diag::note(format!(
         "hurtbox geometry applied: fighter {kind}, {} capsule(s), revision {revision}",
         rules.len()
-    ));
+        ));
+    }
 }
 
 #[cfg(test)]
@@ -126,6 +140,7 @@ mod tests {
             endpoint2: [1.0; 3],
             radius: 4.0,
             status: 0,
+            disabled: false,
         };
         assert!(rule.valid());
         assert!(!GeometryRule { radius: f32::NAN, ..rule.clone() }.valid());
