@@ -132,6 +132,9 @@ pub struct CancelRuleWire {
     pub start_frame: u8,
     pub end_frame: u8,
     pub sync_combo: bool,
+    /// Absent for legacy fighter-wide rules. Explicit slots require a capable plugin.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub costume_slots: Option<Vec<u8>>,
 }
 
 pub fn enabled_wires(
@@ -156,6 +159,7 @@ pub fn enabled_wires(
                         start_frame: rule.start_frame,
                         end_frame: rule.end_frame,
                         sync_combo: rule.sync_combo,
+                        costume_slots: None,
                     });
                 }
             }
@@ -164,6 +168,28 @@ pub fn enabled_wires(
     // Stable order between publication calls; order within one move stays authored.
     wires.sort_by(|a, b| (&a.fighter, a.motion).cmp(&(&b.fighter, b.motion)));
     wires
+}
+
+/// Build a scoped cancel payload for one explicitly resolved character/move.
+/// The caller must verify the saved binding and plugin capability before publishing.
+pub fn scoped_wires(
+    fighter: &str,
+    motion: &str,
+    rules: &[CancelRule],
+    scope: &crate::roster::edit_scope::EditScope,
+) -> Result<Vec<CancelRuleWire>, &'static str> {
+    if !scope.fighter.eq_ignore_ascii_case(fighter) || scope.slots.is_empty() {
+        return Err("cancel target does not match the resolved fighter/costumes");
+    }
+    let store = HashMap::from([(
+        fighter.to_string(),
+        HashMap::from([(motion.to_string(), rules.to_vec())]),
+    )]);
+    let mut wires = enabled_wires(&store);
+    for wire in &mut wires {
+        wire.costume_slots = Some(scope.slots.clone());
+    }
+    Ok(wires)
 }
 
 #[derive(Deserialize)]
@@ -333,6 +359,51 @@ mod tests {
             wires.iter().map(|wire| wire.target).collect::<Vec<_>>(),
             vec![CancelTarget::Walk, CancelTarget::Dash, CancelTarget::Crouch]
         );
+    }
+
+    #[test]
+    fn cancel_wire_can_limit_one_logical_character_to_multiple_costumes() {
+        let mut rule = CancelRule::default();
+        rule.enabled = true;
+        let scope = crate::roster::edit_scope::EditScope {
+            key: crate::roster::RosterKey::slot("mario", 8),
+            fighter: "mario".into(),
+            slots: vec![8, 9, 10, 11],
+        };
+        let wires = scoped_wires("Mario", "attack_11", &[rule], &scope).unwrap();
+        assert_eq!(wires.len(), 1);
+        assert_eq!(wires[0].costume_slots, Some(vec![8, 9, 10, 11]));
+        let json = serde_json::to_value(&wires[0]).unwrap();
+        assert_eq!(json["costume_slots"], serde_json::json!([8, 9, 10, 11]));
+        assert_eq!(json["fighter"], "mario");
+    }
+
+    #[test]
+    fn cancel_wire_does_not_guess_a_mismatched_or_missing_scope() {
+        let scope = crate::roster::edit_scope::EditScope {
+            key: crate::roster::RosterKey::slot("mario", 8),
+            fighter: "mario".into(),
+            slots: vec![8],
+        };
+        assert!(scoped_wires("luigi", "attack_11", &[], &scope).is_err());
+        let empty = crate::roster::edit_scope::EditScope {
+            slots: Vec::new(),
+            ..scope
+        };
+        assert!(scoped_wires("mario", "attack_11", &[], &empty).is_err());
+    }
+
+    #[test]
+    fn old_cancel_wire_stays_without_a_costume_field() {
+        let mut rule = CancelRule::default();
+        rule.enabled = true;
+        let store = HashMap::from([(
+            "mario".to_string(),
+            HashMap::from([("attack_11".to_string(), vec![rule])]),
+        )]);
+        let wires = enabled_wires(&store);
+        let json = serde_json::to_value(&wires[0]).unwrap();
+        assert!(json.get("costume_slots").is_none());
     }
 
     #[test]
