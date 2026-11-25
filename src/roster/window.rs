@@ -348,6 +348,14 @@ impl RosterWindow {
         entry.all_slots()
     }
 
+    pub fn cancel_edit_target(&self) -> Option<&RosterKey> {
+        self.edit_target.as_ref()
+    }
+
+    pub fn clear_edit_target(&mut self) {
+        self.edit_target = None;
+    }
+
     /// The moves each added character has replaced, read out of the edit log.
     ///
     /// An edit belongs to a character when it is scoped to one of that character's

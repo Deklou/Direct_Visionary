@@ -1363,6 +1363,18 @@ fn retain_latest_for_marker(messages: &mut Vec<String>, marker: &str) {
 /// queueing (so offline drags cannot grow the outbox without bound) and when flushing
 /// (so a burst of queued states sends once).
 fn retain_latest_full_replace(messages: &mut Vec<String>) {
+    // Legacy and scoped cancels replace the same runtime list, including a legacy clear.
+    let is_cancel = |frame: &str| {
+        frame.contains("\"cancel_rules\":") || frame.contains("\"cancel_rules_scoped\":")
+    };
+    if let Some(latest) = messages.iter().rposition(|frame| is_cancel(frame)) {
+        let mut index = 0;
+        messages.retain(|frame| {
+            let keep = !is_cancel(frame) || index == latest;
+            index += 1;
+            keep
+        });
+    }
     for marker in FULL_REPLACE_MARKERS {
         retain_latest_for_marker(messages, marker);
     }
@@ -1683,8 +1695,6 @@ impl GameLink {
         {
             return false;
         }
-        // A pending legacy full-replace must never overwrite this scoped payload.
-        shared.outbox.retain(|frame| !frame.contains("\"cancel_rules\":"));
         queue_latest_full_replace(&mut shared.outbox, frame);
         shared.edits_tx += 1;
         true
@@ -2240,7 +2250,13 @@ fn serve_connection(shared: &Arc<Mutex<Shared>>, mut stream: TcpStream) -> Optio
         // Outbound edits first — they're latency-sensitive.
         let pending: Vec<String> = {
             let mut s = shared.lock().unwrap();
-            std::mem::take(&mut s.outbox)
+            let mut pending = std::mem::take(&mut s.outbox);
+            // A scoped snapshot from a previous socket is not valid before this handshake.
+            // The editor republishes its current, revalidated state after GiveClientId.
+            if !s.scoped_cancels_supported {
+                pending.retain(|frame| !frame.contains("\"cancel_rules_scoped\":"));
+            }
+            pending
         };
         let mut pending = pending;
         retain_latest_full_replace(&mut pending);
@@ -2749,6 +2765,15 @@ mod tests {
         assert_eq!(pending.len(), 1);
         assert!(pending[0].contains("\"costume_slots\":[8,9]"));
         assert!(!pending[0].contains("\"cancel_rules\":"));
+    }
+
+    #[test]
+    fn cancel_clear_replaces_a_pending_scoped_snapshot_even_after_requeue() {
+        let old = r#"<TCP_MESSAGE>{"cancel_rules_scoped":[{"costume_slots":[8]}]}</TCP_MESSAGE>"#.to_string();
+        let clear = r#"<TCP_MESSAGE>{"cancel_rules":[]}</TCP_MESSAGE>"#.to_string();
+        let mut combined = vec![old, clear.clone()];
+        retain_latest_full_replace(&mut combined);
+        assert_eq!(combined, vec![clear]);
     }
 
     #[test]

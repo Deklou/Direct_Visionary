@@ -18,7 +18,9 @@ use crate::data::{EditRecord, EffectCallEdit};
 pub const PROJECT_FILE_NAME: &str = "modproject.json";
 /// 4: effect-call rotations are stored X, Y, Z as the ACMD slots carry them (3 and older stored
 /// them reversed, from reading the slots as zr, yr, xr).
-pub const PROJECT_VERSION: u32 = 4;
+/// 5: saved cancel rules carry explicit character/costume bindings; older editors must not
+/// reopen them and publish those rules for every costume.
+pub const PROJECT_VERSION: u32 = 5;
 
 /// Versions this build can open. Every field added since v1 carries `#[serde(default)]`, so
 /// an older project loads with the new sections empty — which is exactly what was true when

@@ -3334,6 +3334,7 @@ pub struct VisionaryApp {
     /// TCP client to the slight_replica plugin (:7878).
     game_link: crate::game_link::GameLink,
     cancel_rules_store: HashMap<String, HashMap<String, Vec<crate::cancel_rules::CancelRule>>>,
+    cancel_base_slots: BTreeMap<String, Vec<u8>>,
     /// Debounced live-pin push for an edited effect call (index, last edit time).
     /// Shared per-kind runtime overrides (Effects panel + Eff Editor game panel).
     live_overrides: crate::game_link::LiveOverrides,
@@ -3727,6 +3728,7 @@ impl VisionaryApp {
             eff_editor: crate::eff_editor::EffEditor::default(),
             game_link: crate::game_link::GameLink::default(),
             cancel_rules_store: HashMap::new(),
+            cancel_base_slots: BTreeMap::new(),
             last_live_trait_rules: Vec::new(),
             live_overrides: crate::game_link::LiveOverrides::default(),
             eff_mods: HashMap::new(),
@@ -3850,6 +3852,7 @@ impl VisionaryApp {
     fn set_data_root(&mut self, path: PathBuf) {
         save_config_path("data_root", &path);
         self.state.fighters.clear();
+        self.cancel_base_slots.clear();
         self.state.labels.clear();
         self.state.status = format!("Loading from {}...", path.display());
 
@@ -3900,6 +3903,7 @@ impl VisionaryApp {
         let fighter_dir = path.join("fighter");
         if !fighter_dir.is_dir() {
             self.state.status = "No fighter/ directory found.".to_string();
+            self.publish_cancel_rules();
             return;
         }
 
@@ -3943,6 +3947,7 @@ impl VisionaryApp {
 
         let roots = self.all_roots();
         self.state.fighters.clear();
+        self.cancel_base_slots.clear();
 
         // Fighter name → the root that owns it. A mod root may either ADD a new fighter or
         // extend an existing one with more slots; the first root to define a fighter owns
@@ -4006,6 +4011,10 @@ impl VisionaryApp {
                     crate::data::FighterSource::ModRoot
                 };
 
+                if root_idx == 0 && self.state.data_root.is_some() {
+                    let base_slots = crate::data::discover_costume_slots(std::slice::from_ref(root), &name);
+                    self.cancel_base_slots.insert(name.clone(), base_slots);
+                }
                 let entry = crate::data::FighterEntry {
                     name,
                     display_name,
@@ -4044,6 +4053,7 @@ impl VisionaryApp {
         }
         status.push('.');
         self.state.status = status;
+        self.publish_cancel_rules();
     }
 
     /// Restore every fighter hidden by the roster filter and rebuild the list from the current
@@ -4193,6 +4203,7 @@ impl VisionaryApp {
         let cache_result = crate::acmd::forget_fighter_cache(&fighter);
 
         self.state.fighters.remove(index);
+        self.publish_cancel_rules();
         if was_selected {
             self.state.selected_fighter = None;
             self.state.selected_move = None;
@@ -19515,6 +19526,7 @@ If you step every basis for a                          type and NONE of them mat
         self.eff_mods.clear();
         self.live_overrides = crate::game_link::LiveOverrides::default();
         self.roster.project = crate::mod_project::RosterMod::default();
+        self.roster.clear_edit_target();
         self.roster.params.clear();
         self.edit_history.clear();
         self.game_link.end_project_batch();
@@ -20888,6 +20900,7 @@ If you step every basis for a                          type and NONE of them mat
         // Loading is replacement here too: the roster window's edits belong to the project
         // that was open, not to the one being loaded.
         self.roster.project = std::mem::take(&mut project.roster);
+        self.roster.clear_edit_target();
         self.roster.params = project
             .fighters
             .iter()
@@ -35773,6 +35786,7 @@ impl eframe::App for VisionaryApp {
         // Which moves each added character has replaced, read from the edit log so the roster
         // panel does not need its own copy of it.
         self.roster.authored_moves = self.roster.replaced_moves(&self.state.edit_log);
+        let cancel_roster_before = self.roster.project.authored.clone();
         self.roster.show(
             &ctx,
             &self.state.fighters,
@@ -35798,6 +35812,8 @@ impl eframe::App for VisionaryApp {
             self.extra_roots = self.roster.enabled_roots();
             save_mod_roots(&self.extra_roots);
             self.reindex_fighters();
+        } else if self.roster.project.authored != cancel_roster_before {
+            self.publish_cancel_rules();
         }
         self.perf.end("eff_editor", t);
         for removal in self.eff_editor.take_transplant_removals() {

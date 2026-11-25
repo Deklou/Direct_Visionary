@@ -1,7 +1,10 @@
 //! Per-move custom cancel rules. No custom cancel is enabled by default.
 
 use serde::{Deserialize, Deserializer, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use crate::roster::{RosterBacking, RosterKey};
+use crate::roster::edit_scope::{self, EditScope};
+use crate::roster::index::RosterIndex;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -86,6 +89,33 @@ impl CancelCondition {
     }
 }
 
+/// Saved owner and exact costume scope. A slot clone also retains its authored CSS identity.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CancelBinding {
+    pub scope: EditScope,
+    pub authored_name_id: Option<String>,
+}
+
+pub fn resolve_binding(
+    roster: &RosterIndex,
+    fighter: &str,
+    key: &RosterKey,
+    base_slots: &BTreeMap<String, Vec<u8>>,
+) -> Option<CancelBinding> {
+    let scope = edit_scope::resolve(roster, key, base_slots).ok()?;
+    if !scope.fighter.eq_ignore_ascii_case(fighter) {
+        return None;
+    }
+    let entry = roster.entries.iter().find(|entry| &entry.key == key)?;
+    let authored_name_id = match &entry.backing {
+        RosterBacking::Fighter => None,
+        RosterBacking::SlotClone { .. } => Some(
+            entry.name_id.as_ref().filter(|name| !name.is_empty())?.clone()
+        ),
+    };
+    Some(CancelBinding { scope, authored_name_id })
+}
+
 /// One window and one condition, authorizing any of the selected targets.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -96,6 +126,8 @@ pub struct CancelRule {
     pub start_frame: u8,
     pub end_frame: u8,
     pub sync_combo: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub binding: Option<CancelBinding>,
 }
 
 impl Default for CancelRule {
@@ -107,6 +139,7 @@ impl Default for CancelRule {
             start_frame: 4,
             end_frame: 10,
             sync_combo: false,
+            binding: None,
         }
     }
 }
@@ -192,6 +225,40 @@ pub fn scoped_wires(
     Ok(wires)
 }
 
+/// Only publish rules whose saved identity still resolves to the same costume set.
+pub fn resolved_wires(
+    store: &HashMap<String, HashMap<String, Vec<CancelRule>>>,
+    mut resolve: impl FnMut(&str, &RosterKey) -> Option<CancelBinding>,
+) -> Vec<CancelRuleWire> {
+    let mut cache = BTreeMap::new();
+    let mut wires = Vec::new();
+    for (fighter, moves) in store {
+        for (motion, rules) in moves {
+            for rule in rules.iter().filter(|rule| rule.enabled && rule.valid()) {
+                let Some(saved) = rule.binding.as_ref() else {
+                    continue;
+                };
+                let current = cache
+                    .entry((fighter.clone(), saved.scope.key.clone()))
+                    .or_insert_with(|| resolve(fighter, &saved.scope.key));
+                if current.as_ref() != Some(saved) {
+                    continue;
+                }
+                if let Ok(scoped) = scoped_wires(
+                    fighter, motion, std::slice::from_ref(rule), &saved.scope,
+                ) {
+                    wires.extend(scoped);
+                }
+            }
+        }
+    }
+    wires.sort_by(|a, b| {
+        (&a.fighter, a.motion, &a.costume_slots)
+            .cmp(&(&b.fighter, b.motion, &b.costume_slots))
+    });
+    wires
+}
+
 #[derive(Deserialize)]
 #[serde(default)]
 struct LegacyRule {
@@ -244,6 +311,7 @@ where
                     start_frame: rule.start_frame,
                     end_frame: rule.end_frame,
                     sync_combo: rule.sync_combo,
+                    binding: None,
                 }],
             };
             (motion, list)
@@ -254,6 +322,71 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn binding(slot: Option<u8>, slots: Vec<u8>, name: Option<&str>) -> CancelBinding {
+        CancelBinding {
+            scope: EditScope {
+                key: slot.map_or_else(|| RosterKey::fighter("mario"), |slot| RosterKey::slot("mario", slot)),
+                fighter: "mario".into(),
+                slots,
+            },
+            authored_name_id: name.map(str::to_owned),
+        }
+    }
+
+    fn bound_rule(binding: Option<CancelBinding>, target: CancelTarget) -> CancelRule {
+        CancelRule { enabled: true, binding, targets: vec![target], ..Default::default() }
+    }
+
+    #[test]
+    fn scoped_cancel_publication_keeps_three_logical_owners_separate() {
+        let vanilla = binding(None, (0..8).collect(), None);
+        let first = binding(Some(8), vec![8, 9], Some("first"));
+        let second = binding(Some(12), vec![12, 13], Some("second"));
+        let store = HashMap::from([("mario".into(), HashMap::from([(
+            "attack_11".into(), vec![
+                bound_rule(Some(vanilla.clone()), CancelTarget::Grab),
+                bound_rule(Some(first.clone()), CancelTarget::Jump),
+                bound_rule(Some(second.clone()), CancelTarget::Shield),
+                bound_rule(None, CancelTarget::TiltU),
+            ],
+        )]))]);
+        let wires = resolved_wires(&store, |_, key| {
+            [&vanilla, &first, &second].into_iter()
+                .find(|binding| &binding.scope.key == key).cloned()
+        });
+        assert_eq!(wires.len(), 3);
+        assert_eq!(wires[0].costume_slots, Some((0..8).collect()));
+        assert_eq!(wires[0].target, CancelTarget::Grab);
+        assert_eq!(wires[1].costume_slots, Some(vec![8, 9]));
+        assert_eq!(wires[1].target, CancelTarget::Jump);
+        assert_eq!(wires[2].costume_slots, Some(vec![12, 13]));
+        assert_eq!(wires[2].target, CancelTarget::Shield);
+    }
+
+    #[test]
+    fn scoped_cancel_publication_refuses_changed_or_missing_identity() {
+        let saved = binding(Some(8), vec![8, 9], Some("first"));
+        let store = HashMap::from([("mario".into(), HashMap::from([(
+            "attack_11".into(), vec![bound_rule(Some(saved.clone()), CancelTarget::Jump)],
+        )]))]);
+        assert!(resolved_wires(&store, |_, _| None).is_empty());
+        let changed_slots = binding(Some(8), vec![8, 10], Some("first"));
+        assert!(resolved_wires(&store, |_, _| Some(changed_slots.clone())).is_empty());
+        let changed_owner = binding(Some(8), vec![8, 9], Some("replacement"));
+        assert!(resolved_wires(&store, |_, _| Some(changed_owner.clone())).is_empty());
+        assert_eq!(resolved_wires(&store, |_, _| Some(saved.clone())).len(), 1);
+    }
+
+    #[test]
+    fn scoped_cancel_binding_survives_save_and_reload() {
+        let saved = binding(Some(8), vec![8, 9], Some("first"));
+        let original = bound_rule(Some(saved), CancelTarget::Jump);
+        let json = serde_json::to_string(&original).unwrap();
+        assert_eq!(serde_json::from_str::<CancelRule>(&json).unwrap(), original);
+        let legacy: CancelRule = serde_json::from_str(r#"{"enabled":true}"#).unwrap();
+        assert!(legacy.enabled && legacy.binding.is_none());
+    }
 
     #[derive(Deserialize)]
     struct Stored {
