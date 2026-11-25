@@ -6468,6 +6468,40 @@ mod tests {
             });
             assert!(expected == observed, "native emitter set changed: {}", set.name);
         }
+        // The same emitter bytes are insufficient if their backing resource indices
+        // now resolve to different textures, geometry or GPU programs.
+        let native_textures = original.texture_info.as_ref().expect("native textures");
+        let rebuilt_textures = actual.texture_info.as_ref().expect("rebuilt textures");
+        for native in &native_textures.descriptors {
+            assert!(rebuilt_textures.descriptors.iter().any(|d|
+                d.id == native.id && d.name == native.name),
+                "native texture descriptor missing: {}", native.name);
+        }
+        let native_primitives = original.primitive_info.as_ref().expect("native primitives");
+        for native in &native_primitives.descriptors {
+            let expected = geometry_for_id(&before, native.id).expect("native geometry");
+            let observed = geometry_for_id(&after, native.id).expect("rebuilt native geometry");
+            assert!(expected == observed, "native geometry changed: {:#x}", native.id);
+        }
+        let native_shader = original.shader_info.as_ref().expect("native shaders");
+        let rebuilt_shader = actual.shader_info.as_ref().expect("rebuilt shaders");
+        for (label, source, output) in [
+            ("standard", &native_shader.binary_data, &rebuilt_shader.binary_data),
+            ("compute", &native_shader.compute_binary, &rebuilt_shader.compute_binary),
+        ] {
+            let Some(source) = source.as_ref().filter(|bytes| !bytes.is_empty()) else { continue; };
+            let native_programs = effect_library::bnsh::BnshFile::read(source).expect("native BNSH");
+            let rebuilt_programs = effect_library::bnsh::BnshFile::read(
+                output.as_ref().expect("native shader container retained")
+            ).expect("rebuilt BNSH");
+            assert!(rebuilt_programs.variations.len() >= native_programs.variations.len());
+            for (index, (native, rebuilt)) in native_programs.variations.iter()
+                .zip(rebuilt_programs.variations.iter()).enumerate()
+            {
+                assert!(format!("{:?}", native.binary_program) == format!("{:?}", rebuilt.binary_program),
+                    "native {label} shader program changed at index {index}");
+            }
+        }
         let clone_idx = after.entry_names.iter().position(|n| n == &clone_name).unwrap();
         let clone_set = &actual.emitter_list.emitter_sets[
             after.entries[clone_idx].emitter_set_id as usize - 1
