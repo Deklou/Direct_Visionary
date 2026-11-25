@@ -487,11 +487,25 @@ fn retire_private_clone(manager: *mut u64, owner: u32) {
 }
 
 pub(super) fn private_clone_alias(hash: u64, target: crate::slight::rule_scope::RuntimeTarget) -> Option<u64> {
-    (PRIVATE_CLONE_PHASE.load(Ordering::Acquire) == 2
-        && target.fighter_kind == *smash::lib::lua_const::FIGHTER_KIND_KIRBY
-        && target.costume == 0
-        && hash == smash::hash40("kirby_dash"))
-        .then(|| smash::hash40(PRIVATE_CLONE_NAME))
+    if PRIVATE_CLONE_PHASE.load(Ordering::Acquire) != 2
+        || target.fighter_kind != *smash::lib::lua_const::FIGHTER_KIND_KIRBY
+        || hash != smash::hash40("kirby_dash")
+    {
+        return None;
+    }
+    static ALIASED: AtomicBool = AtomicBool::new(false);
+    static EXCLUDED: AtomicBool = AtomicBool::new(false);
+    if target.costume == 0 {
+        if !ALIASED.swap(true, Ordering::Relaxed) {
+            skyline::println!("[SLight] PRIVATE_CLONE alias hit costume=0");
+        }
+        Some(smash::hash40(PRIVATE_CLONE_NAME))
+    } else {
+        if !EXCLUDED.swap(true, Ordering::Relaxed) {
+            skyline::println!("[SLight] PRIVATE_CLONE alias excluded costume={}", target.costume);
+        }
+        None
+    }
 }
 
 /// Observe emitter-set construction for the donor co-load diagnostics.
