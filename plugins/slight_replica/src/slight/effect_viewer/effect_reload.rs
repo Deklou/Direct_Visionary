@@ -256,216 +256,159 @@ unsafe fn private_probe_ptcl(
     Some(buffer as *const u8)
 }
 
-// Independent clone probe: the native loader keeps its ordinary ARC reference, but
-// its synthetic handle receives our private *whole EFFN* (not just its PTCL).
-// Only a single, explicitly staged Kirby dash clone is accepted in this experiment.
-// No global callback, native-name registration, hidden item or manual hash-map edit.
-const PRIVATE_CLONE_FILE: &str = "sd:/slight/debug/private_carrier_clone.eff";
-const PRIVATE_CLONE_NAME: &str = "vsnedit_kirby_dash";
-const PRIVATE_CLONE_HANDLE: u32 = 0x7f00_0001;
+// Scoped live carrier v1. One private EFF, one entry, one exclusive vanilla
+// costume group. The native fighter folder is only a residency anchor; its ARC
+// file, names and handle are never changed. No hidden item and no legacy globals.
 const PRIVATE_CLONE_LOAD_SITE: usize = 0x35609ac;
 const PRIVATE_CLONE_CLEAR_SITE: usize = 0x355f9f4;
-static PRIVATE_CLONE_STAGE: LazyLock<Mutex<Option<Vec<u8>>>> =
-    LazyLock::new(|| Mutex::new(None));
-static PRIVATE_CLONE_ARMED: AtomicBool = AtomicBool::new(false);
-// 0 idle, 1 constructing, 2 published, 3 retiring, 4 finished/refused.
+static PRIVATE_LIVE_SUPPORTED: AtomicBool = AtomicBool::new(false);
+static PRIVATE_LIVE_NEXT_HANDLE: AtomicU64 = AtomicU64::new(0x7f00_0001);
+static PRIVATE_LIVE_HANDLE: AtomicU64 = AtomicU64::new(0);
+// 0 idle, 1 constructing, 2 published, 3 retiring, 4 cleared, 5 quarantined.
 static PRIVATE_CLONE_PHASE: AtomicU64 = AtomicU64::new(0);
 static PRIVATE_CLONE_MANAGER: AtomicUsize = AtomicUsize::new(0);
 static PRIVATE_CLONE_OWNER: AtomicU64 = AtomicU64::new(0);
 static PRIVATE_CLONE_BUFFER: AtomicUsize = AtomicUsize::new(0);
 static PRIVATE_CLONE_SLOT: AtomicUsize = AtomicUsize::new(0);
+static PRIVATE_LIVE_HIT: AtomicBool = AtomicBool::new(false);
+struct PrivateLiveRequest {
+    preview: crate::slight::rule_scope::ScopedEffPreview,
+    bytes: Vec<u8>,
+    from: u64,
+    to: u64,
+}
+static PRIVATE_LIVE_PENDING: LazyLock<Mutex<Option<PrivateLiveRequest>>> =
+    LazyLock::new(|| Mutex::new(None));
+static PRIVATE_LIVE_DIRTY: AtomicBool = AtomicBool::new(false);
+static PRIVATE_LIVE_ACTIVE: LazyLock<Mutex<Option<(crate::slight::rule_scope::ScopedEffPreview, u64, u64)>>> =
+    LazyLock::new(|| Mutex::new(None));
 thread_local! {
-    static PRIVATE_CLONE_PENDING: std::cell::Cell<(usize, usize)> =
-        const { std::cell::Cell::new((0, 0)) };
+    static PRIVATE_CLONE_PENDING: std::cell::Cell<(usize, u32, usize)> =
+        const { std::cell::Cell::new((0, 0, 0)) };
 }
 
-fn valid_private_clone(bytes: &[u8]) -> bool {
-    if bytes.len() < 0x1020 || bytes.len() >= 4 * 1024 * 1024
-        || &bytes[..4] != b"EFFN"
-        || bytes[8..16] != [1, 0, 0, 0, 0, 0, 1, 0]
-        || bytes[20..24] == [0, 0, 0, 0]
-        || bytes[24..32] != [0; 8]
-        || &bytes[32..32 + PRIVATE_CLONE_NAME.len()] != PRIVATE_CLONE_NAME.as_bytes()
-        || bytes[32 + PRIVATE_CLONE_NAME.len()] != 0
-        || &bytes[0x1000..0x1004] != b"VFXB"
-        || bytes[0x100a..0x100c] != [0x16, 0]
-        || bytes[0x100e] != 12
-    {
-        return false;
-    }
-    let declared = u32::from_le_bytes(bytes[0x101c..0x1020].try_into().unwrap()) as usize;
-    declared == bytes.len() - 0x1000
+pub fn private_live_supported() -> bool {
+    PRIVATE_LIVE_SUPPORTED.load(Ordering::Acquire)
 }
 
-fn prepare_private_clone_probe() -> bool {
+fn prepare_private_live() -> bool {
     if !crate::slight::ver::is_13_0_5() {
         return false;
     }
-    let Ok(meta) = std::fs::metadata(PRIVATE_CLONE_FILE) else { return false; };
-    if meta.len() < 0x1020 || meta.len() >= 4 * 1024 * 1024 {
-        skyline::println!("[SLight] PRIVATE_CLONE refused: file length");
-        return false;
-    }
-    let Ok(bytes) = std::fs::read(PRIVATE_CLONE_FILE) else { return false; };
-    if !valid_private_clone(&bytes) {
-        skyline::println!("[SLight] PRIVATE_CLONE refused: EFFN/VFXB layout");
-        return false;
-    }
-    // 13.0.5 ONLY. Verify exact instructions before installing either interior hook.
-    // load: mov w8,#0xa8; madd x8,x24,x8,x21; mov w9,#0x8010 ...
-    // clear: immediately AFTER the native zero-store to slot+0x10.
     let text = unsafe { skyline::hooks::getRegionAddress(skyline::hooks::Region::Text) as usize };
-    let matches = unsafe {
+    unsafe {
         std::slice::from_raw_parts((text + PRIVATE_CLONE_LOAD_SITE) as *const u8, 20)
             == [0x08,0x15,0x80,0x52,0x08,0x57,0x08,0x9b,0x09,0x02,0x90,0x52,0x29,0x00,0xa0,0x72,0x0b,0x69,0x29,0xf8]
         && std::slice::from_raw_parts((text + PRIVATE_CLONE_CLEAR_SITE - 4) as *const u8, 28)
             == [0x1f,0x69,0x29,0xf8,0x09,0x00,0x80,0x12,0x09,0x03,0x00,0xb9,0x49,0x01,0x00,0xb9,0x09,0x06,0x90,0x52,0x29,0x00,0xa0,0x72,0x1f,0x69,0x29,0xb8]
-    };
-    if !matches {
-        skyline::println!("[SLight] PRIVATE_CLONE refused: native instruction signature");
-        return false;
     }
-    *PRIVATE_CLONE_STAGE.lock() = Some(bytes);
-    PRIVATE_CLONE_ARMED.store(true, Ordering::Release);
-    skyline::println!("[SLight] PRIVATE_CLONE armed");
-    true
 }
 
-// x21 = manager; w26 = requested handle; x24 = newly reserved slot index;
-// x11 = resident EFFN pointer. Substitution occurs before the native store,
-// PTCL construction AND kind registration, so all three use the same buffer.
+fn private_live_request(preview: crate::slight::rule_scope::ScopedEffPreview) -> Option<PrivateLiveRequest> {
+    if !private_live_supported() || !preview.valid()
+        || crate::slight::slight_consts::fighters::game_kind_name(preview.fighter_kind) != Some(preview.fighter.as_str())
+    {
+        return None;
+    }
+    let path = format!("sd:/{}", preview.private_sd_rel_path());
+    let size = std::fs::metadata(&path).ok()?.len();
+    if !(0x1020..4 * 1024 * 1024).contains(&size) {
+        return None;
+    }
+    let bytes = std::fs::read(&path).ok()?;
+    if bytes.len() != size as usize || &bytes[..4] != b"EFFN"
+        || bytes[8..16] != [1,0,0,0,0,0,1,0]
+        || bytes[20..24] == [0; 4] || bytes[24..32] != [0; 8]
+        || &bytes[0x1000..0x1004] != b"VFXB"
+        || bytes[0x100a..0x100c] != [0x16,0] || bytes[0x100e] != 12
+        || u32::from_le_bytes(bytes[0x101c..0x1020].try_into().ok()?) as usize != bytes.len() - 0x1000
+    {
+        return None;
+    }
+    let end = bytes[32..0x1000].iter().position(|b| *b == 0)? + 32;
+    let name = std::str::from_utf8(&bytes[32..end]).ok()?;
+    let original = name.strip_prefix("vsnedit_")?;
+    if original.len() > 80 || !original.starts_with(&format!("{}_", preview.fighter))
+        || !original.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+    {
+        return None;
+    }
+    let from = smash::hash40(original);
+    let to = smash::hash40(name);
+    if from == to { return None; }
+    Some(PrivateLiveRequest { preview, bytes, from, to })
+}
+
+pub fn replace_private_live_preview(preview: Option<crate::slight::rule_scope::ScopedEffPreview>) {
+    if !private_live_supported() { return; }
+    if let Some(p) = preview.as_ref() {
+        let active = PRIVATE_LIVE_ACTIVE.lock();
+        if PRIVATE_CLONE_PHASE.load(Ordering::Acquire) == 2
+            && active.as_ref().is_some_and(|(a, _, _)| a == p)
+            && !PRIVATE_LIVE_DIRTY.load(Ordering::Acquire)
+        {
+            return;
+        }
+    }
+    let expected = preview.is_some();
+    let request = preview.and_then(private_live_request);
+    if expected && request.is_none() {
+        skyline::println!("[SLight] PRIVATE_LIVE request rejected; restoring native");
+    } else {
+        skyline::println!("[SLight] PRIVATE_LIVE snapshot queued active={}", request.is_some());
+    }
+    let mut pending = PRIVATE_LIVE_PENDING.lock();
+    *pending = request;
+    PRIVATE_LIVE_DIRTY.store(true, Ordering::Release);
+}
+
+// x21=manager, w26=requested handle, x24=new slot index, x11=EFFN pointer.
+// Same two validated sites as the one-shot clone probe. The private pointer
+// feeds the native slot, PTCL builder and name registration.
 #[skyline::hook(offset = PRIVATE_CLONE_LOAD_SITE, inline)]
 unsafe fn hook_private_clone_pointer(ctx: &mut skyline::hooks::InlineCtx) {
-    let (manager, buffer) = PRIVATE_CLONE_PENDING.with(|p| p.get());
+    let (manager, handle, buffer) = PRIVATE_CLONE_PENDING.with(|p| p.get());
     if manager == 0 || buffer == 0 || ctx.registers[21].x() as usize != manager
-        || ctx.registers[26].w() != PRIVATE_CLONE_HANDLE || ctx.registers[24].x() >= 30
+        || ctx.registers[26].w() != handle || ctx.registers[24].x() >= 30
     {
         return;
     }
     let slot = manager + 0x18000 + ctx.registers[24].x() as usize * 0xa8;
-    if *(slot as *const u32) != PRIVATE_CLONE_HANDLE {
-        return;
-    }
+    if *(slot as *const u32) != handle { return; }
     PRIVATE_CLONE_SLOT.store(slot, Ordering::Release);
     ctx.registers[11].set_x(buffer as u64);
 }
 
-// This hook runs AFTER the native kind/handle removal, VFX destruction, ARC
-// decref and EFFN pointer clear, with the original slot still locked and named.
-// The exact slot address AND synthetic handle must match our allocation.
-// A missed acknowledgement intentionally leaks one bounded allocation, never
-// frees through a guessed owner or reuses a possibly-live GPU buffer.
 #[skyline::hook(offset = PRIVATE_CLONE_CLEAR_SITE, inline)]
 unsafe fn hook_private_clone_clear(ctx: &mut skyline::hooks::InlineCtx) {
     let slot = PRIVATE_CLONE_SLOT.load(Ordering::Acquire);
     let manager = PRIVATE_CLONE_MANAGER.load(Ordering::Acquire);
-    if slot == 0 || manager == 0 || ctx.registers[25].x() as usize != manager
+    let handle = PRIVATE_LIVE_HANDLE.load(Ordering::Acquire) as u32;
+    if slot == 0 || manager == 0 || handle == 0 || ctx.registers[25].x() as usize != manager
         || ctx.registers[23].x() >= 30
         || manager + 0x18000 + ctx.registers[23].x() as usize * 0xa8 != slot
         || ctx.registers[24].x() as usize != slot
-        || *(slot as *const u32) != PRIVATE_CLONE_HANDLE
-        || *((slot + 0x10) as *const usize) != 0
+        || *(slot as *const u32) != handle || *((slot + 0x10) as *const usize) != 0
     {
         return;
     }
-    PRIVATE_CLONE_PHASE.store(4, Ordering::Release);
+    // Native names, handle, VFX and ARC references have already been destroyed.
     let buffer = PRIVATE_CLONE_BUFFER.swap(0, Ordering::AcqRel);
     PRIVATE_CLONE_SLOT.store(0, Ordering::Release);
     if buffer != 0 {
         game_effect_free(manager as *mut u64, buffer as *mut u8);
-        skyline::println!("[SLight] PRIVATE_CLONE native retirement released={buffer:#x}");
+        skyline::println!("[SLight] PRIVATE_LIVE released handle={handle} buffer={buffer:#x}");
     }
+    PRIVATE_CLONE_PHASE.store(4, Ordering::Release);
 }
 
 unsafe fn game_effect_free(manager: *mut u64, buffer: *mut u8) {
-    // Same native allocator object and virtual free entry used by a4d10.
     let obj = (manager as usize + 0x194d8) as *mut u64;
     let vtable = *obj as usize;
-    if vtable == 0 || buffer.is_null() {
-        return;
-    }
+    if vtable == 0 || buffer.is_null() { return; }
     let free: extern "C" fn(*mut u64, *mut u8) =
         std::mem::transmute(*((vtable + 0x18) as *const usize));
     free(obj, buffer);
-}
-
-unsafe fn begin_private_clone(manager: *mut u64, owner: u32, idx: u32, result: u32) -> Option<usize> {
-    if result != 1 || !PRIVATE_CLONE_ARMED.load(Ordering::Acquire) || manager.is_null()
-        || owner == PRIVATE_CLONE_HANDLE
-        || path_hash_from_search_index(idx) != Some(smash::hash40("effect/assist/bomberman"))
-        || crate::slight::effect_viewer::resource_reload::resident_len(
-            smash::hash40("effect/assist/bomberman/ef_bomberman.eff"),
-        ) != Some(PRIVATE_PROBE_ORIGINAL_LEN)
-    {
-        return None;
-    }
-    let mutex = (manager as usize + 0x19498) as *mut u8;
-    mgr_mutex_lock(mutex);
-    let can_load = carrier_manager_slot(manager, owner, smash::hash40("effect/assist/bomberman"))
-        .is_some_and(|s| *((s + 0x98) as *const i32) > 0)
-        && manager_slot_for_handle(manager, PRIVATE_CLONE_HANDLE).is_none()
-        && kind_lookup(manager, smash::hash40(PRIVATE_CLONE_NAME)).is_none()
-        && (0..30).any(|i| *((manager as usize + 0x18000 + i * 0xa8) as *const i32) == -1);
-    mgr_mutex_unlock(mutex);
-    if !can_load {
-        skyline::println!("[SLight] PRIVATE_CLONE refused: owner/handle/kind/slot");
-        return None;
-    }
-    if !PRIVATE_CLONE_ARMED.swap(false, Ordering::AcqRel) {
-        return None;
-    }
-    let bytes = PRIVATE_CLONE_STAGE.lock().take()?;
-    let size = (bytes.len() + 0xfff) & !0xfff;
-    let buffer = game_effect_alloc(manager, size, 0x1000);
-    if buffer.is_null() {
-        skyline::println!("[SLight] PRIVATE_CLONE native allocation failed");
-        return None;
-    }
-    if buffer as usize & 0xfff != 0 {
-        game_effect_free(manager, buffer);
-        skyline::println!("[SLight] PRIVATE_CLONE native alignment failed");
-        return None;
-    }
-    std::ptr::write_bytes(buffer, 0, size);
-    std::ptr::copy_nonoverlapping(bytes.as_ptr(), buffer, bytes.len());
-    PRIVATE_CLONE_MANAGER.store(manager as usize, Ordering::Release);
-    PRIVATE_CLONE_OWNER.store(owner as u64, Ordering::Release);
-    PRIVATE_CLONE_BUFFER.store(buffer as usize, Ordering::Release);
-    PRIVATE_CLONE_PHASE.store(1, Ordering::Release);
-    skyline::println!("[SLight] PRIVATE_CLONE allocated={:#x} bytes={} owner={owner} handle={PRIVATE_CLONE_HANDLE}", buffer as usize, bytes.len());
-    Some(buffer as usize)
-}
-
-unsafe fn finish_private_clone(manager: *mut u64, buffer: usize, result: u32) {
-    let slot = PRIVATE_CLONE_SLOT.load(Ordering::Acquire);
-    if slot == 0 {
-        // The private pointer was never given to the engine. Do not touch any
-        // unexpected native handle that may have caused an early return.
-        if PRIVATE_CLONE_BUFFER.compare_exchange(buffer, 0, Ordering::AcqRel, Ordering::Acquire).is_ok() {
-            game_effect_free(manager, buffer as *mut u8);
-            skyline::println!("[SLight] PRIVATE_CLONE not substituted result={result}");
-        }
-        PRIVATE_CLONE_PHASE.store(4, Ordering::Release);
-        return;
-    }
-    let mutex = (manager as usize + 0x19498) as *mut u8;
-    mgr_mutex_lock(mutex);
-    let owned = carrier_manager_slot(manager, PRIVATE_CLONE_HANDLE, smash::hash40("effect/assist/bomberman")) == Some(slot)
-        && *((slot + 0x10) as *const usize) == buffer;
-    let registered = owned && kind_lookup(manager, smash::hash40(PRIVATE_CLONE_NAME)) == Some((PRIVATE_CLONE_HANDLE, 0));
-    mgr_mutex_unlock(mutex);
-    skyline::println!("[SLight] PRIVATE_CLONE load result={result} slot={slot:#x} owned={owned} registered={registered}");
-    if result == 1 && registered
-        && PRIVATE_CLONE_PHASE.compare_exchange(1, 2, Ordering::AcqRel, Ordering::Acquire).is_ok()
-    {
-        return;
-    }
-    let _ = PRIVATE_CLONE_PHASE.compare_exchange(1, 3, Ordering::AcqRel, Ordering::Acquire);
-    if owned && result == 1 && PRIVATE_CLONE_PHASE.load(Ordering::Acquire) == 3 {
-        unload_effects(manager, PRIVATE_CLONE_HANDLE);
-    }
-    // A failed construction may have retained native references. Keep the
-    // allocation bounded until native cleanup (or process exit) in that case.
 }
 
 fn retire_private_clone(manager: *mut u64, owner: u32) {
@@ -474,37 +417,174 @@ fn retire_private_clone(manager: *mut u64, owner: u32) {
     {
         return;
     }
+    retire_private_live(manager);
+}
+
+fn retire_private_live(manager: *mut u64) {
     let state = PRIVATE_CLONE_PHASE.load(Ordering::Acquire);
     if matches!(state, 1 | 2)
         && PRIVATE_CLONE_PHASE.compare_exchange(state, 3, Ordering::AcqRel, Ordering::Acquire).is_ok()
     {
-        skyline::println!("[SLight] PRIVATE_CLONE retirement requested owner={owner}");
+        let handle = PRIVATE_LIVE_HANDLE.load(Ordering::Acquire) as u32;
+        skyline::println!("[SLight] PRIVATE_LIVE retirement requested handle={handle}");
         if state == 2 {
-            unsafe { unload_effects(manager, PRIVATE_CLONE_HANDLE) };
+            unsafe { unload_effects(manager, handle) };
         }
-        // If construction is still in flight, finish_private_clone retires it.
+        // If still constructing, the construction path releases its reference.
     }
 }
 
 pub(super) fn private_clone_alias(hash: u64, target: crate::slight::rule_scope::RuntimeTarget) -> Option<u64> {
-    if PRIVATE_CLONE_PHASE.load(Ordering::Acquire) != 2
-        || target.fighter_kind != *smash::lib::lua_const::FIGHTER_KIND_KIRBY
-        || hash != smash::hash40("kirby_dash")
+    if PRIVATE_CLONE_PHASE.load(Ordering::Acquire) != 2 { return None; }
+    let active = PRIVATE_LIVE_ACTIVE.try_lock()?;
+    let (preview, from, to) = active.as_ref()?;
+    if hash != *from || !target.matches(Some(preview.fighter_kind), Some(&preview.costume_slots))
+        || PRIVATE_CLONE_PHASE.load(Ordering::Acquire) != 2
     {
         return None;
     }
-    static ALIASED: AtomicBool = AtomicBool::new(false);
-    static EXCLUDED: AtomicBool = AtomicBool::new(false);
-    if target.costume == 0 {
-        if !ALIASED.swap(true, Ordering::Relaxed) {
-            skyline::println!("[SLight] PRIVATE_CLONE alias hit costume=0");
+    if !PRIVATE_LIVE_HIT.swap(true, Ordering::Relaxed) {
+        skyline::println!("[SLight] PRIVATE_LIVE alias hit fighter={} costume={} from={from:#x} to={to:#x}", preview.fighter, target.costume);
+    }
+    Some(*to)
+}
+
+pub(super) fn private_live_has_alias() -> bool {
+    PRIVATE_CLONE_PHASE.load(Ordering::Acquire) == 2
+}
+
+fn pump_private_live() {
+    if !private_live_supported() { return; }
+    let phase = PRIVATE_CLONE_PHASE.load(Ordering::Acquire);
+    if phase == 0 && !PRIVATE_LIVE_DIRTY.load(Ordering::Acquire) { return; }
+    let manager = effect_manager();
+    if manager.is_null() { return; }
+    if phase == 4 {
+        // Never recycle an identity until native retirement explicitly acknowledged.
+        *PRIVATE_LIVE_ACTIVE.lock() = None;
+        PRIVATE_CLONE_MANAGER.store(0, Ordering::Release);
+        PRIVATE_CLONE_OWNER.store(0, Ordering::Release);
+        PRIVATE_LIVE_HANDLE.store(0, Ordering::Release);
+        PRIVATE_CLONE_PHASE.store(0, Ordering::Release);
+    } else if phase != 0 {
+        if phase == 2 && PRIVATE_LIVE_DIRTY.load(Ordering::Acquire)
+            && manager as usize == PRIVATE_CLONE_MANAGER.load(Ordering::Acquire)
+        {
+            retire_private_live(manager);
         }
-        Some(smash::hash40(PRIVATE_CLONE_NAME))
-    } else {
-        if !EXCLUDED.swap(true, Ordering::Relaxed) {
-            skyline::println!("[SLight] PRIVATE_CLONE alias excluded costume={}", target.costume);
+        return;
+    }
+    if !PRIVATE_LIVE_DIRTY.load(Ordering::Acquire) { return; }
+    // Only use an already-resident, uniquely identified fighter's native folder.
+    // Do not force directory loads, mutate ARC metadata or overwrite the live file.
+    let mut pending = match PRIVATE_LIVE_PENDING.try_lock() { Some(p) => p, None => return };
+    let Some(request) = pending.as_ref() else {
+        PRIVATE_LIVE_DIRTY.store(false, Ordering::Release);
+        skyline::println!("[SLight] PRIVATE_LIVE cleared");
+        return;
+    };
+    let folder = format!("effect/fighter/{}", request.preview.fighter);
+    let folder_hash = smash::hash40(&folder);
+    let Some((owner, idx)) = (|| {
+        let slots = ACTIVE_SLOTS.try_lock()?;
+        let owner = unique_carrier_handle(&slots, folder_hash)?;
+        Some((owner, slots.get(&owner)?.search_index))
+    })() else { return; };
+    if !crate::slight::effect_viewer::resource_reload::resident_file_state(smash::hash40(&request.preview.arc_path()))
+        .is_some_and(|file| file.filepath_loaded && file.data != 0 && file.ref_count > 0)
+    {
+        return;
+    }
+    let handle64 = PRIVATE_LIVE_NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
+    if handle64 >= 0x7fff_ffff { return; }
+    let handle = handle64 as u32;
+    let mutex = (manager as usize + 0x19498) as *mut u8;
+    let can_load = unsafe {
+        // Nonblocking acquisition of the exact 13.0.5 native manager mutex
+        // used by the game's own retirement path.
+        let text = skyline::hooks::getRegionAddress(skyline::hooks::Region::Text) as usize;
+        let try_lock: extern "C" fn(*mut u8) -> bool = std::mem::transmute(text + 0x39c60d0);
+        if !try_lock(mutex) { return; }
+        let good = carrier_manager_slot(manager, owner, folder_hash)
+            .is_some_and(|s| *((s + 0x98) as *const i32) > 0)
+            && manager_slot_for_handle(manager, handle).is_none()
+            && kind_lookup(manager, request.to).is_none()
+            && kind_lookup(manager, request.from).is_some_and(|(h, _)| h == owner)
+            && (0..30).any(|i| *((manager as usize + 0x18000 + i * 0xa8) as *const i32) == -1);
+        mgr_mutex_unlock(mutex);
+        good
+    };
+    let request = pending.take().unwrap();
+    PRIVATE_LIVE_DIRTY.store(false, Ordering::Release);
+    drop(pending);
+    if !can_load {
+        skyline::println!("[SLight] PRIVATE_LIVE refused: owner/handle/kind/slot");
+        return;
+    }
+    let size = (request.bytes.len() + 0xfff) & !0xfff;
+    let buffer = unsafe { game_effect_alloc(manager, size, 0x1000) };
+    if buffer.is_null() {
+        skyline::println!("[SLight] PRIVATE_LIVE allocation refused");
+        return;
+    }
+    if buffer as usize & 0xfff != 0 {
+        unsafe { game_effect_free(manager, buffer) };
+        return;
+    }
+    unsafe {
+        std::ptr::write_bytes(buffer, 0, size);
+        std::ptr::copy_nonoverlapping(request.bytes.as_ptr(), buffer, request.bytes.len());
+    }
+    let to = request.to;
+    *PRIVATE_LIVE_ACTIVE.lock() = Some((request.preview, request.from, to));
+    PRIVATE_LIVE_HIT.store(false, Ordering::Relaxed);
+    PRIVATE_LIVE_HANDLE.store(handle64, Ordering::Release);
+    PRIVATE_CLONE_MANAGER.store(manager as usize, Ordering::Release);
+    PRIVATE_CLONE_OWNER.store(owner as u64, Ordering::Release);
+    PRIVATE_CLONE_BUFFER.store(buffer as usize, Ordering::Release);
+    PRIVATE_CLONE_PHASE.store(1, Ordering::Release);
+    skyline::println!("[SLight] PRIVATE_LIVE allocated handle={handle} owner={owner} bytes={}", request.bytes.len());
+    let previous = PRIVATE_CLONE_PENDING.with(|p| p.replace((manager as usize, handle, buffer as usize)));
+    // Experimental: invoke the native loader from the single game-thread pump,
+    // using a fighter folder which is already resident. Rendering from this
+    // context still needs in-game validation; never force readiness state.
+    let result = unsafe { load_effects(manager, handle, &idx) };
+    PRIVATE_CLONE_PENDING.with(|p| p.set(previous));
+    let slot = PRIVATE_CLONE_SLOT.load(Ordering::Acquire);
+    if slot == 0 {
+        if PRIVATE_CLONE_BUFFER.compare_exchange(buffer as usize, 0, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+            unsafe { game_effect_free(manager, buffer) };
+            skyline::println!("[SLight] PRIVATE_LIVE pointer not substituted result={result}");
         }
-        None
+        // Successful native load without the expected substitution is not a safe
+        // candidate for cleanup by us. Stop accepting generations in this session.
+        if PRIVATE_CLONE_PHASE.load(Ordering::Acquire) != 4 {
+            PRIVATE_CLONE_PHASE.store(5, Ordering::Release);
+        }
+        return;
+    }
+    let (owned, registered) = unsafe {
+        mgr_mutex_lock(mutex);
+        let owned = carrier_manager_slot(manager, handle, folder_hash) == Some(slot)
+            && *((slot + 0x10) as *const usize) == buffer as usize;
+        let owner_still_live = carrier_manager_slot(manager, owner, folder_hash)
+            .is_some_and(|s| *((s + 0x98) as *const i32) > 0);
+        let registered = owned && owner_still_live && kind_lookup(manager, to) == Some((handle, 0));
+        mgr_mutex_unlock(mutex);
+        (owned, registered)
+    };
+    skyline::println!("[SLight] PRIVATE_LIVE load result={result} owned={owned} registered={registered} handle={handle}");
+    if result == 1 && registered
+        && PRIVATE_CLONE_PHASE.compare_exchange(1, 2, Ordering::AcqRel, Ordering::Acquire).is_ok()
+    {
+        return;
+    }
+    let _ = PRIVATE_CLONE_PHASE.compare_exchange(1, 3, Ordering::AcqRel, Ordering::Acquire);
+    if owned && result == 1 && PRIVATE_CLONE_PHASE.load(Ordering::Acquire) == 3 {
+        unsafe { unload_effects(manager, handle) };
+    } else if PRIVATE_CLONE_PHASE.load(Ordering::Acquire) != 4 {
+        // Unknown ownership: fail closed and retain at most one bounded allocation.
+        PRIVATE_CLONE_PHASE.store(5, Ordering::Release);
     }
 }
 
@@ -1409,6 +1489,14 @@ unsafe fn capture_backtrace() -> Vec<usize> {
 
 #[skyline::hook(offset = crate::slight::ver::o(LOAD_EFFECTS_OFFSET))]
 fn hook_load_effects(manager: *mut u64, handle: u32, search_index: &u32) -> u32 {
+    // The synthetic load belongs to the private state machine, not to the
+    // map of native fighter/assist owners. Never enqueue it as a legacy donor.
+    if PRIVATE_CLONE_PENDING.with(|p| {
+        let (m, h, b) = p.get();
+        m == manager as usize && h == handle && b != 0
+    }) {
+        return original!()(manager, handle, search_index);
+    }
     LOAD_HOOK_CALLS.fetch_add(1, Ordering::Relaxed);
     // This hook runs on the game's LOADING thread. Everything below that writes to the SD card
     // is research instrumentation and stays behind the trace opt-in — see `trace_enabled`.
@@ -1440,12 +1528,6 @@ fn hook_load_effects(manager: *mut u64, handle: u32, search_index: &u32) -> u32 
     let previous = PRIVATE_PROBE_MANAGER.with(|m| m.replace(probe_manager));
     let result = original!()(manager, handle, search_index);
     PRIVATE_PROBE_MANAGER.with(|m| m.set(previous));
-    if let Some(buffer) = unsafe { begin_private_clone(manager, handle, *search_index, result) } {
-        let previous = PRIVATE_CLONE_PENDING.with(|p| p.replace((manager as usize, buffer)));
-        let clone_result = original!()(manager, PRIVATE_CLONE_HANDLE, search_index);
-        PRIVATE_CLONE_PENDING.with(|p| p.set(previous));
-        unsafe { finish_private_clone(manager, buffer, clone_result) };
-    }
     if mark_game_alucard {
         GAME_ALUCARD_LOADING.store(false, Ordering::Relaxed);
     }
@@ -4402,12 +4484,12 @@ pub fn install_hooks() {
         skyline::install_hook!(hook_readiness);
         skyline::install_hook!(hook_drain_queue);
     }
-    let clone_probe = prepare_private_clone_probe();
-    if clone_probe {
+    if prepare_private_live() {
         skyline::install_hook!(hook_private_clone_pointer);
         skyline::install_hook!(hook_private_clone_clear);
+        PRIVATE_LIVE_SUPPORTED.store(true, Ordering::Release);
     }
-    let private_probe = !clone_probe && prepare_private_buffer_probe();
+    let private_probe = prepare_private_buffer_probe();
     if trace || private_probe {
         skyline::install_hook!(hook_build_effect_set);
     }
@@ -4504,6 +4586,7 @@ pub fn carrier_kind_count() -> usize {
 /// the overwhelmingly common case.
 static LAST_CARRIER_REPORT: AtomicU64 = AtomicU64::new(u64::MAX);
 pub fn pump_carrier_status() {
+    pump_private_live();
     let state = AUTO_CARRIER_STATE.load(Ordering::Relaxed) as u64;
     let kinds = match AUTO_CARRIER_KINDS.try_lock() {
         Some(k) => k.len() as u64,

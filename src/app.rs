@@ -31040,10 +31040,10 @@ If you step every basis for a                          type and NONE of them mat
             return "EFF preview refused: unknown fighter.".into();
         };
         let Some(eff) = self.eff_mods.get(&fighter) else {
-            return "EFF preview cleared; re-enter the match for original effects.".into();
+            return "Private EFF live clear queued; original requests restored.".into();
         };
         if eff.is_empty() {
-            return "EFF preview cleared; re-enter the match for original effects.".into();
+            return "Private EFF live clear queued; original requests restored.".into();
         }
         let own_prefix = format!("{fighter}_");
         let canonical = format!("effect/fighter/{fighter}/ef_{fighter}.eff");
@@ -31076,9 +31076,9 @@ If you step every basis for a                          type and NONE of them mat
         if eff.authored.iter().any(|edit| !source.entry_names.iter().any(|name| name.eq_ignore_ascii_case(&edit.entry_name))) {
             return "EFF preview refused: an edited entry is missing from the original file.".into();
         }
-        let merged = match crate::eff_export::rebuild_eff_bytes(&bytes, eff, Some(root)) {
+        let merged = match crate::eff_export::build_private_live_preview(&bytes, eff, root) {
             Ok(bytes) => bytes,
-            Err(error) => return format!("EFF preview build failed: {error}"),
+            Err(error) => return format!("Private EFF live build refused: {error}"),
         };
         let Some(sd) = crate::scratch_dirs::emulator_sd_root() else {
             return "EFF preview: emulator SD root not found.".into();
@@ -31092,7 +31092,7 @@ If you step every basis for a                          type and NONE of them mat
         if !preview.valid() {
             return "EFF preview refused: invalid identity.".into();
         }
-        let path = sd.join(preview.sd_rel_path());
+        let path = sd.join(preview.private_sd_rel_path());
         let Some(parent) = path.parent() else { return "EFF preview path invalid.".into(); };
         let write = std::fs::create_dir_all(parent).and_then(|_| {
             let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&path)?;
@@ -31105,7 +31105,7 @@ If you step every basis for a                          type and NONE of them mat
             return "EFF preview not sent: connection changed.".into();
         }
         self.scoped_eff_preview = Some(preview);
-        "EFF preview queued for next match entry; mid-match carrier remains disabled.".into()
+        "Private EFF live snapshot queued; native loading and rendering are experimental (see PRIVATE_LIVE log).".into()
     }
 
     /// Service an eff-editor "apply authored edits to the game" request.

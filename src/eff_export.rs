@@ -39,6 +39,71 @@ pub fn rebuild_eff_bytes(
     rebuild_eff_bytes_filtered(src_bytes, eff, donor_root, |_| true)
 }
 
+/// First live-private preview: exactly one own-fighter, single-part emitter entry.
+/// The proven compact carrier exporter does the resource remapping; only the private
+/// name survives the EFFN header. The runtime never replaces the native ARC file.
+pub fn build_private_live_preview(
+    source_bytes: &[u8],
+    eff: &EffMod,
+    root: &std::path::Path,
+) -> Result<Vec<u8>> {
+    if eff.authored.is_empty() || !eff.transplants.is_empty() || !eff.rosters.is_empty()
+        || !eff.entry_edits.is_empty() || !eff.textures.is_empty()
+        || !eff.textures_added.is_empty() || !eff.textures_removed.is_empty()
+    {
+        anyhow::bail!("one own-fighter emitter entry only");
+    }
+    let name = eff.authored[0].entry_name.to_ascii_lowercase();
+    if name.is_empty() || name.len() > 80
+        || !name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+        || eff.authored.iter().any(|edit| !edit.entry_name.eq_ignore_ascii_case(&name))
+    {
+        anyhow::bail!("edit one effect entry at a time");
+    }
+    let source = effect_library::NamcoEffectFile::load(source_bytes)?;
+    let index = source.entry_names.iter().position(|n| n.eq_ignore_ascii_case(&name))
+        .context("entry not present in original EFF")?;
+    let entry = &source.entries[index];
+    let set_idx = (entry.emitter_set_id as usize).checked_sub(1).context("entry has no emitter set")?;
+    if entry.variant_count != 0 || entry.external_model_idx != 0
+        || eff.authored.iter().any(|edit| edit.set_idx != set_idx)
+    {
+        anyhow::bail!("multi-part, external-model or ambiguous emitter entries are not yet supported");
+    }
+    let clone_name = format!("{}{}", crate::mod_project::EDIT_CLONE_PREFIX, name);
+    const TEMPLATE: &str = "effect/assist/bomberman/ef_bomberman.eff";
+    let base = std::fs::read(root.join(TEMPLATE)).context("missing compact carrier template")?;
+    let op = TransplantOp {
+        new_entry_name: clone_name.clone(), src_file_rel: eff.source_rel.clone(),
+        src_set_name: name, src_set_idx: set_idx, one_slot_slots: Vec::new(), replace_entry: None,
+    };
+    let authored = CarrierAuthored {
+        set_name: clone_name.clone(), edits: eff.authored.clone(), roster: None, entry_edit: None,
+    };
+    let mut warnings = Vec::new();
+    let compact = rebuild_runtime_carrier_eff_bytes_with_edits(
+        &base, TEMPLATE, &[op], root, &[authored], &[], &[], &[], &mut warnings,
+    )?;
+    anyhow::ensure!(warnings.is_empty(), "carrier build warnings: {warnings:?}");
+    let parsed = effect_library::NamcoEffectFile::load(&compact)?;
+    let idx = parsed.entry_names.iter().position(|n| n == &clone_name).context("missing private clone")?;
+    anyhow::ensure!(parsed.header.header_chunk_align == 1
+        && parsed.header.num_external_models == 0 && parsed.header.multi_part_effects == 0
+        && parsed.entries[idx].variant_count == 0 && parsed.entries[idx].external_model_idx == 0
+        && compact.len() > 0x1020 && compact.len() < 4 * 1024 * 1024
+        && &compact[0x1000..0x1004] == b"VFXB", "unsupported private EFF layout or size");
+    let mut private = vec![0u8; 0x1000];
+    private[..16].copy_from_slice(&compact[..16]);
+    private[8..10].copy_from_slice(&1u16.to_le_bytes());
+    private[16..32].copy_from_slice(&compact[16 + idx * 16..32 + idx * 16]);
+    private[32..32 + clone_name.len()].copy_from_slice(clone_name.as_bytes());
+    private.extend_from_slice(&compact[0x1000..]);
+    let checked = effect_library::NamcoEffectFile::load(&private)?;
+    anyhow::ensure!(checked.entry_names == vec![clone_name], "private entry table mismatch");
+    verify_shader_indices_resolve(&checked, "private live preview")?;
+    Ok(private)
+}
+
 /// ONE-SLOT-scoped rebuild for export: `slot` None = the base file (only transplants with
 /// no one-slot scoping); Some(s) = the `ef_*_cNN.eff` file (unscoped transplants + those
 /// scoped to that slot — the slotted file replaces the base for that costume, so it must
@@ -6431,6 +6496,48 @@ mod tests {
              shader relocation:\n  {}",
             differing.join("\n  ")
         );
+    }
+
+    #[test]
+    #[ignore = "requires extracted game EFF files"]
+    fn private_live_preview_uses_only_the_edited_entry() {
+        let root = std::path::PathBuf::from(
+            std::env::var_os("VISIONARY_EFF_ROOT").expect("set VISIONARY_EFF_ROOT")
+        );
+        let rel = "effect/fighter/kirby/ef_kirby.eff";
+        let source_bytes = std::fs::read(root.join(rel)).expect("Kirby EFF");
+        let source = effect_library::NamcoEffectFile::load(&source_bytes).expect("source parse");
+        let i = source.entry_names.iter().position(|n| n == "kirby_dash").expect("kirby_dash");
+        let set_idx = source.entries[i].emitter_set_id as usize - 1;
+        let emitter = &source.ptcl_file.as_ref().unwrap().emitter_list.emitter_sets[set_idx].emitters[0];
+        let base_scale = emitter.data.particle_scale.scale_x;
+        let mut eff = crate::mod_project::EffMod {
+            source_rel: rel.into(),
+            authored: vec![crate::mod_project::AuthoredEdit {
+                set_name: source.ptcl_file.as_ref().unwrap().emitter_list.emitter_sets[set_idx].name.clone(),
+                entry_name: "kirby_dash".into(), set_idx,
+                emitter_name: emitter.data.display_name(), emitter_idx: 0,
+                fields: crate::mod_project::EmitterFieldEdits {
+                    scale: Some(base_scale * 2.0), ..Default::default()
+                },
+            }],
+            ..Default::default()
+        };
+        for scale in [base_scale * 2.0, base_scale * 3.0] {
+            eff.authored[0].fields.scale = Some(scale);
+            let bytes = super::build_private_live_preview(&source_bytes, &eff, &root).expect("live build");
+            let parsed = effect_library::NamcoEffectFile::load(&bytes).expect("private EFF parse");
+            assert_eq!(parsed.entry_names, vec!["vsnedit_kirby_dash".to_string()]);
+            let set = &parsed.ptcl_file.as_ref().unwrap().emitter_list.emitter_sets[
+                parsed.entries[0].emitter_set_id as usize - 1
+            ];
+            assert!((set.emitters[0].data.particle_scale.scale_x - scale).abs() < 1e-4);
+            eprintln!("private live EFF: {} bytes, scale {scale}", bytes.len());
+        }
+        let mut other = eff.authored[0].clone();
+        other.entry_name = "kirby_other".into();
+        eff.authored.push(other);
+        assert!(super::build_private_live_preview(&source_bytes, &eff, &root).is_err());
     }
 
     #[test]

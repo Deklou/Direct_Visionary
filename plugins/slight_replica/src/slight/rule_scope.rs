@@ -33,6 +33,10 @@ impl ScopedEffPreview {
     pub fn sd_rel_path(&self) -> String {
         format!("effect_viewer/scoped_live_eff/ef_{}_{}.eff", self.fighter, self.token)
     }
+    /// Never publish a private clone at the old path-wide preview location.
+    pub fn private_sd_rel_path(&self) -> String {
+        format!("effect_viewer/private_live_eff/ef_{}_{}.eff", self.fighter, self.token)
+    }
 }
 
 #[cfg(test)]

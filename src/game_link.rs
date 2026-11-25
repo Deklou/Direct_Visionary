@@ -1401,7 +1401,7 @@ const FULL_REPLACE_MARKERS: &[&str] = &[
     "\"donor_effs\":",
     "\"donor_bytes\":",
     "\"asset_bundle\":",
-    "\"scoped_eff_preview\":",
+    "\"scoped_private_eff\":",
     "\"effect_names\":",
 ];
 
@@ -1897,7 +1897,7 @@ impl GameLink {
         }
         let valid = preview.is_none_or(ScopedEffPreview::valid);
         let preview = preview.filter(|p| p.valid());
-        let payload = serde_json::json!({ "scoped_eff_preview": preview });
+        let payload = serde_json::json!({ "scoped_private_eff": preview });
         let frame = format!("<TCP_MESSAGE>{payload}</TCP_MESSAGE>");
         queue_latest_full_replace(&mut s.outbox, frame);
         s.edits_tx += 1;
@@ -2490,7 +2490,7 @@ fn serve_connection(shared: &Arc<Mutex<Shared>>, mut stream: TcpStream) -> Optio
                 pending.retain(|frame| !frame.contains("\"effect_aliases_scoped\":"));
             }
             if !s.scoped_eff_preview_supported {
-                pending.retain(|frame| !frame.contains("\"scoped_eff_preview\":"));
+                pending.retain(|frame| !frame.contains("\"scoped_private_eff\":"));
             }
             pending
         };
@@ -2945,7 +2945,7 @@ fn handle_frame(shared: &Arc<Mutex<Shared>>, payload: &str) {
                     .and_then(|value| value.as_bool()) == Some(true);
             s.scoped_eff_preview_supported = client_id.is_some()
                 && body.get("GiveClientId")
-                    .and_then(|data| data.get("scoped_eff_preview"))
+                    .and_then(|data| data.get("scoped_private_eff"))
                     .and_then(|value| value.as_bool()) == Some(true);
         }
         _ => {}
@@ -6847,17 +6847,17 @@ mod tests {
         };
         assert!(!link.send_scoped_eff_preview(Some(&p)));
         feed(&link, &[plugin_frame("GiveClientId", &serde_json::json!({
-            "GiveClientId": { "client_id": 4, "scoped_eff_preview": true }
+            "GiveClientId": { "client_id": 4, "scoped_private_eff": true }
         }))]);
         assert!(link.supports_scoped_eff_preview());
         assert!(link.send_scoped_eff_preview(Some(&p)));
         assert!(!link.send_scoped_eff_preview(Some(&ScopedEffPreview { costume_slots: vec![], ..p.clone() })));
         let pending = link.shared.lock().unwrap().outbox.clone();
         assert_eq!(pending.len(), 1);
-        assert!(pending[0].contains("\"scoped_eff_preview\":null"));
+        assert!(pending[0].contains("\"scoped_private_eff\":null"));
         assert!(link.send_scoped_eff_preview(Some(&p)));
         feed(&link, &[plugin_frame("GiveClientId", &serde_json::json!({
-            "GiveClientId": { "client_id": 5, "scoped_acmd": true }
+            "GiveClientId": { "client_id": 5, "scoped_acmd": true, "scoped_eff_preview": true }
         }))]);
         assert!(!link.supports_scoped_eff_preview());
         assert!(!link.send_scoped_eff_preview(Some(&p)));
