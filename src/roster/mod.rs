@@ -20,6 +20,7 @@
 pub mod archive;
 pub mod css;
 pub mod css_view;
+pub mod edit_scope;
 pub mod export;
 pub mod gamma;
 pub mod icons;
