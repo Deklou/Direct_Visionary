@@ -3140,7 +3140,7 @@ mod tests {
         let link = GameLink::default();
         // attack_hi3 has the same motion hash for Ganondorf and Donkey Kong.
         let rate = HitboxRuleWire {
-            motion: 0x99c52257e,
+            motion: 0xacbfc42e6,
             category: CAT_MOTION_RATE,
             hitbox_id: None,
             suppress: false,
@@ -3155,7 +3155,7 @@ mod tests {
         };
         // A second shared name, attack_11, also covers injected ATTACK rules.
         let injection = HitboxRuleWire {
-            motion: 0x63a9f37e5,
+            motion: 0x99c52257e,
             category: 0,
             hitbox_id: Some(0),
             suppress: false,

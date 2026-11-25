@@ -1551,7 +1551,7 @@ mod fighter_scope_tests {
 
     #[test]
     fn identical_attack_hi3_and_attack_11_names_are_fighter_scoped() {
-        for motion in [0x99c52257e, 0x63a9f37e5] {
+        for motion in [0xacbfc42e6, 0x99c52257e] {
             let rule: HitboxRule = serde_json::from_str(&format!(
                 r#"{{"fighter_kind":24,"motion":{motion},"category":9}}"#
             )).unwrap();
@@ -1938,7 +1938,8 @@ unsafe fn hook_kinetic_clear_speed_all(boma: *mut smash::app::BattleObjectModule
     if any_direct_rules(boma) {
         let motion = smash::app::lua_bind::MotionModule::motion_kind(boma);
         let frame = smash::app::lua_bind::MotionModule::frame(boma);
-        if let Some((suppress, _)) = action_for(boma, 
+        if let Some((suppress, _)) = action_for(
+            boma,
             CAT_KINETIC_CLEAR_SPEED_ALL,
             motion,
             KINETIC_KEY_CLEAR_SPEED_ALL,
@@ -2248,7 +2249,8 @@ unsafe fn hook_work_module_inc_int(boma: *mut smash::app::BattleObjectModuleAcce
         let motion = smash::app::lua_bind::MotionModule::motion_kind(boma);
         let frame = smash::app::lua_bind::MotionModule::frame(boma);
         let key = integer_point_key("WorkModule::inc_int", &[slot as i64]);
-        if let Some((suppress, overrides)) = action_for_func(boma, 
+        if let Some((suppress, overrides)) = action_for_func(
+            boma,
             CAT_WORK_MODULE_INC_INT,
             motion,
             key,
@@ -2288,7 +2290,8 @@ unsafe fn hook_work_module_set_int(
         let motion = smash::app::lua_bind::MotionModule::motion_kind(boma);
         let frame = smash::app::lua_bind::MotionModule::frame(boma);
         let key = numeric_point_key("WorkModule::set_int", &[value as f32, slot as f32]);
-        if let Some((suppress, overrides)) = action_for_func(boma, 
+        if let Some((suppress, overrides)) = action_for_func(
+            boma,
             CAT_WORK_MODULE_SET,
             motion,
             key,
@@ -2332,7 +2335,8 @@ unsafe fn hook_work_module_set_int64(
         let motion = smash::app::lua_bind::MotionModule::motion_kind(boma);
         let frame = smash::app::lua_bind::MotionModule::frame(boma);
         let key = integer_point_key("WorkModule::set_int64", &[value, slot as i64]);
-        if let Some((suppress, overrides)) = action_for_func(boma, 
+        if let Some((suppress, overrides)) = action_for_func(
+            boma,
             CAT_WORK_MODULE_SET,
             motion,
             key,
@@ -2370,7 +2374,8 @@ unsafe fn hook_work_module_set_float(
         let motion = smash::app::lua_bind::MotionModule::motion_kind(boma);
         let frame = smash::app::lua_bind::MotionModule::frame(boma);
         let key = numeric_point_key("WorkModule::set_float", &[value, slot as f32]);
-        if let Some((suppress, overrides)) = action_for_func(boma, 
+        if let Some((suppress, overrides)) = action_for_func(
+            boma,
             CAT_WORK_MODULE_SET,
             motion,
             key,
