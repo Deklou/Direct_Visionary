@@ -111,6 +111,38 @@ pub fn rebuild_runtime_carrier_eff_bytes_with_edits(
     removed_textures: &[String],
     warnings: &mut Vec<String>,
 ) -> Result<Vec<u8>> {
+    rebuild_runtime_carrier_with_policy(
+        carrier_bytes, carrier_rel, ops, donor_root, authored, textures,
+        added_textures, removed_textures, warnings, false,
+    )
+}
+
+// Experimental preservation policy. Not wired to the live carrier until native resource
+// fidelity and lifetime boundaries are verified. The legacy builder keeps its existing policy.
+#[allow(clippy::too_many_arguments)]
+fn rebuild_runtime_carrier_with_policy(
+    carrier_bytes: &[u8],
+    carrier_rel: &str,
+    ops: &[TransplantOp],
+    donor_root: &std::path::Path,
+    authored: &[CarrierAuthored],
+    textures: &[TextureImport],
+    added_textures: &[crate::mod_project::TextureAddition],
+    removed_textures: &[String],
+    warnings: &mut Vec<String>,
+    preserve_native: bool,
+) -> Result<Vec<u8>> {
+    if preserve_native && (!textures.is_empty() || !added_textures.is_empty()
+        || !removed_textures.is_empty()
+        || ops.iter().any(|op| op.replace_entry.is_some()
+            || op.src_file_rel.eq_ignore_ascii_case(carrier_rel)
+            || !op.new_entry_name.starts_with(crate::mod_project::EDIT_CLONE_PREFIX))
+        || authored.iter().any(|entry| !ops.iter().any(|op| op.new_entry_name == entry.set_name)
+            || entry.roster.is_some() || entry.entry_edit.is_some()
+            || entry.edits.iter().any(|edit| edit.fields.texture_name.is_some())))
+    {
+        anyhow::bail!("native-preserving carrier accepts only separate authored clones");
+    }
     // A carrier-native selection needs no transplant. The runtime remap already turns an `_os`
     // request into the carrier's existing real entry, so parsing, pruning, and repacking these
     // resource pools only introduces risk. Preserve the game's known-good payload byte-for-byte.
@@ -290,11 +322,11 @@ pub fn rebuild_runtime_carrier_eff_bytes_with_edits(
                 .map(|op| op.src_set_name.as_str()),
         )
         .collect();
-    silence_carrier_native_effects(&mut carrier, &transplanted);
-    // The game does not treat an ESET with zero emitters as a valid no-op.  If an entry still
-    // points at one, its loader walks into the following ESET (and can crash).  Keep the entry
-    // name/header so requests still resolve, but make the spawn handle explicitly `none`.
-    clear_empty_emitter_set_references(&mut carrier);
+    if !preserve_native {
+        silence_carrier_native_effects(&mut carrier, &transplanted);
+        // The game does not treat an ESET with zero emitters as a valid no-op.
+        clear_empty_emitter_set_references(&mut carrier);
+    }
     // Textures an edit will SWAP TO are not sampled by anything yet — hold them back from the
     // prune, which otherwise drops them a few lines before the swap looks for them.
     let swap_targets: Vec<String> = authored
@@ -302,12 +334,10 @@ pub fn rebuild_runtime_carrier_eff_bytes_with_edits(
         .flat_map(|entry| entry.edits.iter())
         .filter_map(|edit| edit.fields.texture_name.clone())
         .collect();
-    prune_unreferenced_resources(&mut carrier, &swap_targets)?;
-    // Compaction trims the shader container to the variations something addresses. Verified
-    // safe on game data: `BnshFile` rewriting preserves every variation's byte code, control
-    // code and object data, and the `_RLT` table it emits describes its own pointers correctly
-    // (effect_library's `bnsh_relocation` tests, run against real containers).
-    compact_shader_containers(&mut carrier)?;
+    if !preserve_native {
+        prune_unreferenced_resources(&mut carrier, &swap_targets)?;
+        compact_shader_containers(&mut carrier)?;
+    }
 
     verify_shader_indices_resolve(&carrier, "live carrier")?;
 
@@ -6363,6 +6393,88 @@ mod tests {
              shader relocation:\n  {}",
             differing.join("\n  ")
         );
+    }
+
+    #[test]
+    #[ignore = "requires extracted game EFF files"]
+    fn scoped_carrier_preserves_native_emitters() {
+        let root = std::path::PathBuf::from(
+            std::env::var_os("VISIONARY_EFF_ROOT").expect("set VISIONARY_EFF_ROOT")
+        );
+        const CARRIER: &str = "effect/assist/bomberman/ef_bomberman.eff";
+        const DONOR: &str = "effect/fighter/kirby/ef_kirby.eff";
+        let carrier_base = std::fs::read(root.join(CARRIER)).expect("carrier eff");
+        let before = effect_library::NamcoEffectFile::load(&carrier_base).expect("carrier parse");
+        let donor = effect_library::NamcoEffectFile::load(
+            &std::fs::read(root.join(DONOR)).expect("donor eff")
+        ).expect("donor parse");
+        let index = donor.entry_names.iter().position(|n| n.eq_ignore_ascii_case("kirby_dash"))
+            .expect("kirby_dash");
+        let set_idx = donor.entries[index].emitter_set_id as usize - 1;
+        let emitter = &donor.ptcl_file.as_ref().unwrap().emitter_list.emitter_sets[set_idx].emitters[0];
+        let base_scale = emitter.data.particle_scale.scale_x;
+        assert!(base_scale.abs() > 1e-6);
+        let clone_name = format!("{}kirby_dash", crate::mod_project::EDIT_CLONE_PREFIX);
+        let op = crate::mod_project::TransplantOp {
+            new_entry_name: clone_name.clone(), src_file_rel: DONOR.into(),
+            src_set_name: "kirby_dash".into(), src_set_idx: set_idx,
+            one_slot_slots: Vec::new(), replace_entry: None,
+        };
+        let edit = super::CarrierAuthored {
+            set_name: clone_name.clone(),
+            edits: vec![crate::mod_project::AuthoredEdit {
+                set_name: clone_name.clone(), entry_name: "kirby_dash".into(),
+                set_idx, emitter_name: emitter.data.display_name(), emitter_idx: 0,
+                fields: crate::mod_project::EmitterFieldEdits {
+                    scale: Some(base_scale * 2.0), ..Default::default()
+                },
+            }],
+            roster: None, entry_edit: None,
+        };
+        let mut warnings = Vec::new();
+        let built = super::rebuild_runtime_carrier_with_policy(
+            &carrier_base, CARRIER, &[op], &root, &[edit],
+            &[], &[], &[], &mut warnings, true,
+        ).expect("native-preserving carrier");
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let after = effect_library::NamcoEffectFile::load(&built).expect("carrier re-read");
+        assert_eq!(after.entry_names.len(), before.entry_names.len() + 1);
+        assert_eq!(&after.entry_names[..before.entry_names.len()], before.entry_names.as_slice());
+        for (i, original) in before.entries.iter().enumerate() {
+            let actual = &after.entries[i];
+            assert_eq!(actual.kind, original.kind);
+            assert_eq!(actual.emitter_set_id, original.emitter_set_id);
+            assert_eq!(actual.variant_start_idx, original.variant_start_idx);
+            assert_eq!(actual.variant_count, original.variant_count);
+            assert_eq!(actual.external_model_idx, original.external_model_idx);
+        }
+        for (i, original) in before.effect_variants.iter().enumerate() {
+            let actual = &after.effect_variants[i];
+            assert_eq!(actual.emitter_set_id, original.emitter_set_id);
+            assert_eq!(actual.start_frame, original.start_frame);
+        }
+        let original = before.ptcl_file.as_ref().unwrap();
+        let actual = after.ptcl_file.as_ref().unwrap();
+        for (i, set) in original.emitter_list.emitter_sets.iter().enumerate() {
+            let out = &actual.emitter_list.emitter_sets[i];
+            assert_eq!(set.name, out.name);
+            let mut expected = Vec::new();
+            let mut observed = Vec::new();
+            super::visit_emitters_ref(&set.emitters, &mut |em| {
+                expected.push(em.data.clone().write(original.vfx_version).expect("native emitter"));
+            });
+            super::visit_emitters_ref(&out.emitters, &mut |em| {
+                observed.push(em.data.clone().write(actual.vfx_version).expect("rebuilt native emitter"));
+            });
+            assert!(expected == observed, "native emitter set changed: {}", set.name);
+        }
+        let clone_idx = after.entry_names.iter().position(|n| n == &clone_name).unwrap();
+        let clone_set = &actual.emitter_list.emitter_sets[
+            after.entries[clone_idx].emitter_set_id as usize - 1
+        ];
+        assert!((clone_set.emitters[0].data.particle_scale.scale_x - base_scale * 2.0).abs() < 1e-4);
+        assert!(!after.entry_names.iter().any(|n| n.eq_ignore_ascii_case("kirby_dash")));
+        eprintln!("native EFF: {} B; preservation candidate: {} B", carrier_base.len(), built.len());
     }
 
     /// Editing an untransplanted fighter effect clones it into the carrier with the edit
