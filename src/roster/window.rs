@@ -849,10 +849,9 @@ impl RosterWindow {
             NewCharacterAction::SetEditTarget(target) => {
                 self.status = match &target {
                     Some(key) => format!(
-                        "Moves you edit now belong to {key}. The donor's other costumes keep \
-                         their own version of anything you change."
+                        "ACMD export target: {key}. Live edits are NOT costume-isolated yet."
                     ),
-                    None => "Moves you edit now apply to every costume again.".to_string(),
+                    None => "ACMD edits are unscoped again; check costume ownership before exporting.".to_string(),
                 };
                 self.edit_target = target;
             }
