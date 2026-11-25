@@ -1015,6 +1015,20 @@ pub struct HitboxRuleWire {
 }
 
 #[derive(Serialize)]
+struct ScopedSpawnRuleWire<'a> {
+    fighter_kind: i32,
+    #[serde(flatten)]
+    rule: &'a SpawnRuleWire,
+}
+
+#[derive(Serialize)]
+struct ScopedEffectControlRuleWire<'a> {
+    fighter_kind: i32,
+    #[serde(flatten)]
+    rule: &'a EffectControlRuleWire,
+}
+
+#[derive(Serialize)]
 struct ScopedHitboxRuleWire<'a> {
     fighter_kind: i32,
     #[serde(flatten)]
@@ -1656,9 +1670,24 @@ impl GameLink {
         }
     }
 
-    /// Replace the plugin's live spawn-rule list (suppress/retime ACMD effect spawns).
-    /// Send the FULL current rule set every time — an empty slice clears all rules.
+    /// Legacy serializers retained for wire-shape tests.
+    #[cfg(test)]
     pub fn send_spawn_rules(&self, rules: &[SpawnRuleWire]) {
+        self.send_spawn_payload(rules);
+    }
+
+    pub fn send_scoped_spawn_rules(&self, rules: &[(i32, &SpawnRuleWire)]) {
+        let scoped: Vec<_> = rules
+            .iter()
+            .map(|(fighter_kind, rule)| ScopedSpawnRuleWire {
+                fighter_kind: *fighter_kind,
+                rule: *rule,
+            })
+            .collect();
+        self.send_spawn_payload(&scoped);
+    }
+
+    fn send_spawn_payload<T: Serialize>(&self, rules: &[T]) {
         if self.sends_suppressed() {
             return;
         }
@@ -1673,8 +1702,23 @@ impl GameLink {
         }
     }
 
-    /// Replace the live effect point-control rules (detach and area toggles).
+    #[cfg(test)]
     pub fn send_effect_control_rules(&self, rules: &[EffectControlRuleWire]) {
+        self.send_effect_control_payload(rules);
+    }
+
+    pub fn send_scoped_effect_control_rules(&self, rules: &[(i32, &EffectControlRuleWire)]) {
+        let scoped: Vec<_> = rules
+            .iter()
+            .map(|(fighter_kind, rule)| ScopedEffectControlRuleWire {
+                fighter_kind: *fighter_kind,
+                rule: *rule,
+            })
+            .collect();
+        self.send_effect_control_payload(&scoped);
+    }
+
+    fn send_effect_control_payload<T: Serialize>(&self, rules: &[T]) {
         if self.sends_suppressed() {
             return;
         }

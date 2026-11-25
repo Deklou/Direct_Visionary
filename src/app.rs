@@ -4234,20 +4234,8 @@ impl VisionaryApp {
         // Replace the plugin's full rule lists so the forgotten fighter's rules disappear while
         // every other fighter's rules remain live. The alias/carrier publication is coalesced
         // and flushed later in the normal update loop.
-        let spawn: Vec<crate::game_link::SpawnRuleWire> = self
-            .effect_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        self.game_link.send_spawn_rules(&spawn);
-        let controls: Vec<crate::game_link::EffectControlRuleWire> = self
-            .effect_control_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        self.game_link.send_effect_control_rules(&controls);
+        self.send_live_spawn_rules();
+        self.send_live_effect_control_rules();
         self.send_live_hitbox_rules();
         self.push_effect_aliases();
 
@@ -18267,6 +18255,34 @@ If you step every basis for a                          type and NONE of them mat
         }
     }
 
+    fn send_live_spawn_rules(&self) {
+        let scoped: Vec<_> = self
+            .effect_rules_store
+            .iter()
+            .flat_map(|(key, rules)| {
+                let kind = key
+                    .split_once('/')
+                    .and_then(|(fighter, _)| fighter_kind_id(fighter));
+                rules.iter().filter_map(move |rule| kind.map(|kind| (kind, rule)))
+            })
+            .collect();
+        self.game_link.send_scoped_spawn_rules(&scoped);
+    }
+
+    fn send_live_effect_control_rules(&self) {
+        let scoped: Vec<_> = self
+            .effect_control_rules_store
+            .iter()
+            .flat_map(|(key, rules)| {
+                let kind = key
+                    .split_once('/')
+                    .and_then(|(fighter, _)| fighter_kind_id(fighter));
+                rules.iter().filter_map(move |rule| kind.map(|kind| (kind, rule)))
+            })
+            .collect();
+        self.game_link.send_scoped_effect_control_rules(&scoped);
+    }
+
     /// Send live ACMD rules with the fighter kind belonging to each stored move.
     /// Project replay also uses this path, even when the selected fighter has changed.
     fn send_live_hitbox_rules(&self) {
@@ -18287,21 +18303,9 @@ If you step every basis for a                          type and NONE of them mat
     /// Project loading calls this only after its all-family send barrier is lifted; ordinary
     /// rebuilds use it after their narrower rule batch ends.
     fn publish_live_rule_union(&self) {
-        let effects: Vec<_> = self
-            .effect_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        let controls: Vec<_> = self
-            .effect_control_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
         self.send_live_hitbox_rules();
-        self.game_link.send_spawn_rules(&effects);
-        self.game_link.send_effect_control_rules(&controls);
+        self.send_live_spawn_rules();
+        self.send_live_effect_control_rules();
         self.publish_cancel_rules();
     }
 
@@ -21385,8 +21389,8 @@ If you step every basis for a                          type and NONE of them mat
         self.cancel_rules_store.clear();
         self.game_link.send_cancel_rules(&[]);
         self.game_link.send_trait_rules(&[]);
-        self.game_link.send_spawn_rules(&[]);
-        self.game_link.send_effect_control_rules(&[]);
+        self.send_live_spawn_rules();
+        self.send_live_effect_control_rules();
         self.send_live_hitbox_rules();
         self.game_link.send_effect_aliases(&[]);
         // Asset-bundle callbacks are a distinct full snapshot from the effect carrier. Clear it
@@ -29696,20 +29700,8 @@ If you step every basis for a                          type and NONE of them mat
             self.apply_effect_call_edits_to_current();
             self.push_effect_rules();
         } else if !affected_moves.is_empty() {
-            let all: Vec<crate::game_link::SpawnRuleWire> = self
-                .effect_rules_store
-                .values()
-                .flatten()
-                .cloned()
-                .collect();
-            self.game_link.send_spawn_rules(&all);
-            let all_controls: Vec<crate::game_link::EffectControlRuleWire> = self
-                .effect_control_rules_store
-                .values()
-                .flatten()
-                .cloned()
-                .collect();
-            self.game_link.send_effect_control_rules(&all_controls);
+            self.send_live_spawn_rules();
+            self.send_live_effect_control_rules();
         }
     }
 
@@ -31508,13 +31500,7 @@ If you step every basis for a                          type and NONE of them mat
             }
         }
         // Flush the union of all moves' rules so cross-move redirects apply live at once.
-        let all: Vec<crate::game_link::SpawnRuleWire> = self
-            .effect_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        self.game_link.send_spawn_rules(&all);
+        self.send_live_spawn_rules();
         // Live parity: the copy doesn't exist in the running game yet, but the plugin
         // aliases its hash to the donor's, so redirected spawns show in-game NOW and
         // match the export (a fresh copy is content-identical to its donor).
@@ -32423,20 +32409,8 @@ If you step every basis for a                          type and NONE of them mat
             self.effect_control_rules_store
                 .insert(mv_key, control_rules);
         }
-        let all: Vec<crate::game_link::SpawnRuleWire> = self
-            .effect_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        self.game_link.send_spawn_rules(&all);
-        let all_controls: Vec<crate::game_link::EffectControlRuleWire> = self
-            .effect_control_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        self.game_link.send_effect_control_rules(&all_controls);
+        self.send_live_spawn_rules();
+        self.send_live_effect_control_rules();
         if unsupported_flip_axis {
             self.state.status =
                 "This flip-axis/control token is preserved for source/export, but live preview \
@@ -35856,23 +35830,11 @@ impl eframe::App for VisionaryApp {
             if client.is_some() {
                 // Re-push the authoritative live state after every fresh plugin connection.
                 // This also restores state when the game restarted between socket sessions.
-                let spawn: Vec<crate::game_link::SpawnRuleWire> = self
-                    .effect_rules_store
-                    .values()
-                    .flatten()
-                    .cloned()
-                    .collect();
-                if !spawn.is_empty() {
-                    self.game_link.send_spawn_rules(&spawn);
+                if !self.effect_rules_store.is_empty() {
+                    self.send_live_spawn_rules();
                 }
-                let controls: Vec<crate::game_link::EffectControlRuleWire> = self
-                    .effect_control_rules_store
-                    .values()
-                    .flatten()
-                    .cloned()
-                    .collect();
-                if !controls.is_empty() {
-                    self.game_link.send_effect_control_rules(&controls);
+                if !self.effect_control_rules_store.is_empty() {
+                    self.send_live_effect_control_rules();
                 }
                 if !self.hitbox_rules_store.is_empty() {
                     self.send_live_hitbox_rules();
