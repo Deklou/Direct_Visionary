@@ -6509,6 +6509,16 @@ mod tests {
         assert!((clone_set.emitters[0].data.particle_scale.scale_x - base_scale * 2.0).abs() < 1e-4);
         assert!(!after.entry_names.iter().any(|n| n.eq_ignore_ascii_case("kirby_dash")));
         eprintln!("native EFF: {} B; preservation candidate: {} B", carrier_base.len(), built.len());
+        // Explicit opt-in: emit the exact payload just validated by the assertions above
+        // for a standalone Arcropolis rendering probe. Never touch a game installation
+        // from a test and never overwrite an existing file.
+        if let Some(path) = std::env::var_os("VISIONARY_NATIVE_CARRIER_PROBE_OUT") {
+            let path = std::path::PathBuf::from(path);
+            let mut file = std::fs::OpenOptions::new().write(true).create_new(true)
+                .open(&path).expect("create a new native carrier probe file");
+            std::io::Write::write_all(&mut file, &built).expect("write validated probe bytes");
+            eprintln!("native carrier rendering probe: {}", path.display());
+        }
     }
 
     /// Editing an untransplanted fighter effect clones it into the carrier with the edit
