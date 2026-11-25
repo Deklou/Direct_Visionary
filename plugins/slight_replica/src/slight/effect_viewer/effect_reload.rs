@@ -1964,28 +1964,27 @@ pub unsafe fn pump_auto_carrier(boma: *mut smash::app::BattleObjectModuleAccesso
     // The editor already tells us who it should be: the donor spec's target fighter. Match on
     // that and the carrier stays with the character whose effects are being edited.
     let boid = (*boma).battle_object_id;
-    if let Some(target) = AUTO_CARRIER_TARGET.lock().as_deref() {
-        let kind = smash::app::utility::get_kind(&mut *boma);
-        let is_target = crate::slight::slight_consts::fighters::game_kind_name(kind)
-            .is_some_and(|name| name == target);
-        if !is_target {
-            return;
-        }
-    }
-    // No target known (older editor, or a spec without a fighter target): fall back to a stable
-    // latch. Whoever claims it keeps it until they leave the match — releasing on anything less
-    // makes every other fighter steal it, look at its own empty slot, and rearm on every frame.
     let host = AUTO_CARRIER_HOST.load(Ordering::Relaxed) as u32;
-    if host != 0 && host != boid {
-        if crate::slight::agents::all_records()
-            .iter()
-            .any(|rec| rec.boid == host)
-        {
+    let host_alive = host != 0 && smash::app::sv_battle_object::is_active(host);
+    // Retire through the outgoing host, even when the new target is another fighter.
+    // Do not transfer the claim until the outgoing object and resources are released.
+    let retiring = matches!(state, 3 | 4 | 5);
+    if retiring && host_alive {
+        if host != boid {
             return;
         }
-        dlog(&format!(
-            "AUTO_CARRIER_HOST_GONE previous={host:#x} taking_over={boid:#x}"
-        ));
+    } else {
+        if let Some(target) = AUTO_CARRIER_TARGET.lock().as_deref() {
+            let kind = smash::app::utility::get_kind(&mut *boma);
+            if !crate::slight::slight_consts::fighters::game_kind_name(kind)
+                .is_some_and(|name| name == target)
+            {
+                return;
+            }
+        }
+        if host_alive && host != boid {
+            return;
+        }
     }
     if host != boid {
         AUTO_CARRIER_HOST.store(boid as u64, Ordering::Relaxed);
@@ -2002,6 +2001,7 @@ pub unsafe fn pump_auto_carrier(boma: *mut smash::app::BattleObjectModuleAccesso
         }
         AUTO_CARRIER_RETIRING_ID.store(0, Ordering::Relaxed);
         AUTO_CARRIER_WAIT.store(0, Ordering::Relaxed);
+        AUTO_CARRIER_HOST.store(0, Ordering::Release);
         AUTO_CARRIER_STATE.store(0, Ordering::Relaxed);
         return;
     }
@@ -2103,16 +2103,9 @@ pub unsafe fn pump_auto_carrier(boma: *mut smash::app::BattleObjectModuleAccesso
         AUTO_CARRIER_WAIT.store(0, Ordering::Relaxed);
         AUTO_CARRIER_RETIRING_KINDS.lock().clear();
         AUTO_CARRIER_SET.store(0, Ordering::Release);
-        // Submit the same recursive release used by the game's resource-owner destructor.
-        // Usually the item's own teardown has already dropped this count to zero; the wrapper
-        // detects that and does not underflow it. Either way, state 5 waits for the worker to
-        // make the file genuinely non-resident before another first-load cycle can begin.
-        let dir_hash = smash::hash40(eff_dir(&ef_file));
-        let release =
-            crate::slight::effect_viewer::resource_reload::release_resident_directory(dir_hash);
-        mark(&format!(
-            "carrier_native_directory_release hash={dir_hash:#x} result={release:?}"
-        ));
+        // The native destructor owns the reference. A positive directory count is not
+        // proof that it belongs to the carrier: another object can own it. Never decrement
+        // it a second time; wait for genuine release instead.
         AUTO_CARRIER_POLL.store(0, Ordering::Relaxed);
         AUTO_CARRIER_STATE.store(5, Ordering::Release);
         return;
@@ -2124,10 +2117,10 @@ pub unsafe fn pump_auto_carrier(boma: *mut smash::app::BattleObjectModuleAccesso
         let dir_hash = smash::hash40(eff_dir(&ef_file));
         let file = rr::resident_file_state(file_hash);
         let directory = rr::resident_directory_state(dir_hash);
-        let file_released = file.as_ref().map_or(true, |state| {
+        let file_released = file.as_ref().is_some_and(|state| {
             !state.filepath_loaded && state.data == 0 && state.ref_count == 0
         });
-        let directory_released = directory.as_ref().map_or(true, |state| {
+        let directory_released = directory.as_ref().is_some_and(|state| {
             state.ref_count == 0 && state.incoming_request_count == 0
         });
         let waited = AUTO_CARRIER_POLL.fetch_add(1, Ordering::Relaxed);
@@ -2146,6 +2139,7 @@ pub unsafe fn pump_auto_carrier(boma: *mut smash::app::BattleObjectModuleAccesso
             "carrier_native_release_complete file={file:?} directory={directory:?}"
         ));
         AUTO_CARRIER_POLL.store(0, Ordering::Relaxed);
+        AUTO_CARRIER_HOST.store(0, Ordering::Release);
         AUTO_CARRIER_STATE.store(1, Ordering::Release);
         return;
     }
@@ -2237,11 +2231,7 @@ pub unsafe fn pump_auto_carrier(boma: *mut smash::app::BattleObjectModuleAccesso
         return;
     }
 
-    if !register_donor_serve(&ef_file) {
-        return;
-    }
-    build_remap_from_served(&ef_file);
-
+    // Never register a replacement callback while a real object of that kind can own the file.
     // Never invalidate an assist file while another real object of that kind can still own it.
     // The hidden carrier is already gone before a swap reaches state 1, so a non-zero count here
     // belongs to game activity outside this state machine.
@@ -2255,6 +2245,11 @@ pub unsafe fn pump_auto_carrier(boma: *mut smash::app::BattleObjectModuleAccesso
         }
         return;
     }
+
+    if !register_donor_serve(&ef_file) {
+        return;
+    }
+    build_remap_from_served(&ef_file);
 
     if AUTO_CARRIER_STATE
         .compare_exchange(1, 2, Ordering::SeqCst, Ordering::Relaxed)
