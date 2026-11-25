@@ -6471,7 +6471,7 @@ mod tests {
         };
         let mut warnings = Vec::new();
         let built = super::rebuild_runtime_carrier_with_policy(
-            &carrier_base, CARRIER, &[op], &root, &[edit],
+            &carrier_base, CARRIER, std::slice::from_ref(&op), &root, std::slice::from_ref(&edit),
             &[], &[], &[], &mut warnings, true,
         ).expect("native-preserving carrier");
         assert!(warnings.is_empty(), "{warnings:?}");
@@ -6562,6 +6562,44 @@ mod tests {
                 .open(&path).expect("create a new native carrier probe file");
             std::io::Write::write_all(&mut file, &built).expect("write validated probe bytes");
             eprintln!("native carrier rendering probe: {}", path.display());
+        }
+        // Separate experiment: use the compact carrier build (without native emitter
+        // resources), then retain ONLY the clone's EFFN entry. Keep its emitter-set ID
+        // and the VFXB payload byte-for-byte; do not reserialize the shader pools again.
+        if let Some(path) = std::env::var_os("VISIONARY_PRIVATE_CARRIER_PROBE_OUT") {
+            warnings.clear();
+            let compact = super::rebuild_runtime_carrier_with_policy(
+                &carrier_base, CARRIER, std::slice::from_ref(&op), &root,
+                std::slice::from_ref(&edit), &[], &[], &[], &mut warnings, false,
+            ).expect("compact private carrier");
+            assert!(warnings.is_empty(), "{warnings:?}");
+            let parsed = effect_library::NamcoEffectFile::load(&compact).expect("compact carrier parse");
+            let idx = parsed.entry_names.iter().position(|n| n == &clone_name).unwrap();
+            assert_eq!(parsed.header.header_chunk_align, 1);
+            assert_eq!(parsed.header.num_external_models, 0);
+            assert_eq!(parsed.header.multi_part_effects, 0);
+            assert_eq!(parsed.entries[idx].variant_count, 0);
+            assert_eq!(parsed.entries[idx].external_model_idx, 0);
+            assert!(compact.len() > 0x1000 && compact.len() < 4 * 1024 * 1024);
+            assert_eq!(&compact[0x1000..0x1004], b"VFXB");
+            let mut private = vec![0u8; 0x1000];
+            private[..16].copy_from_slice(&compact[..16]);
+            private[8..10].copy_from_slice(&1u16.to_le_bytes());
+            private[16..32].copy_from_slice(&compact[16 + idx * 16..32 + idx * 16]);
+            private[32..32 + clone_name.len()].copy_from_slice(clone_name.as_bytes());
+            private.extend_from_slice(&compact[0x1000..]);
+            let checked = effect_library::NamcoEffectFile::load(&private).expect("private EFF re-read");
+            assert_eq!(checked.entry_names, vec![clone_name.clone()]);
+            assert_eq!(checked.entries.len(), 1);
+            let set = &checked.ptcl_file.as_ref().unwrap().emitter_list.emitter_sets[
+                checked.entries[0].emitter_set_id as usize - 1
+            ];
+            assert!((set.emitters[0].data.particle_scale.scale_x - base_scale * 2.0).abs() < 1e-4);
+            super::verify_shader_indices_resolve(&checked, "private carrier probe").expect("shader indices");
+            let mut out = std::fs::OpenOptions::new().write(true).create_new(true)
+                .open(&path).expect("create private carrier probe");
+            std::io::Write::write_all(&mut out, &private).expect("write private carrier probe");
+            eprintln!("private clone only: {} B; {:?}", private.len(), path);
         }
     }
 
