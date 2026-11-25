@@ -6,7 +6,7 @@ use crate::roster::{RosterKey, index::RosterIndex};
 use egui::Ui;
 
 impl VisionaryApp {
-    fn current_cancel_binding(&self, fighter: &str, key: &RosterKey) -> Option<CancelBinding> {
+    pub(super) fn current_cancel_binding(&self, fighter: &str, key: &RosterKey) -> Option<CancelBinding> {
         let entry = self.state.fighters.iter().find(|entry| entry.name.eq_ignore_ascii_case(fighter))?;
         let index = RosterIndex::build(
             std::slice::from_ref(entry), &self.roster.library, &self.roster.project, None,

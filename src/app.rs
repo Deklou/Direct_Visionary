@@ -3,6 +3,7 @@ use crate::renderer::{HitboxRenderState, ViewportCallback};
 use egui::{Color32, RichText, ScrollArea, Ui};
 mod recovery_rate;
 mod cancels;
+mod acmd_banks;
 mod hitbox_lifetime;
 /// Main egui application for Visionary.
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -3126,6 +3127,9 @@ pub struct VisionaryApp {
     acmd_receiver: Option<std::sync::mpsc::Receiver<AcmdFetchResult>>,
     /// Merged source/capture snapshots remembered for every move visited this session.
     move_source_cache: HashMap<String, crate::mod_project::MoveSourceSnapshot>,
+    active_acmd_binding: Option<crate::cancel_rules::CancelBinding>,
+    parked_legacy_acmd: Option<crate::mod_project::AcmdEdits>,
+    scoped_acmd_banks: HashMap<String, Vec<crate::mod_project::ScopedAcmdEdits>>,
     /// Selection is held here while the source mismatch modal is open.
     source_mismatch_prompt: Option<PendingMoveSourceMismatch>,
     /// Loads and caches `.eff` files for the viewport's effect preview, and resolves the names
@@ -3636,6 +3640,9 @@ impl VisionaryApp {
             pending_project_move_selection: None,
             acmd_receiver: None,
             move_source_cache: HashMap::new(),
+            active_acmd_binding: None,
+            parked_legacy_acmd: None,
+            scoped_acmd_banks: HashMap::new(),
             source_mismatch_prompt: None,
             pending_project_script: None,
             bone_names: Vec::new(),
@@ -3850,6 +3857,7 @@ impl VisionaryApp {
     }
 
     fn set_data_root(&mut self, path: PathBuf) {
+        self.park_acmd_before_reindex();
         save_config_path("data_root", &path);
         self.state.fighters.clear();
         self.cancel_base_slots.clear();
@@ -3921,6 +3929,7 @@ impl VisionaryApp {
     /// Rebuild the fighter list from the data root plus every mod root. Idempotent — called
     /// on data-root change and whenever the mod-root set changes.
     fn reindex_fighters(&mut self) {
+        self.park_acmd_before_reindex();
         // Sub-fighters, bosses and enemies the roster list has never shown. This filters by
         // exact vanilla name only, so a mod that happens to be called e.g. "nanaex" is kept.
         // `element` is the Pyra/Mythra swap manager, not a playable moveset — the same role
@@ -4092,6 +4101,11 @@ impl VisionaryApp {
         };
         let fighter = self.state.fighters[index].name.clone();
         let was_selected = self.state.selected_fighter == Some(index);
+        if was_selected {
+            self.commit_current_edits();
+            self.park_acmd_workspace();
+        }
+        self.scoped_acmd_banks.remove(&fighter);
 
         // Remove only app-owned merged previews and overlays. The source effect file remains the
         // canonical file in the dump/mod root.
@@ -4806,11 +4820,14 @@ impl VisionaryApp {
     /// rather than assuming the fighter's base slot. Shared by [`select_fighter`] (base slot)
     /// and [`select_costume_slot`] (an explicitly chosen slot).
     fn select_fighter_slot(&mut self, idx: usize, slot: u8) {
-        self.selected_costume_slot = slot;
         // A click is an explicit navigation decision, so it supersedes a project-resume move
         // that may still be waiting for this fighter's background motion scan.
         self.pending_project_move_selection = None;
         self.commit_current_edits();
+        self.park_acmd_workspace();
+        self.selected_costume_slot = slot;
+        let fighter_name = self.state.fighters[idx].name.clone();
+        self.open_acmd_workspace(&fighter_name, slot);
         self.source_mismatch_prompt = None;
         self.state.selected_fighter = Some(idx);
         self.state.selected_move = None;
@@ -10127,7 +10144,9 @@ impl VisionaryApp {
         // belongs to that costume rather than to the fighter as a whole. The export then gates
         // it, so the donor's other costumes keep their own version of the move. A multi-skin
         // character scopes to every slot it owns, so one moveset covers c08–c15.
-        let slot_scopes = self.roster.slot_scopes_for(&fighter.name);
+        let slot_scopes = self.active_acmd_binding.as_ref()
+            .filter(|binding| binding.scope.fighter.eq_ignore_ascii_case(&fighter.name))
+            .map(|binding| binding.scope.slots.clone()).unwrap_or_default();
         self.state.edit_log.save_scoped_multi(
             &fighter.name,
             &fighter.display_name,
@@ -10330,6 +10349,7 @@ impl VisionaryApp {
             }
         }
 
+        self.draw_acmd_workspace_target(ui);
         ui.separator();
         sidebar_section_heading(
             ui,
@@ -19116,6 +19136,7 @@ If you step every basis for a                          type and NONE of them mat
                 .capture_branch_warnings
                 .insert(move_name.to_string(), warning.clone());
         }
+        self.save_acmd_workspaces(&mut project);
         project
     }
 
@@ -19472,6 +19493,9 @@ If you step every basis for a                          type and NONE of them mat
         };
         self.game_link.begin_project_batch();
         self.clear_all_game_edits();
+        self.reset_acmd_workspaces();
+        self.state.selected_move = None;
+        clear_move_state(&mut self.state);
         self.eff_editor.reset_project_state();
         self.state.edit_log.entries.clear();
         self.state.effect_call_edits.clear();
@@ -20830,6 +20854,7 @@ If you step every basis for a                          type and NONE of them mat
         // cleared before the replacement has been materialized.
         self.game_link.begin_project_batch();
         self.clear_all_game_edits();
+        self.reset_acmd_workspaces();
         let previously_loaded_eff = self
             .eff_editor
             .loaded_rel()
@@ -20871,6 +20896,9 @@ If you step every basis for a                          type and NONE of them mat
         let mut n_calls = 0;
         let mut n_eff = 0;
         for (fighter, mut fm) in project.fighters {
+            if !fm.scoped_acmd.is_empty() {
+                self.scoped_acmd_banks.insert(fighter.clone(), std::mem::take(&mut fm.scoped_acmd));
+            }
             if !fm.cancel_rules.is_empty() {
                 self.cancel_rules_store.insert(fighter.clone(), std::mem::take(&mut fm.cancel_rules));
             }
@@ -35569,6 +35597,14 @@ impl eframe::App for VisionaryApp {
             save_mod_roots(&self.extra_roots);
             self.reindex_fighters();
         } else if self.roster.project.authored != cancel_roster_before {
+            // Keep the old identity if the roster changed underneath the active bank.
+            if let Some(index) = self.state.selected_fighter {
+                let slot = self.selected_costume_slot;
+                let fighter = self.state.fighters.get(index).map(|entry| entry.name.clone());
+                if fighter.as_deref().and_then(|name| self.acmd_binding_for_slot(name, slot)) != self.active_acmd_binding {
+                    self.select_fighter_slot(index, slot);
+                }
+            }
             self.publish_cancel_rules();
         }
         self.perf.end("eff_editor", t);
