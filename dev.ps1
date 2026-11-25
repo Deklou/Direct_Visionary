@@ -36,7 +36,11 @@ function Start-Visionary {
     if (-not (Test-Path -LiteralPath $sdDir -PathType Container)) {
         throw "Dossier Visionary introuvable : $sdDir"
     }
-    $env:VISIONARY_SD_DIR = $sdDir
+    $gameSdDir = Join-Path $portable 'sdcard'
+    if (-not (Test-Path -LiteralPath $gameSdDir -PathType Container)) {
+        throw "SD Ryujinx introuvable : $gameSdDir"
+    }
+    $env:VISIONARY_SD_DIR = $gameSdDir
     Write-Host 'Lancement de Visionary...'
     & $gui
 }
@@ -54,7 +58,7 @@ Push-Location $repo
 try {
     $branch = (& git branch --show-current).Trim()
     Test-LastExit 'git branch'
-    if ($branch -notin @('dev', 'test/tcp-communication', 'test/visualisation-collisions')) {
+    if ($branch -notin @('dev', 'test/tcp-communication', 'test/visualisation-collisions', 'test/cibles-edition')) {
         throw "Branche '$branch' : compilation de test non autorisee."
     }
     if (Get-Process -Name visionary -ErrorAction SilentlyContinue) {
