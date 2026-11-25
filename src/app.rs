@@ -15134,6 +15134,9 @@ impl VisionaryApp {
                         3 => false,
                         _ => disabled_now,
                     };
+                    let apply_geometry = action <= 1
+                        || self.hurtbox_geometry_rules.get(&(kind, edited.index as u32))
+                            .is_some_and(|rule| rule.apply_geometry);
                     let rule = crate::game_link::HurtboxGeometryWire {
                         fighter_kind: kind,
                         index: edited.index as u32,
@@ -15143,6 +15146,7 @@ impl VisionaryApp {
                         radius: edited.radius,
                         status,
                         disabled,
+                        apply_geometry,
                     };
                     self.hurtbox_geometry_rules.insert((kind, rule.index), rule);
                     let all: Vec<_> = self.hurtbox_geometry_rules.values().cloned().collect();
