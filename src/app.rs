@@ -3129,6 +3129,7 @@ pub struct VisionaryApp {
     move_source_cache: HashMap<String, crate::mod_project::MoveSourceSnapshot>,
     active_acmd_binding: Option<crate::cancel_rules::CancelBinding>,
     parked_legacy_acmd: Option<crate::mod_project::AcmdEdits>,
+    legacy_acmd_costumes: HashMap<String, Vec<u8>>,
     scoped_acmd_banks: HashMap<String, Vec<crate::mod_project::ScopedAcmdEdits>>,
     /// Selection is held here while the source mismatch modal is open.
     source_mismatch_prompt: Option<PendingMoveSourceMismatch>,
@@ -3642,6 +3643,7 @@ impl VisionaryApp {
             move_source_cache: HashMap::new(),
             active_acmd_binding: None,
             parked_legacy_acmd: None,
+            legacy_acmd_costumes: HashMap::new(),
             scoped_acmd_banks: HashMap::new(),
             source_mismatch_prompt: None,
             pending_project_script: None,
@@ -4106,6 +4108,7 @@ impl VisionaryApp {
             self.park_acmd_workspace();
         }
         self.scoped_acmd_banks.remove(&fighter);
+        self.legacy_acmd_costumes.remove(&fighter);
 
         // Remove only app-owned merged previews and overlays. The source effect file remains the
         // canonical file in the dump/mod root.
@@ -5261,6 +5264,13 @@ impl VisionaryApp {
 
     fn select_move(&mut self, move_entry: MoveEntry) {
         if self.source_mismatch_prompt.is_some() {
+            return;
+        }
+        let verified = self.state.selected_fighter
+            .and_then(|index| self.state.fighters.get(index))
+            .and_then(|fighter| self.acmd_binding_for_slot(&fighter.name, self.selected_costume_slot));
+        if verified.is_none() || verified != self.active_acmd_binding {
+            self.state.status = "Choose a verified character costume before opening an ACMD move. Unassigned edits remain saved.".into();
             return;
         }
         // Panel edits are keyed at the end of the frame, but a click can navigate before that
@@ -10140,10 +10150,8 @@ impl VisionaryApp {
         } else {
             rebuild_script_from_hitboxes(&self.state.script, &self.state.hitboxes)
         };
-        // When the Roster window has a character you added set as the edit target, this move
-        // belongs to that costume rather than to the fighter as a whole. The export then gates
-        // it, so the donor's other costumes keep their own version of the move. A multi-skin
-        // character scopes to every slot it owns, so one moveset covers c08–c15.
+        // The owner was established when this workspace was opened. A change of preview
+        // costume or roster cannot retrospectively reassign its edits.
         let slot_scopes = self.active_acmd_binding.as_ref()
             .filter(|binding| binding.scope.fighter.eq_ignore_ascii_case(&fighter.name))
             .map(|binding| binding.scope.slots.clone()).unwrap_or_default();
@@ -18985,17 +18993,8 @@ If you step every basis for a                          type and NONE of them mat
         for (fighter, moves) in &self.cancel_rules_store {
             project.fighters.entry(fighter.clone()).or_default().cancel_rules = moves.clone();
         }
-        // Scope every fighter's edits to the slot-add mod they were made against, if any. This
-        // is recorded per fighter rather than derived at export time because the export runs
-        // from a saved project, which may be reopened with different roots configured — or
-        // none.
-        let roots = self.all_roots();
-        let data_root = self.state.data_root.clone();
-        let previewed = self.selected_costume_slot;
-        for (fighter, fm) in project.fighters.iter_mut() {
-            fm.costume_slots =
-                crate::data::mod_costume_slots(&roots, fighter, previewed, data_root.as_deref());
-        }
+        // Legacy scopes are retained from the saved file, never inferred from whichever
+        // costume happens to be previewed while saving another character's edits.
         let effect_keys: std::collections::BTreeSet<&String> = self
             .state
             .effect_call_edits
@@ -19494,7 +19493,13 @@ If you step every basis for a                          type and NONE of them mat
         self.game_link.begin_project_batch();
         self.clear_all_game_edits();
         self.reset_acmd_workspaces();
+        self.state.selected_fighter = None;
         self.state.selected_move = None;
+        self.acmd_receiver = None;
+        self.pending_project_script = None;
+        self.pending_project_move_selection = None;
+        self.move_list_receiver = None;
+        self.move_list.clear();
         clear_move_state(&mut self.state);
         self.eff_editor.reset_project_state();
         self.state.edit_log.entries.clear();
@@ -20896,6 +20901,9 @@ If you step every basis for a                          type and NONE of them mat
         let mut n_calls = 0;
         let mut n_eff = 0;
         for (fighter, mut fm) in project.fighters {
+            if !fm.costume_slots.is_empty() {
+                self.legacy_acmd_costumes.insert(fighter.clone(), fm.costume_slots.clone());
+            }
             if !fm.scoped_acmd.is_empty() {
                 self.scoped_acmd_banks.insert(fighter.clone(), std::mem::take(&mut fm.scoped_acmd));
             }

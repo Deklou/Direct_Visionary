@@ -133,6 +133,9 @@ impl VisionaryApp {
     /// Before saving, separate the active editor maps from the legacy maps. Parked banks
     /// are copied verbatim, even when their owner is no longer installed or has changed.
     pub(super) fn save_acmd_workspaces(&self, project: &mut ModProjectFile) {
+        for (fighter, slots) in &self.legacy_acmd_costumes {
+            project.fighters.entry(fighter.clone()).or_default().costume_slots = slots.clone();
+        }
         for (fighter, banks) in &self.scoped_acmd_banks {
             if !banks.is_empty() {
                 project.fighters.entry(fighter.clone()).or_default().scoped_acmd = banks.clone();
@@ -155,6 +158,7 @@ impl VisionaryApp {
         self.active_acmd_binding = None;
         self.parked_legacy_acmd = None;
         self.scoped_acmd_banks.clear();
+        self.legacy_acmd_costumes.clear();
     }
 
     /// Called before an index replacement, while the old selection still identifies its owner.
@@ -178,7 +182,7 @@ impl VisionaryApp {
         let Some(index) = self.state.selected_fighter else { return; };
         let Some(fighter) = self.state.fighters.get(index).map(|entry| entry.name.clone()) else { return; };
         let Some(binding) = self.active_acmd_binding.clone() else {
-            ui.weak("Unassigned ACMD workspace — live rules are inactive. Choose a verified costume.");
+            ui.weak("Unassigned ACMD workspace. Choose a verified costume to open moves; saved edits are preserved.");
             return;
         };
         if self.acmd_binding_for_slot(&fighter, self.selected_costume_slot).as_ref() != Some(&binding) {
@@ -196,10 +200,12 @@ impl VisionaryApp {
         let Some(legacy) = self.parked_legacy_acmd.as_ref() else { return; };
         if !legacy.has_edits() { return; }
         ui.weak("Unassigned ACMD edits are preserved but are not shown in this character's bank.");
-        let compatible = legacy.acmd.values().all(|record| {
-            let slots = record.effective_scopes();
-            slots.is_empty() || slots == binding.scope.slots
-        });
+        let compatible = self.legacy_acmd_costumes.get(&fighter)
+            .is_none_or(|slots| slots.is_empty() || slots == &binding.scope.slots)
+            && legacy.acmd.values().all(|record| {
+                let slots = record.effective_scopes();
+                slots.is_empty() || slots == binding.scope.slots
+            });
         let active_empty = !self.snapshot_acmd_workspace(&fighter).has_edits();
         if !compatible {
             ui.weak("Legacy edits contain different costume scopes. Automatic assignment is refused.");
@@ -217,6 +223,7 @@ impl VisionaryApp {
                 record.slot_scopes = binding.scope.slots.iter().copied().skip(1).collect();
             }
             self.parked_legacy_acmd = Some(AcmdEdits::default());
+            self.legacy_acmd_costumes.remove(&fighter);
             let _ = self.take_acmd_workspace(&fighter);
             self.restore_acmd_workspace(&fighter, legacy);
             // The displayed move still has the previous bank's state. Drop it before reloading
