@@ -94,6 +94,12 @@ pub fn source_project(project: &ModProjectFile) -> Result<Option<GeneratedSource
             // Without it the generated script would remove this move from every other costume
             // of the fighter, so a missing original is refused rather than exported wide.
             let scopes = record.effective_scopes();
+            if scopes.is_empty() && (has_shared_fighter || !edits.costume_slots.is_empty()) {
+                bail!(
+                    "{fighter}/{move_name}: game_ edit has no verified per-move costume scope. \
+                     Export refused to protect other costumes."
+                );
+            }
             if !scopes.is_empty() {
                 let original = original_category(edits, move_name, "game", fighter)?;
                 slot_gates.insert(
@@ -1371,6 +1377,37 @@ mod slot_gate_tests {
             Err(error) => error.to_string(),
         };
         assert!(error.contains("original sound_"), "{error}");
+    }
+
+    #[test]
+    fn an_ambiguous_game_edit_is_not_exported_globally() {
+        let mut project = project(None, None);
+        project.fighters.get_mut("mario").unwrap().costume_slots = vec![8];
+        let error = match source_project(&project) {
+            Ok(_) => panic!("a game edit without a move scope must not reach every costume"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("game_ edit has no verified per-move costume scope"), "{error}");
+    }
+
+    #[test]
+    fn an_unscoped_game_edit_with_an_authored_character_is_ambiguous() {
+        let mut project = project(None, None);
+        project.roster.authored.push(crate::mod_project::AuthoredEntry {
+            key: crate::roster::RosterKey::slot("mario", 8),
+            donor: "mario".into(),
+            slot: 8,
+            slots: Vec::new(),
+            display_name: "My Mario".into(),
+            name_id: "my_mario".into(),
+            moveset_scaffolded: false,
+            files_root: None,
+        });
+        let error = match source_project(&project) {
+            Ok(_) => panic!("adding a costume must not widen an existing game edit"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("game_ edit has no verified per-move costume scope"), "{error}");
     }
 
     #[test]
