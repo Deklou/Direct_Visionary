@@ -172,6 +172,24 @@ fn rebuild_runtime_carrier_with_policy(
         .and_then(|ptcl| ptcl.shader_info.as_ref())
         .and_then(|shader| shader.compute_binary.clone());
 
+    // Preserve all original shader indices, including currently unreferenced native
+    // variations. Only appended donor variations are eligible for compaction.
+    let native_shader_prefix = if preserve_native {
+        let shader = carrier.ptcl_file.as_ref().and_then(|p| p.shader_info.as_ref());
+        let count = |bytes: Option<&Vec<u8>>| -> Result<usize> {
+            match bytes {
+                Some(bytes) => variation_count(bytes),
+                None => Ok(0),
+            }
+        };
+        (
+            count(shader.and_then(|s| s.binary_data.as_ref()))?,
+            count(shader.and_then(|s| s.compute_binary.as_ref()))?,
+        )
+    } else {
+        (0, 0)
+    };
+
     // Load every donor once, then decide which shader strategy the whole carrier uses.
     let mut donors: Vec<(String, effect_library::NamcoEffectFile)> = Vec::new();
     let mut plan: Vec<(&TransplantOp, usize)> = Vec::new();
@@ -337,6 +355,8 @@ fn rebuild_runtime_carrier_with_policy(
     if !preserve_native {
         prune_unreferenced_resources(&mut carrier, &swap_targets)?;
         compact_shader_containers(&mut carrier)?;
+    } else {
+        compact_shader_containers_with_prefix(&mut carrier, native_shader_prefix)?;
     }
 
     verify_shader_indices_resolve(&carrier, "live carrier")?;
@@ -1010,6 +1030,13 @@ fn prune_unreferenced_resources(
 /// a pointer to the image base and every container the writer touched was corrupt. With the
 /// writer fixed it reproduces the game's own pointer set exactly, so repacking is sound again.
 fn compact_shader_containers(carrier: &mut effect_library::NamcoEffectFile) -> Result<()> {
+    compact_shader_containers_with_prefix(carrier, (0, 0))
+}
+
+fn compact_shader_containers_with_prefix(
+    carrier: &mut effect_library::NamcoEffectFile,
+    native_prefix: (usize, usize),
+) -> Result<()> {
     let Some(ptcl) = carrier.ptcl_file.as_mut() else {
         return Ok(());
     };
@@ -1033,6 +1060,9 @@ fn compact_shader_containers(carrier: &mut effect_library::NamcoEffectFile) -> R
         });
     }
 
+    used_standard.extend((0..native_prefix.0).map(|i| i as i32));
+    used_compute.extend((0..native_prefix.1).map(|i| i as i32));
+
     let (standard_map, compute_map) = {
         let Some(shader) = ptcl.shader_info.as_mut() else {
             return Ok(());
@@ -1052,6 +1082,7 @@ fn compact_shader_containers(carrier: &mut effect_library::NamcoEffectFile) -> R
         let mut failed = None;
         visit_emitters(&mut set.emitters, &mut 0, &mut |_, em| {
             let refs = &mut em.data.shader_references;
+            let mut changed = false;
             for (index, map, kind) in [
                 (&mut refs.shader_index, &standard_map, "shader"),
                 (&mut refs.user_shader_index1, &standard_map, "shader"),
@@ -1066,13 +1097,20 @@ fn compact_shader_containers(carrier: &mut effect_library::NamcoEffectFile) -> R
                     continue;
                 }
                 match map.get(index) {
-                    Some(new) => *index = *new,
+                    Some(new) => {
+                        changed |= *index != *new;
+                        *index = *new;
+                    }
                     None => failed = Some((kind, *index)),
                 }
             }
             // `custom_shader_index` is deliberately untouched: it is a small custom-shader mode,
             // not an index into the variation array.
-            em.cached_binary = None; // indices moved → the cached EMTR blob is stale
+            // In preservation mode retain native EMTR bytes when their indices did not
+            // move. Keep the original invalidation policy for the legacy compactor.
+            if changed || native_prefix == (0, 0) {
+                em.cached_binary = None;
+            }
         });
         if let Some((kind, index)) = failed {
             anyhow::bail!(
@@ -6495,6 +6533,12 @@ mod tests {
                 output.as_ref().expect("native shader container retained")
             ).expect("rebuilt BNSH");
             assert!(rebuilt_programs.variations.len() >= native_programs.variations.len());
+            eprintln!("{label} shader variations: {} -> {}",
+                native_programs.variations.len(), rebuilt_programs.variations.len());
+            if label == "standard" {
+                assert!(rebuilt_programs.variations.len() < 225,
+                    "unused donor shader variations were not removed");
+            }
             for (index, (native, rebuilt)) in native_programs.variations.iter()
                 .zip(rebuilt_programs.variations.iter()).enumerate()
             {
