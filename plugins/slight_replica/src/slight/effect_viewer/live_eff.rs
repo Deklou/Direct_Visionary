@@ -295,6 +295,49 @@ fn reload_inner(apply_live: bool) {
     );
 }
 
+/// Serve only the new, explicitly staged fighter path. Never read the old manifest,
+/// co-load a donor, replace a resident buffer, or reparse a loaded fighter.
+pub fn replace_scoped_preview(preview: Option<crate::slight::rule_scope::ScopedEffPreview>) {
+    let Some(preview) = preview.filter(|p| p.valid()) else {
+        *SERVED.lock() = Some(HashMap::new());
+        return;
+    };
+    if crate::slight::slight_consts::fighters::game_kind_name(preview.fighter_kind)
+        != Some(preview.fighter.as_str()) {
+        *SERVED.lock() = Some(HashMap::new());
+        crate::slight::diag::note("scoped EFF preview rejected: fighter identity");
+        return;
+    }
+    let file = format!("sd:/{}", preview.sd_rel_path());
+    let hash = smash::hash40(&preview.arc_path());
+    if SERVED.lock().as_ref().is_some_and(|m| m.len() == 1 && m.get(&hash) == Some(&file)) {
+        return;
+    }
+    *SERVED.lock() = Some(HashMap::new());
+    let Ok(mut input) = std::fs::File::open(&file) else {
+        crate::slight::diag::note(format!("scoped EFF preview missing: {file}"));
+        return;
+    };
+    let mut magic = [0; 4];
+    if std::io::Read::read_exact(&mut input, &mut magic).is_err() || &magic != b"EFFN" {
+        crate::slight::diag::note("scoped EFF preview rejected: file header");
+        return;
+    }
+    let Some(size) = input.metadata().ok().and_then(|m| usize::try_from(m.len()).ok()) else { return; };
+    let already_registered = REGISTERED.lock().as_ref()
+        .and_then(|m| m.get(&hash).copied()).is_some_and(|old| old >= size);
+    if !already_registered {
+        if !crate::slight::effect_viewer::arcrop::init()
+            || !crate::slight::effect_viewer::arcrop::register_disk(hash, size, disk_cb) {
+            crate::slight::diag::note("scoped EFF preview: callback registration failed");
+            return;
+        }
+        REGISTERED.lock().get_or_insert_with(HashMap::new).insert(hash, size);
+    }
+    *SERVED.lock() = Some(HashMap::from([(hash, file)]));
+    crate::slight::diag::note(format!("scoped EFF preview staged for next load: {}", preview.fighter));
+}
+
 /// The SD path currently served for `hash` (the merged eff bytes), if any. Lets the
 /// synchronous live re-read source merged bytes straight off disk (no arc / no thread).
 pub fn served_path(hash: u64) -> Option<String> {

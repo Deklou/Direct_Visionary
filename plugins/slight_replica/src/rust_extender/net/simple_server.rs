@@ -294,7 +294,7 @@ unsafe fn handshake(client: i32, flags: i32) -> Option<u64> {
     let frames = vec![
         r#"{"header":"RemoveAll","body":"{}"}"#.to_owned(),
         format!(
-            r#"{{"header":"GiveClientId","body":"{{\"GiveClientId\":{{\"client_id\":{cid},\"scoped_cancels\":true,\"scoped_acmd\":true,\"scoped_aliases\":true}}}}"}}"#
+            r#"{{"header":"GiveClientId","body":"{{\"GiveClientId\":{{\"client_id\":{cid},\"scoped_cancels\":true,\"scoped_acmd\":true,\"scoped_aliases\":true,\"scoped_eff_preview\":true}}}}"}}"#
         ),
     ];
     let mut batch = TxBatch::new(frames);
@@ -425,6 +425,8 @@ unsafe fn serve_client(client: i32, flags: i32) {
     // Stop publishing before restoring unsent frames. The next client receives
     // its own handshake before any queued application data.
     CLIENT_FD.store(-1, Ordering::Release);
+    // Queue behind any outstanding preview message; the game thread owns callbacks.
+    inbound_push(r#"{"scoped_eff_preview":null}"#.to_string());
     if let Some(tx) = batch {
         tx.requeue();
     }
