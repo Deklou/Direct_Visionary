@@ -439,6 +439,11 @@ fn hook_req(
 /// `costume` is the fighter colour index, or -1 when it cannot be resolved — slot-gated aliases
 /// then do not match, which is the documented conservative behaviour.
 fn alias_and_remap(eff_hash: phx::Hash40, target: crate::slight::rule_scope::RuntimeTarget) -> phx::Hash40 {
+    // Opt-in independent carrier probe: the synthetic name is only reachable from
+    // the explicit Kirby c00 owner while its private native slot is registered.
+    if let Some(hash) = crate::slight::effect_viewer::effect_reload::private_clone_alias(eff_hash.hash, target) {
+        return phx::Hash40 { hash };
+    }
     let aliased = if spawn_rules::any_alias() {
         spawn_rules::alias_for(eff_hash.hash, target).unwrap_or(eff_hash.hash)
     } else {
