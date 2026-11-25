@@ -367,6 +367,25 @@ fn parse_tcp_payload(raw: &str) -> Option<ParsedEdit> {
         return None;
     }
 
+    // An explicit scoped command is ignored by older plugins, rather than being
+    // deserialized as legacy fighter-wide cancels and affecting the vanilla donor.
+    if let Some(value) = v.get("cancel_rules_scoped") {
+        match serde_json::from_value::<Vec<crate::slight::jab_cancel::CancelRule>>(value.clone()) {
+            Ok(rules)
+                if rules.iter().all(|rule| {
+                    rule.costume_slots.as_ref().is_some_and(|slots| !slots.is_empty())
+                }) =>
+            {
+                crate::slight::jab_cancel::set_rules(rules)
+            }
+            Ok(_) => crate::slight::diag::note("scoped cancel rules rejected: missing costumes"),
+            Err(error) => {
+                crate::slight::diag::note(format!("scoped cancel rules parse error: {error}"))
+            }
+        }
+        return None;
+    }
+
     // Experimental custom cancels: game-thread full-list replacement.
     if let Some(value) = v.get("cancel_rules") {
         match serde_json::from_value::<Vec<crate::slight::jab_cancel::CancelRule>>(value.clone()) {
