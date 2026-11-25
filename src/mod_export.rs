@@ -67,6 +67,11 @@ pub struct GeneratedSource {
 /// project. Effect-call deltas are not sufficient by themselves because the generated script
 /// replaces the entire original effect script.
 pub fn source_project(project: &ModProjectFile) -> Result<Option<GeneratedSource>> {
+    // Until the multi-owner generator can emit several bodies for one fighter/motion,
+    // do not silently omit scoped banks or fall back to a fighter-wide replacement.
+    if project.fighters.values().any(|fighter| fighter.scoped_acmd.iter().any(|bank| bank.edits.has_edits())) {
+        bail!("This project contains character-scoped ACMD edits. Multi-owner source export is not connected yet.");
+    }
     validate_authored_owners(project)?;
     let mut acmd_edits = Vec::new();
     let mut effect_edits = Vec::new();
