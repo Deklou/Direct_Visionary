@@ -21416,7 +21416,7 @@ If you step every basis for a                          type and NONE of them mat
         self.effect_control_rules_store.clear();
         self.hitbox_rules_store.clear();
         self.cancel_rules_store.clear();
-        self.game_link.send_cancel_rules(&[]);
+        self.game_link.clear_cancel_rules();
         self.game_link.send_trait_rules(&[]);
         self.game_link.send_spawn_rules(&[]);
         self.game_link.send_effect_control_rules(&[]);

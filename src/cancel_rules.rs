@@ -225,6 +225,19 @@ pub fn scoped_wires(
     Ok(wires)
 }
 
+/// Editing one logical character must not remove another character's rules on the same move.
+pub fn replace_bound_rules(
+    all: &mut Vec<CancelRule>,
+    binding: &CancelBinding,
+    edited: Vec<CancelRule>,
+) {
+    all.retain(|rule| rule.binding.as_ref() != Some(binding));
+    all.extend(edited.into_iter().map(|mut rule| {
+        rule.binding = Some(binding.clone());
+        rule
+    }));
+}
+
 /// Only publish rules whose saved identity still resolves to the same costume set.
 pub fn resolved_wires(
     store: &HashMap<String, HashMap<String, Vec<CancelRule>>>,
@@ -376,6 +389,28 @@ mod tests {
         let changed_owner = binding(Some(8), vec![8, 9], Some("replacement"));
         assert!(resolved_wires(&store, |_, _| Some(changed_owner.clone())).is_empty());
         assert_eq!(resolved_wires(&store, |_, _| Some(saved.clone())).len(), 1);
+    }
+
+    #[test]
+    fn editing_or_removing_one_scoped_cancel_keeps_the_other_owners() {
+        let vanilla = binding(None, (0..8).collect(), None);
+        let first = binding(Some(8), vec![8, 9], Some("first"));
+        let second = binding(Some(12), vec![12, 13], Some("second"));
+        let original = bound_rule(Some(vanilla), CancelTarget::Grab);
+        let other = bound_rule(Some(second), CancelTarget::Shield);
+        let legacy = bound_rule(None, CancelTarget::TiltU);
+        let mut rules = vec![
+            original.clone(),
+            bound_rule(Some(first.clone()), CancelTarget::Jump),
+            other.clone(),
+            legacy.clone(),
+        ];
+        replace_bound_rules(&mut rules, &first, vec![bound_rule(None, CancelTarget::Dash)]);
+        assert_eq!(rules.len(), 4);
+        assert_eq!(rules[3].binding.as_ref(), Some(&first));
+        assert_eq!(rules[3].targets, vec![CancelTarget::Dash]);
+        replace_bound_rules(&mut rules, &first, Vec::new());
+        assert_eq!(rules, vec![original, other, legacy]);
     }
 
     #[test]

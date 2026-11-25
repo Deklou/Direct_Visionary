@@ -23,9 +23,8 @@ pub const PROJECT_FILE_NAME: &str = "modproject.json";
 pub const PROJECT_VERSION: u32 = 5;
 
 /// Versions this build can open. Every field added since v1 carries `#[serde(default)]`, so
-/// an older project loads with the new sections empty — which is exactly what was true when
-/// it was written. The version number is therefore a record of what wrote the file, not a
-/// gate, and [`ModProjectFile::migrate`] is what brings a loaded project up to date.
+/// an older project loads with the new sections empty. [`ModProjectFile::migrate`] brings
+/// it up to date and refuses files from newer editors.
 pub const OLDEST_SUPPORTED_VERSION: u32 = 1;
 
 /// The source and runtime provenance needed to reopen one move without fetching it again.

@@ -1650,15 +1650,12 @@ impl GameLink {
         }
     }
 
-    /// Replace all experimental custom cancels. Empty disables the override.
-    pub fn send_cancel_rules(&self, rules: &[crate::cancel_rules::CancelRuleWire]) {
+    /// Clear the runtime list even on a legacy plugin. Non-empty rules always use the scoped API.
+    pub fn clear_cancel_rules(&self) {
         if self.sends_suppressed() {
             return;
         }
-        let Ok(payload) = serde_json::to_string(&serde_json::json!({ "cancel_rules": rules })) else {
-            return;
-        };
-        let frame = format!("<TCP_MESSAGE>{payload}</TCP_MESSAGE>");
+        let frame = r#"<TCP_MESSAGE>{"cancel_rules":[]}</TCP_MESSAGE>"#.to_owned();
         if let Ok(mut s) = self.shared.lock() {
             queue_latest_full_replace(&mut s.outbox, frame);
             s.edits_tx += 1;
@@ -2749,7 +2746,7 @@ mod tests {
             "GiveClientId": { "client_id": 6, "scoped_cancels": true }
         }))]);
         assert!(!link.send_scoped_cancel_rules(&legacy));
-        link.send_cancel_rules(&legacy);
+        link.clear_cancel_rules();
         let scope = crate::roster::edit_scope::EditScope {
             key: crate::roster::RosterKey::slot("mario", 8),
             fighter: "mario".into(),

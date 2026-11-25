@@ -43,7 +43,7 @@ impl VisionaryApp {
             }
         }
         // An old or disconnected NRO must never receive a non-empty unscoped fallback.
-        self.game_link.send_cancel_rules(&[]);
+        self.game_link.clear_cancel_rules();
     }
 
     pub(super) fn draw_cancel_rules_section(&mut self, ui: &mut Ui) {
@@ -236,8 +236,7 @@ impl VisionaryApp {
 
         if rules != original || reassigned {
             // Do not overwrite other logical characters sharing this fighter and motion.
-            all_rules.retain(|rule| rule.binding.as_ref() != Some(&binding));
-            all_rules.extend(rules);
+            cancel_rules::replace_bound_rules(&mut all_rules, &binding, rules);
             if all_rules.is_empty() {
                 let empty_fighter = self.cancel_rules_store
                     .get_mut(&fighter)
