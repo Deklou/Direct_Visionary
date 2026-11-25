@@ -150,6 +150,112 @@ fn build_effect_set(
     zero: u64,
 ) -> u64;
 
+// Opt-in, one-shot proof of a private GPU-visible PTCL buffer. This is deliberately
+// NOT the runtime carrier: native name registration, ARC residency and handle ownership
+// stay untouched. Use the exact original Bomberman payload, not a reconstructed EFF.
+// Only the builder's data pointer changes. Retain at most one allocation until process exit;
+// proving safe early reclamation is a separate step.
+const PRIVATE_PROBE_FILE: &str = "sd:/slight/debug/private_carrier_probe.eff";
+const PRIVATE_PROBE_ORIGINAL_LEN: usize = 3_441_152;
+const PRIVATE_PROBE_PTCL_OFFSET: usize = 0x1000;
+static PRIVATE_PROBE_ENABLED: AtomicBool = AtomicBool::new(false);
+static PRIVATE_PROBE_DATA: LazyLock<Mutex<Option<Vec<u8>>>> =
+    LazyLock::new(|| Mutex::new(None));
+thread_local! {
+    static PRIVATE_PROBE_MANAGER: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn prepare_private_buffer_probe() -> bool {
+    if !crate::slight::ver::is_13_0_5() {
+        return false;
+    }
+    let Ok(meta) = std::fs::metadata(PRIVATE_PROBE_FILE) else {
+        return false;
+    };
+    if meta.len() != PRIVATE_PROBE_ORIGINAL_LEN as u64 {
+        skyline::println!("[SLight] PRIVATE_BUFFER_PROBE refused: unexpected EFF length");
+        return false;
+    }
+    let Ok(bytes) = std::fs::read(PRIVATE_PROBE_FILE) else {
+        return false;
+    };
+    if bytes.len() != PRIVATE_PROBE_ORIGINAL_LEN
+        || &bytes[..4] != b"EFFN"
+        || u16::from_le_bytes([bytes[14], bytes[15]]) != 1
+        || &bytes[PRIVATE_PROBE_PTCL_OFFSET..PRIVATE_PROBE_PTCL_OFFSET + 4] != b"VFXB"
+        || bytes[PRIVATE_PROBE_PTCL_OFFSET + 0x0e] != 12
+        || u16::from_le_bytes([
+            bytes[PRIVATE_PROBE_PTCL_OFFSET + 10],
+            bytes[PRIVATE_PROBE_PTCL_OFFSET + 11],
+        ]) != 0x16
+    {
+        skyline::println!("[SLight] PRIVATE_BUFFER_PROBE refused: unexpected EFF header");
+        return false;
+    }
+    *PRIVATE_PROBE_DATA.lock() = Some(bytes);
+    PRIVATE_PROBE_ENABLED.store(true, Ordering::Release);
+    skyline::println!("[SLight] PRIVATE_BUFFER_PROBE armed (one native load)");
+    true
+}
+
+fn private_probe_manager(manager: *mut u64, search_index: u32) -> usize {
+    if !PRIVATE_PROBE_ENABLED.load(Ordering::Acquire)
+        || manager.is_null()
+        || path_hash_from_search_index(search_index)
+            != Some(smash::hash40("effect/assist/bomberman"))
+        || crate::slight::effect_viewer::resource_reload::resident_len(
+            smash::hash40("effect/assist/bomberman/ef_bomberman.eff"),
+        ) != Some(PRIVATE_PROBE_ORIGINAL_LEN)
+    {
+        return 0;
+    }
+    manager as usize
+}
+
+unsafe fn private_probe_ptcl(
+    allocator: *mut u8,
+    native: *const u8,
+) -> Option<*const u8> {
+    let manager = PRIVATE_PROBE_MANAGER.with(|m| m.get());
+    if manager == 0 || allocator as usize != manager + 0x194d8 || native.is_null() {
+        return None;
+    }
+    let mut staged = PRIVATE_PROBE_DATA.lock();
+    let bytes = staged.as_ref()?;
+    let ptcl = &bytes[PRIVATE_PROBE_PTCL_OFFSET..];
+    // Do not substitute if this is a different modded payload or already relocated data.
+    // The caller verified the native file's declared length before entering the builder.
+    if native as usize & 0xfff != 0
+        || std::slice::from_raw_parts(native, ptcl.len()) != ptcl
+    {
+        skyline::println!("[SLight] PRIVATE_BUFFER_PROBE refused: native PTCL differs");
+        return None;
+    }
+    // Consume the request BEFORE the allocation; never retry automatically.
+    PRIVATE_PROBE_ENABLED.store(false, Ordering::Release);
+    let bytes = staged.take()?;
+    drop(staged);
+    let ptcl = &bytes[PRIVATE_PROBE_PTCL_OFFSET..];
+    skyline::println!("[SLight] PRIVATE_BUFFER_PROBE allocating {} bytes", ptcl.len());
+    let buffer = game_effect_alloc(manager as *mut u64, ptcl.len(), 0x1000);
+    if buffer.is_null() {
+        skyline::println!("[SLight] PRIVATE_BUFFER_PROBE native allocation failed");
+        return None;
+    }
+    if buffer as usize & 0xfff != 0 {
+        // Never pass an unaligned allocation to the GPU. The allocation is bounded and
+        // retained until exit even on this unexpected allocator-contract violation.
+        skyline::println!("[SLight] PRIVATE_BUFFER_PROBE refused: allocator alignment");
+        return None;
+    }
+    std::ptr::copy_nonoverlapping(ptcl.as_ptr(), buffer, ptcl.len());
+    skyline::println!(
+        "[SLight] PRIVATE_BUFFER_PROBE private={:#x} native={:#x} bytes={}",
+        buffer as usize, native as usize, ptcl.len()
+    );
+    Some(buffer as *const u8)
+}
+
 /// Observe emitter-set construction for the donor co-load diagnostics.
 #[skyline::hook(offset = crate::slight::ver::o(0xa4d90))]
 fn hook_build_effect_set(
@@ -181,7 +287,12 @@ fn hook_build_effect_set(
             ));
         }
     }
-    original!()(p1, p2, effect_data, slot, flag, zero)
+    let private = unsafe { private_probe_ptcl(p2, effect_data) };
+    let result = original!()(p1, p2, private.unwrap_or(effect_data), slot, flag, zero);
+    if private.is_some() {
+        skyline::println!("[SLight] PRIVATE_BUFFER_PROBE builder result={result} slot={slot}");
+    }
+    result
 }
 
 /// Allocate from the GAME's effect allocator (the object at `mgr+0x194d8` whose vtable+0x10
@@ -1073,7 +1184,10 @@ fn hook_load_effects(manager: *mut u64, handle: u32, search_index: &u32) -> u32 
     if mark_game_alucard {
         GAME_ALUCARD_LOADING.store(true, Ordering::Relaxed);
     }
+    let probe_manager = private_probe_manager(manager, *search_index);
+    let previous = PRIVATE_PROBE_MANAGER.with(|m| m.replace(probe_manager));
     let result = original!()(manager, handle, search_index);
+    PRIVATE_PROBE_MANAGER.with(|m| m.set(previous));
     if mark_game_alucard {
         GAME_ALUCARD_LOADING.store(false, Ordering::Relaxed);
     }
@@ -4028,6 +4142,9 @@ pub fn install_hooks() {
         skyline::install_hook!(hook_ensure_dir_loaded);
         skyline::install_hook!(hook_readiness);
         skyline::install_hook!(hook_drain_queue);
+    }
+    let private_probe = prepare_private_buffer_probe();
+    if trace || private_probe {
         skyline::install_hook!(hook_build_effect_set);
     }
     skyline::println!("[SLight] Effect manager reload hooks installed (trace={trace})");
