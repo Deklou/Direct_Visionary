@@ -30,6 +30,7 @@ pub struct HurtboxGeometryWire {
     pub endpoint2: [f32; 3],
     pub radius: f32,
     pub status: i32,
+    pub disabled: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
