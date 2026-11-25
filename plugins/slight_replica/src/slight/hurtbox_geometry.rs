@@ -2,7 +2,7 @@
 //! Changes are applied on the fighter game thread; no extra hooks or PRC writes.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::LazyLock;
 
 use parking_lot::{Mutex, RwLock};
@@ -21,6 +21,8 @@ pub struct GeometryRule {
     pub status: i32,
     #[serde(default)]
     pub disabled: bool,
+    #[serde(default)]
+    pub apply_geometry: bool,
 }
 
 impl GeometryRule {
@@ -39,6 +41,7 @@ impl GeometryRule {
 
 static RULES: LazyLock<RwLock<Vec<GeometryRule>>> = LazyLock::new(|| RwLock::new(Vec::new()));
 static REVISION: AtomicU64 = AtomicU64::new(0);
+static HAS_DISABLED: AtomicBool = AtomicBool::new(false);
 // Object ID + fighter kind prevent reusing a latch for a different fighter instance.
 static APPLIED: LazyLock<Mutex<HashMap<u32, (i32, u64)>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -52,7 +55,9 @@ pub fn set_rules(rules: Vec<GeometryRule>) {
         crate::slight::diag::note("hurtbox geometry rules rejected (index, value or duplicate)");
         return;
     }
+    let has_disabled = rules.iter().any(|r| r.disabled);
     *RULES.write() = rules;
+    HAS_DISABLED.store(has_disabled, Ordering::Release);
     REVISION.fetch_add(1, Ordering::Release);
 }
 
@@ -71,6 +76,9 @@ pub unsafe fn tick(boma: *mut BattleObjectModuleAccessor) {
     let boid = (*boma).battle_object_id;
     let revision = REVISION.load(Ordering::Acquire);
     let previous = APPLIED.lock().get(&boid).copied();
+    if previous == Some((kind, revision)) && !HAS_DISABLED.load(Ordering::Acquire) {
+        return;
+    }
     let rules: Vec<_> = RULES.read().iter()
         .filter(|r| r.fighter_kind == kind).cloned().collect();
     let already_applied = previous == Some((kind, revision));
@@ -93,6 +101,13 @@ pub unsafe fn tick(boma: *mut BattleObjectModuleAccessor) {
             continue;
         }
         if already_applied {
+            continue;
+        }
+        if !rule.apply_geometry {
+            // Re-enable a previously disabled joint without touching its native geometry.
+            HitModule::set_status_joint(
+                boma, Hash40::new_raw(rule.bone), app::HitStatus(rule.status), 0,
+            );
             continue;
         }
         let start = Vector3f {
@@ -141,6 +156,7 @@ mod tests {
             radius: 4.0,
             status: 0,
             disabled: false,
+            apply_geometry: false,
         };
         assert!(rule.valid());
         assert!(!GeometryRule { radius: f32::NAN, ..rule.clone() }.valid());
