@@ -6507,7 +6507,9 @@ mod tests {
         let rel = "effect/fighter/kirby/ef_kirby.eff";
         let source_bytes = std::fs::read(root.join(rel)).expect("Kirby EFF");
         let source = effect_library::NamcoEffectFile::load(&source_bytes).expect("source parse");
-        let i = source.entry_names.iter().position(|n| n == "kirby_dash").expect("kirby_dash");
+        let i = source.entry_names.iter().position(|n| n.eq_ignore_ascii_case("kirby_dash"))
+            .unwrap_or_else(|| panic!("kirby_dash absent de l'EFF : {:?}", source.entry_names));
+        eprintln!("original entry: {}", source.entry_names[i]);
         let set_idx = source.entries[i].emitter_set_id as usize - 1;
         let emitter = &source.ptcl_file.as_ref().unwrap().emitter_list.emitter_sets[set_idx].emitters[0];
         let base_scale = emitter.data.particle_scale.scale_x;
