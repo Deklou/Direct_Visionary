@@ -183,7 +183,7 @@ fn run_one_frame() {
 
     let after_win = crate::slight::frame_context::is_after_win();
     if !after_win && !FIGHT_STARTED.swap(true, Ordering::Relaxed) {
-        crate::slight::hurtbox_geometry::forget_match();
+        crate::slight::hurtbox_geometry::prune_inactive();
         crate::slight::main_smash::on_fight_start();
         skyline::println!(
             "[SLight] fight start fired — fight_active={}",

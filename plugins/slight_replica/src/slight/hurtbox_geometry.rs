@@ -259,7 +259,18 @@ pub fn set_rules(rules: Vec<GeometryRule>) {
     }
 }
 
-/// Drop per-instance latches on a new match; keep the session's authored rules.
+/// Training can emit fight-start repeatedly without destroying the fighter or
+/// resetting its native hit_data. Retain the original geometry and OFF ownership
+/// for living instances; forget only objects that really disappeared.
+pub fn prune_inactive() {
+    APPLIED.lock().retain(|boid, state| unsafe {
+        !app::sv_battle_object::is_null(*boid)
+            && app::sv_battle_object::is_active(*boid)
+            && app::sv_battle_object::module_accessor(*boid) as usize == state.accessor
+    });
+}
+
+/// Actual match teardown, not the repeatable fight-start notification.
 pub fn forget_match() {
     APPLIED.lock().clear();
 }
