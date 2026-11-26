@@ -283,6 +283,10 @@ static PRIVATE_NATIVE_FOLLOW_POS_NO_STOP_HIT: AtomicBool = AtomicBool::new(false
 static PRIVATE_NATIVE_FOLLOW_NO_SCALE_HIT: AtomicBool = AtomicBool::new(false);
 static PRIVATE_NATIVE_FOOT_HIT: AtomicBool = AtomicBool::new(false);
 static PRIVATE_NATIVE_DETACH_HIT: AtomicBool = AtomicBool::new(false);
+static PRIVATE_NATIVE_FOLLOW_COLOR_HIT: AtomicBool = AtomicBool::new(false);
+static PRIVATE_NATIVE_FOLLOW_ALPHA_HIT: AtomicBool = AtomicBool::new(false);
+static PRIVATE_NATIVE_FOLLOW_UNSYNC_HIT: AtomicBool = AtomicBool::new(false);
+static PRIVATE_NATIVE_FOLLOW_POS_UNSYNC_HIT: AtomicBool = AtomicBool::new(false);
 struct PrivateLiveRequest {
     preview: crate::slight::rule_scope::ScopedEffPreview,
     bytes: Vec<u8>,
@@ -405,6 +409,30 @@ unsafe fn hook_private_native_detach(ctx: &mut skyline::hooks::InlineCtx) {
     private_native_route(ctx, 21, &PRIVATE_NATIVE_DETACH_HIT, "detach");
 }
 
+// EFFECT_FOLLOW_COLOR: first decoded hash in x0, BOMA in x22.
+#[skyline::hook(offset = 0x229a784, inline)]
+unsafe fn hook_private_native_follow_color(ctx: &mut skyline::hooks::InlineCtx) {
+    private_native_route(ctx, 22, &PRIVATE_NATIVE_FOLLOW_COLOR_HIT, "follow_color");
+}
+
+// EFFECT_FOLLOW_ALPHA: first decoded hash in x0, BOMA in x22.
+#[skyline::hook(offset = 0x229da40, inline)]
+unsafe fn hook_private_native_follow_alpha(ctx: &mut skyline::hooks::InlineCtx) {
+    private_native_route(ctx, 22, &PRIVATE_NATIVE_FOLLOW_ALPHA_HIT, "follow_alpha");
+}
+
+// EFFECT_FLW_UNSYNC_VIS: first decoded hash in x0, BOMA in x22.
+#[skyline::hook(offset = 0x2294254, inline)]
+unsafe fn hook_private_native_follow_unsync(ctx: &mut skyline::hooks::InlineCtx) {
+    private_native_route(ctx, 22, &PRIVATE_NATIVE_FOLLOW_UNSYNC_HIT, "follow_unsync");
+}
+
+// EFFECT_FLW_POS_UNSYNC_VIS: first decoded hash in x0, BOMA in x22.
+#[skyline::hook(offset = 0x2293a44, inline)]
+unsafe fn hook_private_native_follow_pos_unsync(ctx: &mut skyline::hooks::InlineCtx) {
+    private_native_route(ctx, 22, &PRIVATE_NATIVE_FOLLOW_POS_UNSYNC_HIT, "follow_pos_unsync");
+}
+
 // Each optional route is independent of the two already validated routes.
 // Verify the full 20-byte patch window used by the far-branch trampoline.
 fn install_private_native_extra_routes() {
@@ -457,6 +485,34 @@ fn install_private_native_extra_routes() {
         skyline::install_hook!(hook_private_native_detach);
     } else {
         skyline::println!("[SLight] PRIVATE_LIVE native detach skipped: signature mismatch");
+    }
+    if unsafe { std::slice::from_raw_parts((text + 0x229a784) as *const u8, 20) }
+        == [0xf4, 0x03, 0x00, 0xaa, 0xff, 0x0a, 0x00, 0x71, 0xe0, 0x2b, 0x00, 0xf9, 0xeb, 0x04, 0x00, 0x54, 0xe1, 0x03, 0x1f, 0x32]
+    {
+        skyline::install_hook!(hook_private_native_follow_color);
+    } else {
+        skyline::println!("[SLight] PRIVATE_LIVE native follow_color skipped: signature mismatch");
+    }
+    if unsafe { std::slice::from_raw_parts((text + 0x229da40) as *const u8, 20) }
+        == [0xf4, 0x03, 0x00, 0xaa, 0xff, 0x0a, 0x00, 0x71, 0xe0, 0x2b, 0x00, 0xf9, 0xeb, 0x04, 0x00, 0x54, 0xe1, 0x03, 0x1f, 0x32]
+    {
+        skyline::install_hook!(hook_private_native_follow_alpha);
+    } else {
+        skyline::println!("[SLight] PRIVATE_LIVE native follow_alpha skipped: signature mismatch");
+    }
+    if unsafe { std::slice::from_raw_parts((text + 0x2294254) as *const u8, 20) }
+        == [0xf4, 0x03, 0x00, 0xaa, 0xff, 0x0a, 0x00, 0x71, 0x8b, 0x0a, 0x00, 0x54, 0xe1, 0x03, 0x1f, 0x32, 0xe0, 0x03, 0x13, 0xaa]
+    {
+        skyline::install_hook!(hook_private_native_follow_unsync);
+    } else {
+        skyline::println!("[SLight] PRIVATE_LIVE native follow_unsync skipped: signature mismatch");
+    }
+    if unsafe { std::slice::from_raw_parts((text + 0x2293a44) as *const u8, 20) }
+        == [0xf4, 0x03, 0x00, 0xaa, 0xff, 0x0a, 0x00, 0x71, 0x8b, 0x0a, 0x00, 0x54, 0xe1, 0x03, 0x1f, 0x32, 0xe0, 0x03, 0x13, 0xaa]
+    {
+        skyline::install_hook!(hook_private_native_follow_pos_unsync);
+    } else {
+        skyline::println!("[SLight] PRIVATE_LIVE native follow_pos_unsync skipped: signature mismatch");
     }
 }
 
@@ -703,6 +759,10 @@ fn pump_private_live() {
     PRIVATE_NATIVE_FOLLOW_NO_SCALE_HIT.store(false, Ordering::Relaxed);
     PRIVATE_NATIVE_FOOT_HIT.store(false, Ordering::Relaxed);
     PRIVATE_NATIVE_DETACH_HIT.store(false, Ordering::Relaxed);
+    PRIVATE_NATIVE_FOLLOW_COLOR_HIT.store(false, Ordering::Relaxed);
+    PRIVATE_NATIVE_FOLLOW_ALPHA_HIT.store(false, Ordering::Relaxed);
+    PRIVATE_NATIVE_FOLLOW_UNSYNC_HIT.store(false, Ordering::Relaxed);
+    PRIVATE_NATIVE_FOLLOW_POS_UNSYNC_HIT.store(false, Ordering::Relaxed);
     PRIVATE_LIVE_HANDLE.store(handle64, Ordering::Release);
     PRIVATE_CLONE_MANAGER.store(manager as usize, Ordering::Release);
     PRIVATE_CLONE_OWNER.store(owner as u64, Ordering::Release);
