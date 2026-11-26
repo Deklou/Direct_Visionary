@@ -276,6 +276,13 @@ static PRIVATE_CLONE_SLOT: AtomicUsize = AtomicUsize::new(0);
 static PRIVATE_LIVE_HIT: AtomicBool = AtomicBool::new(false);
 static PRIVATE_NATIVE_FOLLOW_HIT: AtomicBool = AtomicBool::new(false);
 static PRIVATE_NATIVE_OFF_HIT: AtomicBool = AtomicBool::new(false);
+static PRIVATE_NATIVE_EFFECT_HIT: AtomicBool = AtomicBool::new(false);
+static PRIVATE_NATIVE_FOLLOW_STANDARD_HIT: AtomicBool = AtomicBool::new(false);
+static PRIVATE_NATIVE_FOLLOW_POS_HIT: AtomicBool = AtomicBool::new(false);
+static PRIVATE_NATIVE_FOLLOW_POS_NO_STOP_HIT: AtomicBool = AtomicBool::new(false);
+static PRIVATE_NATIVE_FOLLOW_NO_SCALE_HIT: AtomicBool = AtomicBool::new(false);
+static PRIVATE_NATIVE_FOOT_HIT: AtomicBool = AtomicBool::new(false);
+static PRIVATE_NATIVE_DETACH_HIT: AtomicBool = AtomicBool::new(false);
 struct PrivateLiveRequest {
     preview: crate::slight::rule_scope::ScopedEffPreview,
     bytes: Vec<u8>,
@@ -354,6 +361,103 @@ unsafe fn hook_private_native_follow(ctx: &mut skyline::hooks::InlineCtx) {
 #[skyline::hook(offset = PRIVATE_NATIVE_OFF_SITE, inline)]
 unsafe fn hook_private_native_off(ctx: &mut skyline::hooks::InlineCtx) {
     private_native_route(ctx, 20, &PRIVATE_NATIVE_OFF_HIT, "off");
+}
+
+// EFFECT: first decoded hash in x0, BOMA in x22.
+#[skyline::hook(offset = 0x228b094, inline)]
+unsafe fn hook_private_native_effect(ctx: &mut skyline::hooks::InlineCtx) {
+    private_native_route(ctx, 22, &PRIVATE_NATIVE_EFFECT_HIT, "effect");
+}
+
+// EFFECT_FOLLOW: first decoded hash in x0, BOMA in x22.
+#[skyline::hook(offset = 0x2290820, inline)]
+unsafe fn hook_private_native_follow_standard(ctx: &mut skyline::hooks::InlineCtx) {
+    private_native_route(ctx, 22, &PRIVATE_NATIVE_FOLLOW_STANDARD_HIT, "follow_standard");
+}
+
+// EFFECT_FLW_POS: first decoded hash in x0, BOMA in x22.
+#[skyline::hook(offset = 0x2292a34, inline)]
+unsafe fn hook_private_native_follow_pos(ctx: &mut skyline::hooks::InlineCtx) {
+    private_native_route(ctx, 22, &PRIVATE_NATIVE_FOLLOW_POS_HIT, "follow_pos");
+}
+
+// EFFECT_FLW_POS_NO_STOP: first decoded hash in x0, BOMA in x22.
+#[skyline::hook(offset = 0x2293244, inline)]
+unsafe fn hook_private_native_follow_pos_no_stop(ctx: &mut skyline::hooks::InlineCtx) {
+    private_native_route(ctx, 22, &PRIVATE_NATIVE_FOLLOW_POS_NO_STOP_HIT, "follow_pos_no_stop");
+}
+
+// EFFECT_FOLLOW_NO_SCALE: first decoded hash in x0, BOMA in x22.
+#[skyline::hook(offset = 0x22a5cb0, inline)]
+unsafe fn hook_private_native_follow_no_scale(ctx: &mut skyline::hooks::InlineCtx) {
+    private_native_route(ctx, 22, &PRIVATE_NATIVE_FOLLOW_NO_SCALE_HIT, "follow_no_scale");
+}
+
+// FOOT_EFFECT: first decoded hash in x0, BOMA in x26.
+#[skyline::hook(offset = 0x229767c, inline)]
+unsafe fn hook_private_native_foot(ctx: &mut skyline::hooks::InlineCtx) {
+    private_native_route(ctx, 26, &PRIVATE_NATIVE_FOOT_HIT, "foot");
+}
+
+// EFFECT_DETACH_KIND: first decoded hash in x0, BOMA in x21.
+#[skyline::hook(offset = 0x22a57d0, inline)]
+unsafe fn hook_private_native_detach(ctx: &mut skyline::hooks::InlineCtx) {
+    private_native_route(ctx, 21, &PRIVATE_NATIVE_DETACH_HIT, "detach");
+}
+
+// Each optional route is independent of the two already validated routes.
+// Verify the full 20-byte patch window used by the far-branch trampoline.
+fn install_private_native_extra_routes() {
+    let text = unsafe { skyline::hooks::getRegionAddress(skyline::hooks::Region::Text) as usize };
+    if unsafe { std::slice::from_raw_parts((text + 0x228b094) as *const u8, 20) }
+        == [0xf4, 0x03, 0x00, 0xaa, 0xff, 0x0a, 0x00, 0x71, 0x6b, 0x14, 0x00, 0x54, 0xe1, 0x03, 0x1f, 0x32, 0xe0, 0x03, 0x13, 0xaa]
+    {
+        skyline::install_hook!(hook_private_native_effect);
+    } else {
+        skyline::println!("[SLight] PRIVATE_LIVE native effect skipped: signature mismatch");
+    }
+    if unsafe { std::slice::from_raw_parts((text + 0x2290820) as *const u8, 20) }
+        == [0xf4, 0x03, 0x00, 0xaa, 0xff, 0x0a, 0x00, 0x71, 0xe0, 0x2b, 0x00, 0xf9, 0xeb, 0x04, 0x00, 0x54, 0xe1, 0x03, 0x1f, 0x32]
+    {
+        skyline::install_hook!(hook_private_native_follow_standard);
+    } else {
+        skyline::println!("[SLight] PRIVATE_LIVE native follow_standard skipped: signature mismatch");
+    }
+    if unsafe { std::slice::from_raw_parts((text + 0x2292a34) as *const u8, 20) }
+        == [0xf4, 0x03, 0x00, 0xaa, 0xff, 0x0a, 0x00, 0x71, 0x8b, 0x0a, 0x00, 0x54, 0xe1, 0x03, 0x1f, 0x32, 0xe0, 0x03, 0x13, 0xaa]
+    {
+        skyline::install_hook!(hook_private_native_follow_pos);
+    } else {
+        skyline::println!("[SLight] PRIVATE_LIVE native follow_pos skipped: signature mismatch");
+    }
+    if unsafe { std::slice::from_raw_parts((text + 0x2293244) as *const u8, 20) }
+        == [0xf4, 0x03, 0x00, 0xaa, 0xff, 0x0a, 0x00, 0x71, 0x8b, 0x0a, 0x00, 0x54, 0xe1, 0x03, 0x1f, 0x32, 0xe0, 0x03, 0x13, 0xaa]
+    {
+        skyline::install_hook!(hook_private_native_follow_pos_no_stop);
+    } else {
+        skyline::println!("[SLight] PRIVATE_LIVE native follow_pos_no_stop skipped: signature mismatch");
+    }
+    if unsafe { std::slice::from_raw_parts((text + 0x22a5cb0) as *const u8, 20) }
+        == [0xf4, 0x03, 0x00, 0xaa, 0xff, 0x0a, 0x00, 0x71, 0xe0, 0x2b, 0x00, 0xf9, 0xeb, 0x04, 0x00, 0x54, 0xe1, 0x03, 0x1f, 0x32]
+    {
+        skyline::install_hook!(hook_private_native_follow_no_scale);
+    } else {
+        skyline::println!("[SLight] PRIVATE_LIVE native follow_no_scale skipped: signature mismatch");
+    }
+    if unsafe { std::slice::from_raw_parts((text + 0x229767c) as *const u8, 20) }
+        == [0xf5, 0x03, 0x00, 0xaa, 0xff, 0x0a, 0x00, 0x71, 0xcb, 0x12, 0x00, 0x54, 0xe1, 0x03, 0x1f, 0x32, 0xe0, 0x03, 0x13, 0xaa]
+    {
+        skyline::install_hook!(hook_private_native_foot);
+    } else {
+        skyline::println!("[SLight] PRIVATE_LIVE native foot skipped: signature mismatch");
+    }
+    if unsafe { std::slice::from_raw_parts((text + 0x22a57d0) as *const u8, 20) }
+        == [0xb5, 0xa2, 0x40, 0xf9, 0xf4, 0x03, 0x00, 0xaa, 0xdf, 0x06, 0x00, 0x71, 0x2d, 0x01, 0x00, 0x54, 0xe1, 0x03, 0x1f, 0x32]
+    {
+        skyline::install_hook!(hook_private_native_detach);
+    } else {
+        skyline::println!("[SLight] PRIVATE_LIVE native detach skipped: signature mismatch");
+    }
 }
 
 fn private_live_request(preview: crate::slight::rule_scope::ScopedEffPreview) -> Option<PrivateLiveRequest> {
@@ -592,6 +696,13 @@ fn pump_private_live() {
     PRIVATE_LIVE_HIT.store(false, Ordering::Relaxed);
     PRIVATE_NATIVE_FOLLOW_HIT.store(false, Ordering::Relaxed);
     PRIVATE_NATIVE_OFF_HIT.store(false, Ordering::Relaxed);
+    PRIVATE_NATIVE_EFFECT_HIT.store(false, Ordering::Relaxed);
+    PRIVATE_NATIVE_FOLLOW_STANDARD_HIT.store(false, Ordering::Relaxed);
+    PRIVATE_NATIVE_FOLLOW_POS_HIT.store(false, Ordering::Relaxed);
+    PRIVATE_NATIVE_FOLLOW_POS_NO_STOP_HIT.store(false, Ordering::Relaxed);
+    PRIVATE_NATIVE_FOLLOW_NO_SCALE_HIT.store(false, Ordering::Relaxed);
+    PRIVATE_NATIVE_FOOT_HIT.store(false, Ordering::Relaxed);
+    PRIVATE_NATIVE_DETACH_HIT.store(false, Ordering::Relaxed);
     PRIVATE_LIVE_HANDLE.store(handle64, Ordering::Release);
     PRIVATE_CLONE_MANAGER.store(manager as usize, Ordering::Release);
     PRIVATE_CLONE_OWNER.store(owner as u64, Ordering::Release);
@@ -4546,6 +4657,7 @@ pub fn install_hooks() {
             if native_routes {
                 skyline::install_hook!(hook_private_native_follow);
                 skyline::install_hook!(hook_private_native_off);
+                install_private_native_extra_routes();
                 skyline::println!("[SLight] PRIVATE_LIVE native routes installed (ACMD disabled)");
             }
             PRIVATE_LIVE_SUPPORTED.store(true, Ordering::Release);
