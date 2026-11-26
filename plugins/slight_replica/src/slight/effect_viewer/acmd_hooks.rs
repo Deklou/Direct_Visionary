@@ -1489,7 +1489,7 @@ macro_rules! effect_hook {
                     let preserve_authored = !crate::slight::hitbox_viewer::is_injecting()
                         && preserve_authored_effect(source_boma, args.eff_hash, motion, frame);
                     if !crate::slight::hitbox_viewer::is_injecting()
-                        && crate::slight::effect_viewer::spawn_rules::suppressed(live_rule_target(boma), 
+                        && crate::slight::effect_viewer::spawn_rules::suppressed(live_rule_target(boma),
                             args.eff_hash, motion, frame,
                         )
                         && !preserve_authored
@@ -1498,7 +1498,7 @@ macro_rules! effect_hook {
                     }
                     // Scoped transform wins over the global pin for THIS spawn only.
                     if let Some((pos, rot, scale)) =
-                        crate::slight::effect_viewer::spawn_rules::transform_for(live_rule_target(boma), 
+                        crate::slight::effect_viewer::spawn_rules::transform_for(live_rule_target(boma),
                             args.eff_hash,
                             motion,
                             frame,
@@ -1526,19 +1526,19 @@ macro_rules! effect_hook {
                     }
                     // Looked up separately from the transform: a spawn can be retuned without
                     // being moved, so these must not sit inside the branch above.
-                    set_pending_rate(crate::slight::effect_viewer::spawn_rules::rate_for(live_rule_target(boma), 
+                    set_pending_rate(crate::slight::effect_viewer::spawn_rules::rate_for(live_rule_target(boma),
                         args.eff_hash,
                         motion,
                         frame,
                     ));
                     set_pending_camera_offset(
-                        crate::slight::effect_viewer::spawn_rules::camera_offset_for(live_rule_target(boma), 
+                        crate::slight::effect_viewer::spawn_rules::camera_offset_for(live_rule_target(boma),
                             args.eff_hash,
                             motion,
                             frame,
                         ),
                     );
-                    let (tint, alpha) = crate::slight::effect_viewer::spawn_rules::tint_for(live_rule_target(boma), 
+                    let (tint, alpha) = crate::slight::effect_viewer::spawn_rules::tint_for(live_rule_target(boma),
                         args.eff_hash,
                         motion,
                         frame,
@@ -1546,14 +1546,14 @@ macro_rules! effect_hook {
                     .unwrap_or((None, None));
                     set_pending_tint(tint, alpha);
                     set_pending_particle_tint(
-                        crate::slight::effect_viewer::spawn_rules::particle_tint_for(live_rule_target(boma), 
+                        crate::slight::effect_viewer::spawn_rules::particle_tint_for(live_rule_target(boma),
                             args.eff_hash,
                             motion,
                             frame,
                         ),
                     );
                     set_pending_scale_w(
-                        crate::slight::effect_viewer::spawn_rules::scale_w_for(live_rule_target(boma), 
+                        crate::slight::effect_viewer::spawn_rules::scale_w_for(live_rule_target(boma),
                             args.eff_hash,
                             motion,
                             frame,
@@ -2086,7 +2086,7 @@ macro_rules! color_hook {
                     let preserve_authored = !crate::slight::hitbox_viewer::is_injecting()
                         && preserve_authored_effect(boma, cmd_hash, motion, frame);
                     if !crate::slight::hitbox_viewer::is_injecting()
-                        && crate::slight::effect_viewer::spawn_rules::suppressed(live_rule_target(boma), 
+                        && crate::slight::effect_viewer::spawn_rules::suppressed(live_rule_target(boma),
                             cmd_hash, motion, frame,
                         )
                         && !preserve_authored
@@ -2094,7 +2094,7 @@ macro_rules! color_hook {
                         return;
                     }
                     if let Some((color, transition)) =
-                        crate::slight::effect_viewer::spawn_rules::color_for(live_rule_target(boma), 
+                        crate::slight::effect_viewer::spawn_rules::color_for(live_rule_target(boma),
                             cmd_hash, motion, frame,
                         )
                     {
@@ -2944,7 +2944,7 @@ pub unsafe fn preserve_authored_effect(
     }
     let boid = (*boma).battle_object_id;
     let candidates =
-        crate::slight::effect_viewer::spawn_rules::replacement_injections_for_suppression(live_rule_target(boma), 
+        crate::slight::effect_viewer::spawn_rules::replacement_injections_for_suppression(live_rule_target(boma),
             authored_hash,
             motion,
             frame,

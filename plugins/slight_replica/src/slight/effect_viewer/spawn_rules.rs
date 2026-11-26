@@ -318,7 +318,7 @@ pub fn injections_for(target: RuntimeTarget, motion: u64) -> Vec<(usize, SpawnIn
 /// retimes emit the suppression and replacement adjacent to one another, while colour retimes
 /// carry both fields on one rule. Keeping that relationship here lets the runtime distinguish a
 /// deliberately disabled authored call from a replacement that arrived too late.
-pub fn replacement_injections_for_suppression(target: RuntimeTarget, 
+pub fn replacement_injections_for_suppression(target: RuntimeTarget,
     eff_hash: u64,
     motion: u64,
     frame: f32,
@@ -420,7 +420,7 @@ pub fn stop_suppressed(target: RuntimeTarget, func: &str, eff_hash: u64, motion:
 
 /// Per-spawn transform for the FIRST non-suppress rule matching this spawn — (pos, rot, scale),
 /// each optional. None when no transform rule applies (the spawn keeps the global pin / script).
-pub fn transform_for(target: RuntimeTarget, 
+pub fn transform_for(target: RuntimeTarget,
     eff_hash: u64,
     motion: u64,
     motion_frame: f32,
@@ -467,7 +467,7 @@ pub fn camera_offset_for(target: RuntimeTarget, eff_hash: u64, motion: u64, moti
 /// One lookup for both, unlike the rate above, because both are applied at the same moment to
 /// the same handle — but each half stays optional, so recolouring a spawn does not also assert
 /// an opacity the editor never set.
-pub fn tint_for(target: RuntimeTarget, 
+pub fn tint_for(target: RuntimeTarget,
     eff_hash: u64,
     motion: u64,
     motion_frame: f32,
@@ -518,7 +518,7 @@ pub fn scale_w_for(target: RuntimeTarget, eff_hash: u64, motion: u64, motion_fra
 ///
 /// Returns `None` when no rule applies, so the script's own arguments are left alone; the two
 /// halves are separately optional so retiming a ramp does not have to restate its colour.
-pub fn color_for(target: RuntimeTarget, 
+pub fn color_for(target: RuntimeTarget,
     cmd_hash: u64,
     motion: u64,
     motion_frame: f32,
