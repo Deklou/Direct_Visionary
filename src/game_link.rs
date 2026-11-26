@@ -2955,7 +2955,7 @@ mod tests {
     }
 
     #[test]
-    fn scoped_hurtbox_rules_preserve_costumes_and_clear_legacy_snapshots() {
+    fn scoped_acmd_hurtbox_rules_preserve_costumes_and_clear_legacy_snapshots() {
         let link = scoped_acmd_link();
         let geometry = |costume_slots: Vec<u8>| HurtboxGeometryWire {
             fighter_kind: 25,
@@ -2993,7 +2993,7 @@ mod tests {
     }
 
     #[test]
-    fn plugin_hurtbox_rules_match_scoped_runtime_identity() {
+    fn scoped_acmd_plugin_hurtbox_rules_match_runtime_identity() {
         let source = std::fs::read_to_string(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("plugins/slight_replica/src/slight/hurtbox_geometry.rs")
