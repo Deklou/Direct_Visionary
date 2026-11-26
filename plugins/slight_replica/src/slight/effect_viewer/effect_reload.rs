@@ -261,6 +261,9 @@ unsafe fn private_probe_ptcl(
 // file, names and handle are never changed. No hidden item and no legacy globals.
 const PRIVATE_CLONE_LOAD_SITE: usize = 0x35609ac;
 const PRIVATE_CLONE_CLEAR_SITE: usize = 0x355f9f4;
+// After the native Lua hash conversion, before the hash is copied into the request.
+const PRIVATE_NATIVE_FOLLOW_SITE: usize = 0x2299fa0;
+const PRIVATE_NATIVE_OFF_SITE: usize = 0x229ccd0;
 static PRIVATE_LIVE_SUPPORTED: AtomicBool = AtomicBool::new(false);
 static PRIVATE_LIVE_NEXT_HANDLE: AtomicU64 = AtomicU64::new(0x7f00_0001);
 static PRIVATE_LIVE_HANDLE: AtomicU64 = AtomicU64::new(0);
@@ -271,6 +274,8 @@ static PRIVATE_CLONE_OWNER: AtomicU64 = AtomicU64::new(0);
 static PRIVATE_CLONE_BUFFER: AtomicUsize = AtomicUsize::new(0);
 static PRIVATE_CLONE_SLOT: AtomicUsize = AtomicUsize::new(0);
 static PRIVATE_LIVE_HIT: AtomicBool = AtomicBool::new(false);
+static PRIVATE_NATIVE_FOLLOW_HIT: AtomicBool = AtomicBool::new(false);
+static PRIVATE_NATIVE_OFF_HIT: AtomicBool = AtomicBool::new(false);
 struct PrivateLiveRequest {
     preview: crate::slight::rule_scope::ScopedEffPreview,
     bytes: Vec<u8>,
@@ -302,6 +307,53 @@ fn prepare_private_live() -> bool {
         && std::slice::from_raw_parts((text + PRIVATE_CLONE_CLEAR_SITE - 4) as *const u8, 28)
             == [0x1f,0x69,0x29,0xf8,0x09,0x00,0x80,0x12,0x09,0x03,0x00,0xb9,0x49,0x01,0x00,0xb9,0x09,0x06,0x90,0x52,0x29,0x00,0xa0,0x72,0x1f,0x69,0x29,0xb8]
     }
+}
+
+fn prepare_private_native_routes() -> bool {
+    if !crate::slight::ver::is_13_0_5()
+        || crate::slight::smash_utils::subsystem_disabled("remap")
+    {
+        return false;
+    }
+    let text = unsafe { skyline::hooks::getRegionAddress(skyline::hooks::Region::Text) as usize };
+    unsafe {
+        std::slice::from_raw_parts((text + PRIVATE_NATIVE_FOLLOW_SITE) as *const u8, 16)
+            == [0xf4,0x03,0x00,0xaa,0xff,0x0a,0x00,0x71,0xe0,0x2b,0x00,0xf9,0xeb,0x04,0x00,0x54]
+        && std::slice::from_raw_parts((text + PRIVATE_NATIVE_OFF_SITE) as *const u8, 16)
+            == [0xe1,0x03,0x00,0xaa,0xbf,0x0a,0x00,0x71,0xab,0x02,0x00,0x54,0x68,0x12,0x40,0xf9]
+    }
+}
+
+// Only used when the broad ACMD hook group is disabled. Both sites hold the
+// decoded hash in x0 and the fighter module accessor in a callee-saved register.
+unsafe fn private_native_route(
+    ctx: &mut skyline::hooks::InlineCtx,
+    boma_register: usize,
+    first_hit: &AtomicBool,
+    operation: &str,
+) {
+    if !private_live_has_alias() { return; }
+    let hash = ctx.registers[0].x();
+    let boma = ctx.registers[boma_register].x() as *mut smash::app::BattleObjectModuleAccessor;
+    let Some(target) = crate::slight::hitbox_viewer::rule_target(boma) else { return; };
+    if let Some(to) = private_clone_alias(hash, target) {
+        ctx.registers[0].set_x(to);
+        if !first_hit.swap(true, Ordering::Relaxed) {
+            skyline::println!("[SLight] PRIVATE_LIVE native {operation} routed from={hash:#x} to={to:#x}");
+        }
+    }
+}
+
+// EFFECT_FOLLOW_NO_STOP: x22 = BOMA; displaced MOV x20,x0 saves the effect hash.
+#[skyline::hook(offset = PRIVATE_NATIVE_FOLLOW_SITE, inline)]
+unsafe fn hook_private_native_follow(ctx: &mut skyline::hooks::InlineCtx) {
+    private_native_route(ctx, 22, &PRIVATE_NATIVE_FOLLOW_HIT, "follow");
+}
+
+// EFFECT_OFF_KIND: x20 = BOMA; displaced MOV x1,x0 sets the effect hash argument.
+#[skyline::hook(offset = PRIVATE_NATIVE_OFF_SITE, inline)]
+unsafe fn hook_private_native_off(ctx: &mut skyline::hooks::InlineCtx) {
+    private_native_route(ctx, 20, &PRIVATE_NATIVE_OFF_HIT, "off");
 }
 
 fn private_live_request(preview: crate::slight::rule_scope::ScopedEffPreview) -> Option<PrivateLiveRequest> {
@@ -538,6 +590,8 @@ fn pump_private_live() {
     let to = request.to;
     *PRIVATE_LIVE_ACTIVE.lock() = Some((request.preview, request.from, to));
     PRIVATE_LIVE_HIT.store(false, Ordering::Relaxed);
+    PRIVATE_NATIVE_FOLLOW_HIT.store(false, Ordering::Relaxed);
+    PRIVATE_NATIVE_OFF_HIT.store(false, Ordering::Relaxed);
     PRIVATE_LIVE_HANDLE.store(handle64, Ordering::Release);
     PRIVATE_CLONE_MANAGER.store(manager as usize, Ordering::Release);
     PRIVATE_CLONE_OWNER.store(owner as u64, Ordering::Release);
@@ -4485,9 +4539,19 @@ pub fn install_hooks() {
         skyline::install_hook!(hook_drain_queue);
     }
     if prepare_private_live() {
-        skyline::install_hook!(hook_private_clone_pointer);
-        skyline::install_hook!(hook_private_clone_clear);
-        PRIVATE_LIVE_SUPPORTED.store(true, Ordering::Release);
+        let native_routes = crate::slight::smash_utils::subsystem_disabled("acmd");
+        if !native_routes || prepare_private_native_routes() {
+            skyline::install_hook!(hook_private_clone_pointer);
+            skyline::install_hook!(hook_private_clone_clear);
+            if native_routes {
+                skyline::install_hook!(hook_private_native_follow);
+                skyline::install_hook!(hook_private_native_off);
+                skyline::println!("[SLight] PRIVATE_LIVE native routes installed (ACMD disabled)");
+            }
+            PRIVATE_LIVE_SUPPORTED.store(true, Ordering::Release);
+        } else {
+            skyline::println!("[SLight] PRIVATE_LIVE disabled: native route signatures or remap");
+        }
     }
     let private_probe = prepare_private_buffer_probe();
     if trace || private_probe {
