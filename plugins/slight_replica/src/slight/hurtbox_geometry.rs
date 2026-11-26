@@ -61,13 +61,188 @@ fn valid_snapshot(rules: &[GeometryRule]) -> bool {
     })
 }
 
+// Group zero of HitModule in main 13.0.5. The native setter at +0x4697f0
+// copies 0x38 bytes into record+8; the count getter at +0x46a8b0 reads group+6.
+pub(super) type CapsuleGeometry = ([f32; 3], [f32; 3], f32);
+
+#[derive(Clone, Copy, Debug)]
+struct NativeCapsule {
+    bone: u64,
+    geometry: CapsuleGeometry,
+    part: i32,
+    height: i32,
+    status: i32,
+    shape: i32,
+}
+
+fn geometry_matches(a: CapsuleGeometry, b: CapsuleGeometry) -> bool {
+    (a.2 - b.2).abs() <= 0.001
+        && a.0.iter().zip(b.0.iter()).chain(a.1.iter().zip(b.1.iter()))
+            .all(|(x, y)| (x - y).abs() <= 0.001)
+}
+
+fn valid_capsule_geometry(g: CapsuleGeometry) -> bool {
+    g.2.is_finite() && g.2 > 0.0 && g.2 <= 50.0
+        && g.0.iter().chain(g.1.iter()).all(|v| v.is_finite() && v.abs() <= 200.0)
+}
+
+impl NativeCapsule {
+    fn same_metadata(&self, other: &Self) -> bool {
+        self.bone == other.bone && self.part == other.part && self.height == other.height
+            && self.status == other.status && self.shape == other.shape
+    }
+}
+
+unsafe fn read_at<T: Copy>(base: *const u8, offset: usize) -> T {
+    core::ptr::read_unaligned(base.add(offset).cast::<T>())
+}
+
+/// The vtable guard deliberately rejects unfamiliar HitModule implementations.
+unsafe fn native_capsule(boma: *mut BattleObjectModuleAccessor, index: u32) -> Option<NativeCapsule> {
+    if boma.is_null() || index >= 128 || !crate::slight::ver::is_13_0_5() {
+        return None;
+    }
+    let module: *const u8 = read_at(boma.cast(), 0xb0);
+    if module.is_null() { return None; }
+    let vtable: *const u8 = read_at(module, 0);
+    if vtable.is_null() { return None; }
+    let text = skyline::hooks::getRegionAddress(skyline::hooks::Region::Text) as usize;
+    if text == 0 || read_at::<usize>(vtable, 0x90) != text + 0x4697f0
+        || read_at::<usize>(vtable, 0x170) != text + 0x46a8b0
+        || read_at::<usize>(vtable, 0x148) != text + 0x46a800
+    {
+        return None;
+    }
+    let group: *const u8 = read_at(module, 0x60);
+    let records: *const u8 = read_at(module, 0x70);
+    if group.is_null() || records.is_null() { return None; }
+    let first = read_at::<i16>(group, 4) as i32;
+    let count = read_at::<i16>(group, 6) as i32;
+    if !(0..=128).contains(&first) || !(1..=128).contains(&count)
+        || index as i32 >= count || HitModule::get_part_size(boma, 0) as i32 != count
+    {
+        return None;
+    }
+    let record = records.add((first as usize + index as usize) * 0x50);
+    let capsule = NativeCapsule {
+        bone: read_at(record, 0x28),
+        geometry: (read_at(record, 0x08), read_at(record, 0x14), read_at(record, 0x20)),
+        part: read_at(record, 0x30),
+        height: read_at(record, 0x34),
+        status: read_at(record, 0x38),
+        shape: read_at(record, 0x3c),
+    };
+    // COLLISION_SHAPE_TYPE_CAPSULE = 2 in the 13.0.5 constant registration.
+    (capsule.shape == 2 && capsule.bone > 0 && capsule.bone <= 0xffffffffff
+        && valid_capsule_geometry(capsule.geometry)).then_some(capsule)
+}
+
+#[repr(C, align(16))]
+struct PaddedVector {
+    vector: Vector3f,
+    padding: f32,
+}
+
+impl PaddedVector {
+    fn new(v: [f32; 3]) -> Self {
+        Self { vector: Vector3f { x: v[0], y: v[1], z: v[2] }, padding: 0.0 }
+    }
+}
+
+/// Keep native metadata, including the default status. The public wrapper also
+/// signals the game's geometry update work flag. Its vector loads are 16 bytes.
+unsafe fn write_geometry(boma: *mut BattleObjectModuleAccessor, index: u32,
+                         current: NativeCapsule, geometry: CapsuleGeometry,
+                         action: &str) -> Option<NativeCapsule> {
+    let start = PaddedVector::new(geometry.0);
+    let end = PaddedVector::new(geometry.1);
+    app::FighterUtil::set_hit_data(
+        boma, index as i32, 0, &start.vector, &end.vector, geometry.2,
+        Hash40::new_raw(current.bone), app::CollisionPart(current.part as _),
+        app::HitHeight(current.height as _), app::HitStatus(current.status),
+        app::CollisionShapeType(current.shape as _),
+    );
+    let after = native_capsule(boma, index);
+    let ok = after.as_ref().is_some_and(|v| {
+        current.same_metadata(v) && geometry_matches(v.geometry, geometry)
+    });
+    crate::slight::diag::note(format!(
+        "HURTBOX native {action} boid={} index={index} bone={:#x} ok={ok} before={:?} requested={geometry:?} readback={after:?}",
+        (*boma).battle_object_id, current.bone, current.geometry,
+    ));
+    after.filter(|v| v.bone == current.bone)
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AppliedGeometry {
+    index: u32,
+    bone: u64,
+    original: CapsuleGeometry,
+    written: CapsuleGeometry,
+}
+
+unsafe fn apply_geometry(boma: *mut BattleObjectModuleAccessor, rule: &GeometryRule) -> Option<AppliedGeometry> {
+    // PRC catalog and runtime capsule must agree before the first write.
+    // The catalog is currently per fighter kind, so a different costume's
+    // geometry is rejected rather than inferred.
+    let reference = crate::slight::collision_view::reference_geometry(
+        rule.fighter_kind, rule.index, rule.bone,
+    );
+    let native = native_capsule(boma, rule.index);
+    let Some(current) = native.filter(|v| v.bone == rule.bone
+        && reference.is_some_and(|r| geometry_matches(v.geometry, r))) else {
+        crate::slight::diag::note(format!(
+            "HURTBOX native apply refused fighter={} index={} bone={:#x} reference={reference:?} native={native:?}",
+            rule.fighter_kind, rule.index, rule.bone,
+        ));
+        return None;
+    };
+    let requested = (rule.endpoint1, rule.endpoint2, rule.radius);
+    if geometry_matches(current.geometry, requested) {
+        return None;
+    }
+    let after = write_geometry(boma, rule.index, current, requested, "apply")?;
+    Some(AppliedGeometry {
+        index: rule.index, bone: rule.bone, original: current.geometry, written: after.geometry,
+    })
+}
+
+unsafe fn restore_geometry(boma: *mut BattleObjectModuleAccessor, edit: AppliedGeometry) {
+    let Some(current) = native_capsule(boma, edit.index).filter(|v| v.bone == edit.bone) else {
+        crate::slight::diag::note(format!("HURTBOX native restore refused index={} (layout or bone)", edit.index));
+        return;
+    };
+    if geometry_matches(current.geometry, edit.original) { return; }
+    if !geometry_matches(current.geometry, edit.written) {
+        crate::slight::diag::note(format!("HURTBOX native restore refused index={} (changed elsewhere)", edit.index));
+        return;
+    }
+    // Restore only the geometry we changed, not the entire fighter's hit_data.
+    write_geometry(boma, edit.index, current, edit.original, "restore");
+}
+
+/// None: unedited volume (keep PRC fallback). Some(None): an edited volume
+/// cannot be read safely (omit the marker rather than display requested values).
+pub(super) unsafe fn geometry_for_overlay(
+    boma: *mut BattleObjectModuleAccessor, index: u32, bone: u64,
+) -> Option<Option<CapsuleGeometry>> {
+    let boid = (*boma).battle_object_id;
+    let tracked = APPLIED.lock().get(&boid).is_some_and(|state| {
+        state.accessor == boma as usize
+            && state.geometry.iter().any(|edit| edit.index == index && edit.bone == bone)
+    });
+    if !tracked { return None; }
+    Some(native_capsule(boma, index).filter(|v| v.bone == bone).map(|v| v.geometry))
+}
+
 #[derive(Clone, Debug)]
 struct AppliedState {
     target: RuntimeTarget,
     revision: u64,
     /// Saved default joint statuses, used to undo OFF when a rule disappears.
     disabled_joints: Vec<(u64, i32)>,
-    changed_geometry: bool,
+    accessor: usize,
+    geometry: Vec<AppliedGeometry>,
 }
 
 static RULES: LazyLock<RwLock<Vec<GeometryRule>>> = LazyLock::new(|| RwLock::new(Vec::new()));
@@ -104,7 +279,7 @@ pub unsafe fn tick(boma: *mut BattleObjectModuleAccessor) {
     let previous = APPLIED.lock().get(&boid).cloned();
 
     if let Some(state) = previous.as_ref() {
-        if state.target == target && state.revision == revision {
+        if state.target == target && state.revision == revision && state.accessor == boma as usize {
             for (bone, _) in &state.disabled_joints {
                 HitModule::set_status_joint(boma, Hash40::new_raw(*bone), app::HitStatus(3), 0);
             }
@@ -124,10 +299,12 @@ pub unsafe fn tick(boma: *mut BattleObjectModuleAccessor) {
     // Undo the preceding snapshot before applying the replacement. Do not write
     // old-fighter bones into a new fighter when battle_object_id is recycled.
     if let Some(state) = previous {
-        if state.target.fighter_kind == target.fighter_kind {
-            if state.changed_geometry {
-                app::FighterUtil::reset_hit_data(boma);
+        if state.target == target && state.accessor == boma as usize {
+            for edit in state.geometry.iter().copied() {
+                restore_geometry(boma, edit);
             }
+        }
+        if state.target.fighter_kind == target.fighter_kind {
             for (bone, status) in state.disabled_joints {
                 if !disabled_joints.iter().any(|(new_bone, _)| *new_bone == bone) {
                     HitModule::set_status_joint(boma, Hash40::new_raw(bone), app::HitStatus(status), 0);
@@ -136,25 +313,14 @@ pub unsafe fn tick(boma: *mut BattleObjectModuleAccessor) {
         }
     }
 
-    let mut changed_geometry = false;
-    for rule in &rules {
-        if rule.disabled || !rule.apply_geometry {
-            continue;
+    let mut geometry = Vec::new();
+    if app::smashball::is_training_mode() {
+        for rule in &rules {
+            if rule.disabled || !rule.apply_geometry { continue; }
+            if let Some(edit) = apply_geometry(boma, rule) {
+                geometry.push(edit);
+            }
         }
-        let start = Vector3f {
-            x: rule.endpoint1[0], y: rule.endpoint1[1], z: rule.endpoint1[2],
-        };
-        let end = Vector3f {
-            x: rule.endpoint2[0], y: rule.endpoint2[1], z: rule.endpoint2[2],
-        };
-        // Native geometry write remains experimental until its ABI and PRC index
-        // correspondence have been verified independently in-game.
-        app::FighterUtil::set_hit_data(
-            boma, rule.index as i32, 0, &start, &end, rule.radius,
-            Hash40::new_raw(rule.bone), app::CollisionPart(1),
-            app::HitHeight(1), app::HitStatus(rule.status), app::CollisionShapeType(2),
-        );
-        changed_geometry = true;
     }
 
     for (bone, _) in &disabled_joints {
@@ -165,7 +331,7 @@ pub unsafe fn tick(boma: *mut BattleObjectModuleAccessor) {
         APPLIED.lock().remove(&boid);
     } else {
         APPLIED.lock().insert(boid, AppliedState {
-            target, revision, disabled_joints, changed_geometry,
+            target, revision, disabled_joints, accessor: boma as usize, geometry,
         });
         crate::slight::diag::note(format!(
             "hurtbox geometry applied: fighter {} costume {} {} rule(s), revision {}",
@@ -195,12 +361,22 @@ mod tests {
 
     #[test]
     fn geometry_rules_reject_unsafe_values() {
-        let rule = rule(0, vec![0], 0);
-        assert!(rule.valid());
-        assert!(!GeometryRule { radius: f32::NAN, ..rule.clone() }.valid());
-        assert!(!GeometryRule { index: 128, ..rule.clone() }.valid());
-        assert!(!GeometryRule { endpoint1: [f32::INFINITY; 3], ..rule }.valid());
+        let original = rule(0, vec![0], 0);
+        assert!(original.valid());
+        assert!(!GeometryRule { radius: f32::NAN, ..original.clone() }.valid());
+        assert!(!GeometryRule { index: 128, ..original.clone() }.valid());
+        assert!(!GeometryRule { endpoint1: [f32::INFINITY; 3], ..original }.valid());
         assert!(!valid_snapshot(&[rule(0, Vec::new(), 0)]));
+    }
+
+    #[test]
+    fn native_geometry_comparison_checks_both_ends_and_radius() {
+        let baseline = ([0.0, 1.0, 2.0], [3.0, 4.0, 5.0], 2.0);
+        assert!(valid_capsule_geometry(baseline));
+        assert!(geometry_matches(baseline, ([0.0001, 1.0, 2.0], baseline.1, 2.0)));
+        assert!(!geometry_matches(baseline, (baseline.0, [3.0, 4.0, 6.0], 2.0)));
+        assert!(!geometry_matches(baseline, (baseline.0, baseline.1, 3.0)));
+        assert!(!valid_capsule_geometry((baseline.0, baseline.1, f32::NAN)));
     }
 
     #[test]

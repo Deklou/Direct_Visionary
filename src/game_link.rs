@@ -2999,7 +2999,8 @@ mod tests {
                 .join("plugins/slight_replica/src/slight/hurtbox_geometry.rs")
         ).unwrap();
         assert!(source.contains("target.matches(Some(self.fighter_kind), Some(&self.costume_slots))"));
-        assert!(source.contains("FighterUtil::reset_hit_data(boma)"));
+        assert!(source.contains("restore_geometry(boma, edit)"));
+        assert!(source.contains("reference_geometry("));
         assert!(source.contains("HitModule::set_status_joint("));
         assert!(source.contains("state.disabled_joints"));
     }

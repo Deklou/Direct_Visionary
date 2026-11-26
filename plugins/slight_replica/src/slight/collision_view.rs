@@ -130,6 +130,23 @@ pub fn set_roster(reply: RosterReply) {
     config.requests.remove(&reply.kind);
 }
 
+/// Read the current session's original PRC reference, never an edited value.
+pub(super) fn reference_geometry(kind: i32, index: u32, bone: u64)
+    -> Option<crate::slight::hurtbox_geometry::CapsuleGeometry>
+{
+    let config = CONFIG.lock();
+    let (client, config) = config.as_ref()?;
+    if *client != crate::rust_extender::net::simple_server::client_id()
+        || !crate::rust_extender::net::simple_server::has_client()
+    {
+        return None;
+    }
+    let mut matches = config.roster.get(&kind)?.iter().filter(|v| v.index == index);
+    let v = matches.next()?;
+    if matches.next().is_some() || v.bone != bone { return None; }
+    Some((v.endpoint1, v.endpoint2, v.radius))
+}
+
 fn request_roster(config: &mut Config, kind: i32) {
     if !(0..128).contains(&kind) {
         return;
@@ -252,7 +269,7 @@ unsafe fn desired(boma: *mut BattleObjectModuleAccessor, config: &Config) -> Vec
     report_hit_vtable(boma);
     let kind = app::utility::get_kind(&mut *boma);
     let Some(volumes) = config.roster.get(&kind) else { return out; };
-    // PRC shapes are references, not native geometry readback.
+    // Unedited volumes keep the PRC reference; edited capsules are read from HitModule.
     let parts = HitModule::get_part_size(boma, 0) as i32;
     if !(1..=128).contains(&parts) {
         return out;
@@ -275,7 +292,12 @@ unsafe fn desired(boma: *mut BattleObjectModuleAccessor, config: &Config) -> Vec
         } else {
             continue;
         };
-        append_capsule(&mut out, v.bone, v.endpoint1, v.endpoint2, v.radius, color);
+        let (a, b, radius) = match crate::slight::hurtbox_geometry::geometry_for_overlay(boma, v.index, v.bone) {
+            Some(Some(geometry)) => geometry,
+            Some(None) => continue,
+            None => (v.endpoint1, v.endpoint2, v.radius),
+        };
+        append_capsule(&mut out, v.bone, a, b, radius, color);
     }
     out
 }
