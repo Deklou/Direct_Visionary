@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, Serialize, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct HurtboxGeometryWire {
     pub fighter_kind: i32,
     pub costume_slots: Vec<u8>,

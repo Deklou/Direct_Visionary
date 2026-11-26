@@ -21,7 +21,8 @@ pub const PROJECT_FILE_NAME: &str = "modproject.json";
 /// 5: saved cancel rules carry explicit character/costume bindings; older editors must not
 /// reopen them and publish those rules for every costume.
 /// 6: independent ACMD workspaces for each verified logical character.
-pub const PROJECT_VERSION: u32 = 6;
+/// 7: project-owned hurtbox geometry and joint rules.
+pub const PROJECT_VERSION: u32 = 7;
 
 /// Versions this build can open. Every field added since v1 carries `#[serde(default)]`, so
 /// an older project loads with the new sections empty. [`ModProjectFile::migrate`] brings
@@ -191,6 +192,7 @@ fn scoped_fighter(
         scope_move_map(&fighter.capture_branch_warnings, selected_move);
     // The source-only ACMD exporter cannot install live cancel hooks.
     scoped.cancel_rules.clear();
+    scoped.hurtbox_geometry.clear();
     scoped.live_tweaks = fighter
         .live_tweaks
         .iter()
@@ -243,6 +245,7 @@ impl ModProjectFile {
                 && f.eff.as_ref().map(|e| e.is_empty()).unwrap_or(true)
                 && f.live_tweaks.is_empty()
                 && f.cancel_rules.is_empty()
+                && f.hurtbox_geometry.is_empty()
                 && f.params.is_empty()
         }) && self.roster.is_empty()
     }
@@ -593,6 +596,9 @@ pub fn take_acmd_bank(
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct FighterMod {
+    /// Live hurtbox edits with exact logical character and costume ownership.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hurtbox_geometry: Vec<(crate::cancel_rules::CancelBinding, crate::game_link::HurtboxGeometryWire)>,
     /// Independent ACMD banks; the historical maps below remain unassigned until
     /// the user explicitly moves them to a verified character.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1799,6 +1805,25 @@ mod acmd_bank_tests {
             },
             authored_name_id: (slot != 0).then(|| format!("mario_{slot}")),
         }
+    }
+
+    #[test]
+    fn hurtbox_geometry_round_trips_with_exact_owner_and_counts_as_edit() {
+        let owner = binding(8);
+        let rule = crate::game_link::HurtboxGeometryWire {
+            fighter_kind: 0, costume_slots: owner.scope.slots.clone(),
+            index: 1, bone: 1, endpoint1: [1.0, 2.0, 3.0],
+            endpoint2: [4.0, 5.0, 6.0], radius: 20.0, status: 0,
+            disabled: true, apply_geometry: true,
+        };
+        let mut project = ModProjectFile::default();
+        project.fighters.entry("mario".into()).or_default()
+            .hurtbox_geometry.push((owner.clone(), rule.clone()));
+        assert!(!project.is_empty());
+        let loaded: ModProjectFile = serde_json::from_str(
+            &serde_json::to_string(&project).unwrap()).unwrap();
+        assert_eq!(loaded.fighters["mario"].hurtbox_geometry, vec![(owner, rule)]);
+        assert!(scope_acmd_project(&loaded, AcmdProjectScope::All).is_empty());
     }
 
     fn bank(slot: u8, source: &str) -> ScopedAcmdEdits {

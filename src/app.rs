@@ -3164,11 +3164,10 @@ pub struct VisionaryApp {
     pending_project_script: Option<crate::acmd_src::ProjectScript>,
     // Cached bone names for dropdown
     bone_names: Vec<String>,
-    /// Session-only parameter-defined hurtboxes for the selected fighter. These never enter
-    /// AppState, project serialization, or edit history.
+    /// Parameter-defined reference and preview hurtboxes for the selected fighter.
     hurtbox_volumes: Vec<crate::data::HurtboxVolume>,
     hurtbox_original_volumes: Vec<crate::data::HurtboxVolume>,
-    // Each session-only rule retains the verified logical owner that created it.
+    // Project-owned rules retain the exact verified logical owner that created them.
     hurtbox_geometry_rules: Vec<(crate::cancel_rules::CancelBinding, crate::game_link::HurtboxGeometryWire)>,
     hurtbox_warnings: Vec<crate::data::HurtboxLoadWarning>,
     /// Persistent viewport preference; it remains true across fighters even when a fighter has
@@ -5019,7 +5018,8 @@ impl VisionaryApp {
         if let Some(binding) = geometry_binding {
             for volume in &mut self.hurtbox_volumes {
                 if let Some((_, rule)) = self.hurtbox_geometry_rules.iter()
-                    .find(|(owner, rule)| owner == &binding && rule.index == volume.index as u32)
+                    .find(|(owner, rule)| owner == &binding && rule.index == volume.index as u32
+                        && rule.bone == volume.bone_hash)
                 {
                     volume.endpoint1 = rule.endpoint1;
                     volume.endpoint2 = rule.endpoint2;
@@ -15083,8 +15083,7 @@ impl VisionaryApp {
             return;
         };
 
-        // Geometry is intentionally session-only until the native call is tested on Ryujinx.
-        // It does not change the fighter's PRC or the authored HIT_NO range.
+        // Geometry rules are saved with the project, separately from PRC and HIT_NO ranges.
         let binding = self.state.selected_fighter
             .and_then(|i| self.state.fighters.get(i))
             .and_then(|fighter| {
@@ -15100,7 +15099,7 @@ impl VisionaryApp {
         let mut geometry_action: Option<u8> = None; // 0: apply, 1: restore, 2: disable, 3: enable
         ui.group(|ui| {
             ui.label("Live capsule geometry (experimental)");
-            ui.small("One-shot live preview on Smash 13.0.5. No project/export changes.");
+            ui.small("Saved in the project JSON; live geometry on Smash 13.0.5. Not exported to a standalone mod.");
             if let Some(edit) = self.hurtbox_volumes.get_mut(index) {
                 ui.horizontal(|ui| {
                     ui.label("Radius");
@@ -15161,10 +15160,10 @@ impl VisionaryApp {
                         3 => false,
                         _ => disabled_now,
                     };
-                    let apply_geometry = action <= 1
-                        || self.hurtbox_geometry_rules.iter()
+                    let apply_geometry = action == 0
+                        || (action != 1 && self.hurtbox_geometry_rules.iter()
                             .find(|(owner, rule)| owner == &binding && rule.index == edited.index as u32)
-                            .is_some_and(|(_, rule)| rule.apply_geometry);
+                            .is_some_and(|(_, rule)| rule.apply_geometry));
                     let rule = crate::game_link::HurtboxGeometryWire {
                         fighter_kind: kind,
                         costume_slots: binding.scope.slots.clone(),
@@ -15180,13 +15179,15 @@ impl VisionaryApp {
                     self.hurtbox_geometry_rules.retain(|(owner, existing)| {
                         owner != &binding || existing.index != rule.index
                     });
-                    self.hurtbox_geometry_rules.push((binding, rule));
+                    if rule.disabled || rule.apply_geometry {
+                        self.hurtbox_geometry_rules.push((binding, rule));
+                    }
                     self.send_live_hurtbox_rules();
                     self.state.status = match action {
                         1 => "Original hurtbox geometry queued for live preview.".into(),
                         2 => "Joint OFF for all animations queued; verify real collisions in Ryujinx.".into(),
                         3 => "Joint re-enabled; verify recovery in Ryujinx.".into(),
-                        _ => "Experimental hurtbox geometry queued; verify the result in Ryujinx.".into(),
+                        _ => "Hurtbox geometry stored in project and queued for live preview.".into(),
                     };
                 } else {
                     self.state.status =
@@ -18467,7 +18468,7 @@ If you step every basis for a                          type and NONE of them mat
         self.send_live_hurtbox_rules();
     }
 
-    /// Keep all verified session owners, not just the currently previewed costume.
+    /// Keep all verified project owners, not just the currently previewed costume.
     /// Drop stale bindings and refuse overlapping claims before reaching the plugin.
     fn send_live_hurtbox_rules(&self) {
         if self.game_link.sends_suppressed() {
@@ -19119,6 +19120,10 @@ If you step every basis for a                          type and NONE of them mat
             fighters: HashMap::new(),
             roster: self.roster.project.clone(),
         };
+        for (binding, rule) in &self.hurtbox_geometry_rules {
+            project.fighters.entry(binding.scope.fighter.clone()).or_default()
+                .hurtbox_geometry.push((binding.clone(), rule.clone()));
+        }
         // Trait edits are authored in the Roster window and have no edit-log entry, so a
         // fighter whose only change is a value edit would otherwise be absent from the project
         // entirely — the edit would be saved nowhere and exported nowhere.
@@ -20747,10 +20752,13 @@ If you step every basis for a                          type and NONE of them mat
         let ExportOutcome {
             mut report,
             mut errors,
-            warnings,
+            mut warnings,
             built_source_root,
             has_source,
         } = outcome;
+        if project.fighters.values().any(|f| !f.hurtbox_geometry.is_empty()) {
+            warnings.push("Hurtbox geometry is saved in modproject.json but is not installed by standalone mod export.".into());
+        }
 
         // `run_export` has no generated source to create the destination for an overlay-only
         // project. Create it after verification succeeds, preserving the all-or-nothing refusal
@@ -21061,6 +21069,7 @@ If you step every basis for a                          type and NONE of them mat
         let mut n_calls = 0;
         let mut n_eff = 0;
         for (fighter, mut fm) in project.fighters {
+            self.hurtbox_geometry_rules.append(&mut fm.hurtbox_geometry);
             if !fm.costume_slots.is_empty() {
                 self.legacy_acmd_costumes.insert(fighter.clone(), fm.costume_slots.clone());
             }
@@ -21585,6 +21594,7 @@ If you step every basis for a                          type and NONE of them mat
         self.effect_control_rules_store.clear();
         self.hitbox_rules_store.clear();
         self.hurtbox_geometry_rules.clear();
+        self.hurtbox_volumes = self.hurtbox_original_volumes.clone();
         self.game_link.send_hurtbox_geometry_rules(&[]);
         self.parked_live_acmd.clear();
         self.cancel_rules_store.clear();

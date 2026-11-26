@@ -299,6 +299,7 @@ struct AppliedState {
     accessor: usize,
     geometry: Vec<AppliedGeometry>,
     probe_ticks: u32,
+    geometry_pending: bool,
 }
 
 static RULES: LazyLock<RwLock<Vec<GeometryRule>>> = LazyLock::new(|| RwLock::new(Vec::new()));
@@ -346,7 +347,9 @@ pub unsafe fn tick(boma: *mut BattleObjectModuleAccessor) {
     let previous = APPLIED.lock().get(&boid).cloned();
 
     if let Some(state) = previous.as_ref() {
-        if state.target == target && state.revision == revision && state.accessor == boma as usize {
+        let ready = state.geometry_pending && app::smashball::is_training_mode()
+            && crate::slight::collision_view::has_reference_roster(target.fighter_kind);
+        if state.target == target && state.revision == revision && state.accessor == boma as usize && !ready {
             for (bone, _) in &state.disabled_joints {
                 HitModule::set_status_joint(boma, Hash40::new_raw(*bone), app::HitStatus(3), 0);
             }
@@ -393,7 +396,10 @@ pub unsafe fn tick(boma: *mut BattleObjectModuleAccessor) {
     }
 
     let mut geometry = Vec::new();
-    if app::smashball::is_training_mode() {
+    let training = app::smashball::is_training_mode();
+    let geometry_pending = rules.iter().any(|rule| !rule.disabled && rule.apply_geometry)
+        && (!training || !crate::slight::collision_view::has_reference_roster(target.fighter_kind));
+    if training && !geometry_pending {
         for rule in &rules {
             if rule.disabled || !rule.apply_geometry { continue; }
             if let Some(edit) = apply_geometry(boma, rule) {
@@ -410,7 +416,7 @@ pub unsafe fn tick(boma: *mut BattleObjectModuleAccessor) {
         APPLIED.lock().remove(&boid);
     } else {
         APPLIED.lock().insert(boid, AppliedState {
-            target, revision, disabled_joints, accessor: boma as usize, geometry, probe_ticks: 0,
+            target, revision, disabled_joints, accessor: boma as usize, geometry, probe_ticks: 0, geometry_pending,
         });
         crate::slight::diag::note(format!(
             "HURTBOX rules boid={boid} revision={revision} entries(index,bone,disabled,apply_geometry,radius)={:?}",

@@ -130,6 +130,17 @@ pub fn set_roster(reply: RosterReply) {
     config.requests.remove(&reply.kind);
 }
 
+/// A saved rule can arrive before the first reference reply. Wait for the
+/// current client's catalog (including an explicitly empty reply).
+pub(super) fn has_reference_roster(kind: i32) -> bool {
+    let config = CONFIG.lock();
+    config.as_ref().is_some_and(|(client, config)| {
+        *client == crate::rust_extender::net::simple_server::client_id()
+            && crate::rust_extender::net::simple_server::has_client()
+            && config.roster.contains_key(&kind)
+    })
+}
+
 /// Read the current session's original PRC reference, never an edited value.
 pub(super) fn reference_geometry(kind: i32, index: u32, bone: u64)
     -> Option<crate::slight::hurtbox_geometry::CapsuleGeometry>
