@@ -24,6 +24,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, Serialize, PartialEq)]
 pub struct HurtboxGeometryWire {
     pub fighter_kind: i32,
+    pub costume_slots: Vec<u8>,
     pub index: u32,
     pub bone: u64,
     pub endpoint1: [f32; 3],
@@ -1654,21 +1655,14 @@ impl GameLink {
             .unwrap_or(false)
     }
 
-    /// Replace the session-only fighter hurtbox geometry preview.
-    pub fn send_hurtbox_geometry_rules(&self, rules: &[HurtboxGeometryWire]) {
-        if self.sends_suppressed() {
-            return;
-        }
-        let Ok(payload) = serde_json::to_string(
-            &serde_json::json!({ "hurtbox_geometry_rules": rules })
-        ) else {
-            return;
-        };
-        let frame = format!("<TCP_MESSAGE>{payload}</TCP_MESSAGE>");
-        if let Ok(mut s) = self.shared.lock() {
-            queue_latest_full_replace(&mut s.outbox, frame);
-            s.edits_tx += 1;
-        }
+    /// Scoped, session-only hurtbox preview. Legacy plugins only receive an empty clear.
+    pub fn send_hurtbox_geometry_rules(&self, rules: &[HurtboxGeometryWire]) -> bool {
+        let valid = rules.iter().all(|rule| {
+            rule.fighter_kind >= 0 && !rule.costume_slots.is_empty()
+                && rule.costume_slots.iter().copied().collect::<std::collections::HashSet<_>>().len()
+                    == rule.costume_slots.len()
+        });
+        self.send_scoped_acmd_payload("hurtbox_geometry_rules", rules, valid)
     }
 
     /// Small session-only flags, independent of the hurtbox reference geometry.
