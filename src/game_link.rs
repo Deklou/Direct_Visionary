@@ -21,6 +21,20 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct HurtboxGeometryWire {
+    pub fighter_kind: i32,
+    pub costume_slots: Vec<u8>,
+    pub index: u32,
+    pub bone: u64,
+    pub endpoint1: [f32; 3],
+    pub endpoint2: [f32; 3],
+    pub radius: f32,
+    pub status: i32,
+    pub disabled: bool,
+    pub apply_geometry: bool,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct CollisionReferenceWire {
     pub index: u32,
@@ -1393,6 +1407,7 @@ const FULL_REPLACE_MARKERS: &[&str] = &[
     "\"trait_rules\":",
     "\"spawn_rules\":",
     "\"hitbox_rules\":",
+    "\"hurtbox_geometry_rules\":",
     "\"cancel_rules\":",
     "\"cancel_rules_scoped\":",
     "\"effect_control_rules\":",
@@ -1427,7 +1442,7 @@ fn retain_latest_for_marker(messages: &mut Vec<String>, marker: &str) {
 /// (so a burst of queued states sends once).
 fn retain_latest_full_replace(messages: &mut Vec<String>) {
     // Each legacy clear and scoped snapshot replace the same runtime list.
-    for family in ["cancel_rules", "hitbox_rules", "spawn_rules", "effect_control_rules", "effect_aliases"] {
+    for family in ["cancel_rules", "hitbox_rules", "spawn_rules", "effect_control_rules", "effect_aliases", "hurtbox_geometry_rules"] {
         let legacy = format!("\"{family}\":");
         let scoped = format!("\"{family}_scoped\":");
         let same_family = |frame: &str| frame.contains(&legacy) || frame.contains(&scoped);
@@ -1638,6 +1653,16 @@ impl GameLink {
             .lock()
             .map(|s| s.kinds.contains_key(&id))
             .unwrap_or(false)
+    }
+
+    /// Scoped, session-only hurtbox preview. Legacy plugins only receive an empty clear.
+    pub fn send_hurtbox_geometry_rules(&self, rules: &[HurtboxGeometryWire]) -> bool {
+        let valid = rules.iter().all(|rule| {
+            rule.fighter_kind >= 0 && !rule.costume_slots.is_empty()
+                && rule.costume_slots.iter().copied().collect::<std::collections::HashSet<_>>().len()
+                    == rule.costume_slots.len()
+        });
+        self.send_scoped_acmd_payload("hurtbox_geometry_rules", rules, valid)
     }
 
     /// Small session-only flags, independent of the hurtbox reference geometry.
@@ -2927,6 +2952,76 @@ mod tests {
         let body_str = serde_json::to_string(body).unwrap();
         let body_esc = serde_json::to_string(&body_str).unwrap();
         format!("<TCP_MESSAGE>{{\"header\":\"{header}\",\"body\":{body_esc}}}</TCP_MESSAGE>")
+    }
+
+    #[test]
+    fn scoped_acmd_hurtbox_rules_preserve_costumes_and_clear_legacy_snapshots() {
+        let link = scoped_acmd_link();
+        let geometry = |costume_slots: Vec<u8>| HurtboxGeometryWire {
+            fighter_kind: 25,
+            costume_slots,
+            index: 2,
+            bone: 0x1234,
+            endpoint1: [0.0; 3],
+            endpoint2: [1.0, 0.0, 0.0],
+            radius: 3.0,
+            status: 0,
+            disabled: true,
+            apply_geometry: false,
+        };
+        assert!(link.send_hurtbox_geometry_rules(&[geometry(vec![0, 1, 2, 3])]));
+        assert!(link.send_hurtbox_geometry_rules(&[geometry(vec![8, 9])]));
+        let queued = link.shared.lock().unwrap().outbox.clone();
+        assert_eq!(queued.len(), 1, "one full snapshot replaces the preceding snapshot");
+        let body = &queued[0]["<TCP_MESSAGE>".len()..queued[0].len() - "</TCP_MESSAGE>".len()];
+        let payload: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(payload["hurtbox_geometry_rules_scoped"][0]["fighter_kind"], 25);
+        assert_eq!(payload["hurtbox_geometry_rules_scoped"][0]["costume_slots"],
+            serde_json::json!([8, 9]));
+        assert_eq!(payload["hurtbox_geometry_rules_scoped"][0]["disabled"], true);
+
+        assert!(!link.send_hurtbox_geometry_rules(&[geometry(vec![])]));
+        assert_eq!(link.shared.lock().unwrap().outbox,
+            vec![r#"<TCP_MESSAGE>{"hurtbox_geometry_rules":[]}</TCP_MESSAGE>"#]);
+
+        feed(&link, &[plugin_frame("GiveClientId", &serde_json::json!({
+            "GiveClientId": { "client_id": 8 }
+        }))]);
+        assert!(!link.send_hurtbox_geometry_rules(&[geometry(vec![8, 9])]));
+        assert_eq!(link.shared.lock().unwrap().outbox,
+            vec![r#"<TCP_MESSAGE>{"hurtbox_geometry_rules":[]}</TCP_MESSAGE>"#]);
+    }
+
+    #[test]
+    fn scoped_acmd_plugin_hurtbox_rules_match_runtime_identity() {
+        let source = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("plugins/slight_replica/src/slight/hurtbox_geometry.rs")
+        ).unwrap();
+        assert!(source.contains("target.matches(Some(self.fighter_kind), Some(&self.costume_slots))"));
+        assert!(source.contains("restore_geometry(boma, edit)"));
+        assert!(source.contains("reference_geometry("));
+        assert!(source.contains("HitModule::set_status_joint("));
+        assert!(source.contains("state.disabled_joints"));
+    }
+
+    #[test]
+    fn scoped_acmd_hurtbox_tracking_survives_fight_start() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("plugins/slight_replica/src/slight");
+        let dispatch = std::fs::read_to_string(root.join("agent_extender/mod.rs")).unwrap();
+        let geometry = std::fs::read_to_string(root.join("hurtbox_geometry.rs")).unwrap();
+        let fight_start = dispatch.split("if !after_win && !FIGHT_STARTED.swap")
+            .nth(1).unwrap().split("crate::slight::main_smash::on_fighter_frame()")
+            .next().unwrap();
+        assert!(!fight_start.contains("hurtbox_geometry::"));
+        assert!(!geometry.contains("fn prune_inactive"));
+        assert!(geometry.contains("agents::boid_from_module(boma)"));
+        assert!(!geometry.contains("BOID_MASK"));
+        assert!(!geometry.contains("applied.retain("));
+        assert!(geometry.contains("APPLIED.lock().get(&boid).cloned()"));
+        assert!(geometry.contains("native_capsule(boma, edit.index).is_none()"));
+        assert!(dispatch.contains("hurtbox_geometry::forget_match()"));
     }
 
     #[test]

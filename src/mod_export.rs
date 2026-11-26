@@ -813,6 +813,25 @@ pub fn validate_project(project: &ModProjectFile) -> Result<()> {
     if project.name.trim().is_empty() {
         bail!("project name is empty");
     }
+    let mut claims = std::collections::HashSet::new();
+    let mut count = 0;
+    for (fighter, edits) in &project.fighters {
+        for (binding, rule) in &edits.hurtbox_geometry {
+            count += 1;
+            if count > 128 || !binding.scope.fighter.eq_ignore_ascii_case(fighter)
+                || rule.costume_slots != binding.scope.slots || rule.costume_slots.is_empty()
+                || !(0..=127).contains(&rule.fighter_kind) || rule.index >= 128
+                || rule.bone == 0 || rule.bone > 0xffffffffff
+                || !rule.radius.is_finite() || rule.radius <= 0.0 || rule.radius > 50.0
+                || !(0..=3).contains(&rule.status)
+                || !rule.endpoint1.iter().chain(rule.endpoint2.iter())
+                    .all(|v| v.is_finite() && v.abs() <= 200.0)
+                || !rule.costume_slots.iter().all(|slot| claims.insert((rule.fighter_kind, *slot, rule.index)))
+            {
+                bail!("invalid or overlapping saved hurtbox geometry for {fighter}");
+            }
+        }
+    }
     Ok(())
 }
 

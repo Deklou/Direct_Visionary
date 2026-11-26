@@ -86,6 +86,7 @@ unsafe extern "C" fn fighter_line_main(agent: &mut L2CFighterBase) {
     // status callback.
     crate::slight::hitbox_viewer::inject_tick(lua_state);
     if let Some(boma) = boma_from_lua(lua_state) {
+        crate::slight::hurtbox_geometry::tick(boma);
         crate::slight::collision_view::tick(boma);
     }
     // End-of-motion watch: tells the editor when a captured move's script has finished, so
@@ -182,6 +183,8 @@ fn run_one_frame() {
 
     let after_win = crate::slight::frame_context::is_after_win();
     if !after_win && !FIGHT_STARTED.swap(true, Ordering::Relaxed) {
+        // Fight-start may be raised during a transient fighter reset.
+        // Hurtbox originals survive it; the fighter callback owns their lifetime.
         crate::slight::main_smash::on_fight_start();
         skyline::println!(
             "[SLight] fight start fired — fight_active={}",
@@ -243,6 +246,7 @@ pub fn driver_has_ticked() -> bool {
 }
 
 fn teardown_match() {
+    crate::slight::hurtbox_geometry::forget_match();
     crate::slight::collision_view::forget_match();
     FIGHT_STARTED.store(false, Ordering::Relaxed);
     crate::slight::pending::process();
