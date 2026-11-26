@@ -3168,7 +3168,8 @@ pub struct VisionaryApp {
     /// AppState, project serialization, or edit history.
     hurtbox_volumes: Vec<crate::data::HurtboxVolume>,
     hurtbox_original_volumes: Vec<crate::data::HurtboxVolume>,
-    hurtbox_geometry_rules: BTreeMap<(i32, u32), crate::game_link::HurtboxGeometryWire>,
+    // Each session-only rule retains the verified logical owner that created it.
+    hurtbox_geometry_rules: Vec<(crate::cancel_rules::CancelBinding, crate::game_link::HurtboxGeometryWire)>,
     hurtbox_warnings: Vec<crate::data::HurtboxLoadWarning>,
     /// Persistent viewport preference; it remains true across fighters even when a fighter has
     /// no parameter data, while the checkbox itself is disabled for that fighter.
@@ -3657,7 +3658,7 @@ impl VisionaryApp {
             bone_names: Vec::new(),
             hurtbox_volumes: Vec::new(),
             hurtbox_original_volumes: Vec::new(),
-            hurtbox_geometry_rules: BTreeMap::new(),
+            hurtbox_geometry_rules: Vec::new(),
             hurtbox_warnings: Vec::new(),
             show_hurtboxes: load_hurtbox_visibility(),
             live_collision_flags: [false; 4],
@@ -4118,6 +4119,10 @@ impl VisionaryApp {
         }
         self.scoped_acmd_banks.remove(&fighter);
         self.parked_live_acmd.retain(|bank| !bank.binding.scope.fighter.eq_ignore_ascii_case(&fighter));
+        self.hurtbox_geometry_rules.retain(|(binding, _)| {
+            !binding.scope.fighter.eq_ignore_ascii_case(&fighter)
+        });
+        self.send_live_hurtbox_rules();
         self.legacy_acmd_costumes.remove(&fighter);
 
         // Remove only app-owned merged previews and overlays. The source effect file remains the
@@ -5009,9 +5014,13 @@ impl VisionaryApp {
         self.hurtbox_original_volumes = hurtbox_result.volumes.clone();
         self.hurtbox_volumes = hurtbox_result.volumes;
         self.hurtbox_warnings = hurtbox_result.warnings;
-        if let Some(kind) = fighter_kind_id(&name) {
+        let geometry_binding = self.acmd_binding_for_slot(&name, self.selected_costume_slot)
+            .filter(|binding| self.verified_acmd_binding(binding));
+        if let Some(binding) = geometry_binding {
             for volume in &mut self.hurtbox_volumes {
-                if let Some(rule) = self.hurtbox_geometry_rules.get(&(kind, volume.index as u32)) {
+                if let Some((_, rule)) = self.hurtbox_geometry_rules.iter()
+                    .find(|(owner, rule)| owner == &binding && rule.index == volume.index as u32)
+                {
                     volume.endpoint1 = rule.endpoint1;
                     volume.endpoint2 = rule.endpoint2;
                     volume.radius = rule.radius;
@@ -15076,12 +15085,18 @@ impl VisionaryApp {
 
         // Geometry is intentionally session-only until the native call is tested on Ryujinx.
         // It does not change the fighter's PRC or the authored HIT_NO range.
-        let kind = self.state.selected_fighter
+        let binding = self.state.selected_fighter
             .and_then(|i| self.state.fighters.get(i))
-            .and_then(|fighter| fighter_kind_id(&fighter.name));
-        let disabled_now = kind
-            .and_then(|kind| self.hurtbox_geometry_rules.get(&(kind, volume.index as u32)))
-            .is_some_and(|rule| rule.disabled);
+            .and_then(|fighter| {
+                let binding = self.acmd_binding_for_slot(&fighter.name, self.selected_costume_slot)?;
+                (self.active_acmd_binding.as_ref() == Some(&binding)
+                    && self.verified_acmd_binding(&binding)).then_some(binding)
+            });
+        let kind = binding.as_ref().and_then(|binding| fighter_kind_id(&binding.scope.fighter));
+        let disabled_now = binding.as_ref()
+            .and_then(|binding| self.hurtbox_geometry_rules.iter()
+                .find(|(owner, rule)| owner == binding && rule.index == volume.index as u32))
+            .is_some_and(|(_, rule)| rule.disabled);
         let mut geometry_action: Option<u8> = None; // 0: apply, 1: restore, 2: disable, 3: enable
         ui.group(|ui| {
             ui.label("Live capsule geometry (experimental)");
@@ -15102,26 +15117,29 @@ impl VisionaryApp {
                 }
             }
             ui.horizontal(|ui| {
-                if ui.button("Apply geometry live").clicked() {
+                if ui.add_enabled(binding.is_some(), egui::Button::new("Apply geometry live")).clicked() {
                     geometry_action = Some(0);
                 }
-                if ui.button("Restore original geometry").clicked() {
+                if ui.add_enabled(binding.is_some(), egui::Button::new("Restore original geometry")).clicked() {
                     geometry_action = Some(1);
                 }
             });
             ui.horizontal(|ui| {
-                if ui.button(if disabled_now {
+                if ui.add_enabled(binding.is_some(), egui::Button::new(if disabled_now {
                     "Enable joint globally"
                 } else {
                     "Disable joint globally"
-                }).clicked() {
+                })).clicked() {
                     geometry_action = Some(if disabled_now { 3 } else { 2 });
                 }
-                ui.small("All animations; temporary statuses may override until the next frame.");
+                ui.small("All animations of the verified character/costumes; the whole bone is affected.");
             });
+            if binding.is_none() {
+                ui.weak("Choose a verified character and costume before sending hurtbox edits.");
+            }
         });
         if let Some(action) = geometry_action {
-            if let Some(kind) = kind {
+            if let (Some(kind), Some(binding)) = (kind, binding) {
                 if action == 1 {
                     if let Some(original) = self.hurtbox_original_volumes.iter()
                         .find(|v| v.index == volume.index).cloned()
@@ -15144,10 +15162,12 @@ impl VisionaryApp {
                         _ => disabled_now,
                     };
                     let apply_geometry = action <= 1
-                        || self.hurtbox_geometry_rules.get(&(kind, edited.index as u32))
-                            .is_some_and(|rule| rule.apply_geometry);
+                        || self.hurtbox_geometry_rules.iter()
+                            .find(|(owner, rule)| owner == &binding && rule.index == edited.index as u32)
+                            .is_some_and(|(_, rule)| rule.apply_geometry);
                     let rule = crate::game_link::HurtboxGeometryWire {
                         fighter_kind: kind,
+                        costume_slots: binding.scope.slots.clone(),
                         index: edited.index as u32,
                         bone: edited.bone_hash,
                         endpoint1: edited.endpoint1,
@@ -15157,9 +15177,11 @@ impl VisionaryApp {
                         disabled,
                         apply_geometry,
                     };
-                    self.hurtbox_geometry_rules.insert((kind, rule.index), rule);
-                    let all: Vec<_> = self.hurtbox_geometry_rules.values().cloned().collect();
-                    self.game_link.send_hurtbox_geometry_rules(&all);
+                    self.hurtbox_geometry_rules.retain(|(owner, existing)| {
+                        owner != &binding || existing.index != rule.index
+                    });
+                    self.hurtbox_geometry_rules.push((binding, rule));
+                    self.send_live_hurtbox_rules();
                     self.state.status = match action {
                         1 => "Original hurtbox geometry queued for live preview.".into(),
                         2 => "Joint OFF for all animations queued; verify real collisions in Ryujinx.".into(),
@@ -15170,6 +15192,8 @@ impl VisionaryApp {
                     self.state.status =
                         "Unknown default hurtbox status: geometry not sent.".into();
                 }
+            } else {
+                self.state.status = "No verified character/costume target: hurtbox edit not sent.".into();
             }
         }
 
@@ -18440,6 +18464,33 @@ If you step every basis for a                          type and NONE of them mat
         self.send_live_spawn_rules();
         self.send_live_effect_control_rules();
         self.publish_cancel_rules();
+        self.send_live_hurtbox_rules();
+    }
+
+    /// Keep all verified session owners, not just the currently previewed costume.
+    /// Drop stale bindings and refuse overlapping claims before reaching the plugin.
+    fn send_live_hurtbox_rules(&self) {
+        if self.game_link.sends_suppressed() {
+            return;
+        }
+        let mut claimed = HashSet::new();
+        let mut rules = Vec::new();
+        for (binding, rule) in &self.hurtbox_geometry_rules {
+            if !self.verified_acmd_binding(binding)
+                || fighter_kind_id(&binding.scope.fighter) != Some(rule.fighter_kind)
+                || rule.costume_slots != binding.scope.slots
+            {
+                continue;
+            }
+            if binding.scope.slots.iter().any(|slot| {
+                !claimed.insert((rule.fighter_kind, *slot, rule.index))
+            }) {
+                self.game_link.send_hurtbox_geometry_rules(&[]);
+                return;
+            }
+            rules.push(rule.clone());
+        }
+        self.game_link.send_hurtbox_geometry_rules(&rules);
     }
 
     /// Rehydrate every move represented by a loaded project through the same source parser and
@@ -21533,6 +21584,8 @@ If you step every basis for a                          type and NONE of them mat
         self.effect_rules_store.clear();
         self.effect_control_rules_store.clear();
         self.hitbox_rules_store.clear();
+        self.hurtbox_geometry_rules.clear();
+        self.game_link.send_hurtbox_geometry_rules(&[]);
         self.parked_live_acmd.clear();
         self.cancel_rules_store.clear();
         self.game_link.clear_cancel_rules();
