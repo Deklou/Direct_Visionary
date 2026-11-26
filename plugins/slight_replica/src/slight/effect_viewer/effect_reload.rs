@@ -283,6 +283,14 @@ static PRIVATE_NATIVE_FOLLOW_POS_NO_STOP_HIT: AtomicBool = AtomicBool::new(false
 static PRIVATE_NATIVE_FOLLOW_NO_SCALE_HIT: AtomicBool = AtomicBool::new(false);
 static PRIVATE_NATIVE_FOOT_HIT: AtomicBool = AtomicBool::new(false);
 static PRIVATE_NATIVE_DETACH_HIT: AtomicBool = AtomicBool::new(false);
+static PRIVATE_NATIVE_FOLLOW_FLIP_HIT: AtomicBool = AtomicBool::new(false);
+static PRIVATE_NATIVE_FOLLOW_NO_STOP_FLIP_HIT: AtomicBool = AtomicBool::new(false);
+static PRIVATE_NATIVE_FLIP_HIT: AtomicBool = AtomicBool::new(false);
+static PRIVATE_NATIVE_FLIP_ALPHA_HIT: AtomicBool = AtomicBool::new(false);
+static PRIVATE_NATIVE_FOLLOW_FLIP_ALPHA_HIT: AtomicBool = AtomicBool::new(false);
+static PRIVATE_NATIVE_FOLLOW_FLIP_COLOR_HIT: AtomicBool = AtomicBool::new(false);
+static PRIVATE_NATIVE_FOLLOW_FLIP_ARG13_HIT: AtomicBool = AtomicBool::new(false);
+static PRIVATE_NATIVE_FOLLOW_FLIP_RND_HIT: AtomicBool = AtomicBool::new(false);
 static PRIVATE_NATIVE_FOLLOW_COLOR_HIT: AtomicBool = AtomicBool::new(false);
 static PRIVATE_NATIVE_FOLLOW_ALPHA_HIT: AtomicBool = AtomicBool::new(false);
 static PRIVATE_NATIVE_FOLLOW_UNSYNC_HIT: AtomicBool = AtomicBool::new(false);
@@ -335,20 +343,29 @@ fn prepare_private_native_routes() -> bool {
     }
 }
 
-// Only used when the broad ACMD hook group is disabled. Both sites hold the
-// decoded hash in x0 and the fighter module accessor in a callee-saved register.
+// Only used when the broad ACMD hook group is disabled.
 unsafe fn private_native_route(
     ctx: &mut skyline::hooks::InlineCtx,
     boma_register: usize,
     first_hit: &AtomicBool,
     operation: &str,
 ) {
+    private_native_route_register(ctx, boma_register, 0, first_hit, operation);
+}
+
+unsafe fn private_native_route_register(
+    ctx: &mut skyline::hooks::InlineCtx,
+    boma_register: usize,
+    hash_register: usize,
+    first_hit: &AtomicBool,
+    operation: &str,
+) {
     if !private_live_has_alias() { return; }
-    let hash = ctx.registers[0].x();
+    let hash = ctx.registers[hash_register].x();
     let boma = ctx.registers[boma_register].x() as *mut smash::app::BattleObjectModuleAccessor;
     let Some(target) = crate::slight::hitbox_viewer::rule_target(boma) else { return; };
     if let Some(to) = private_clone_alias(hash, target) {
-        ctx.registers[0].set_x(to);
+        ctx.registers[hash_register].set_x(to);
         if !first_hit.swap(true, Ordering::Relaxed) {
             skyline::println!("[SLight] PRIVATE_LIVE native {operation} routed from={hash:#x} to={to:#x}");
         }
@@ -433,6 +450,55 @@ unsafe fn hook_private_native_follow_pos_unsync(ctx: &mut skyline::hooks::Inline
     private_native_route(ctx, 22, &PRIVATE_NATIVE_FOLLOW_POS_UNSYNC_HIT, "follow_pos_unsync");
 }
 
+// FLIP routes run after the native orientation choice and before request setup.
+// EFFECT_FOLLOW_FLIP: selected hash in x22, BOMA in x23.
+#[skyline::hook(offset = 0x2294e68, inline)]
+unsafe fn hook_private_native_follow_flip(ctx: &mut skyline::hooks::InlineCtx) {
+    private_native_route_register(ctx, 23, 22, &PRIVATE_NATIVE_FOLLOW_FLIP_HIT, "follow_flip");
+}
+
+// EFFECT_FOLLOW_NO_STOP_FLIP: selected hash in x1, BOMA in x20.
+#[skyline::hook(offset = 0x22960c8, inline)]
+unsafe fn hook_private_native_follow_no_stop_flip(ctx: &mut skyline::hooks::InlineCtx) {
+    private_native_route_register(ctx, 20, 1, &PRIVATE_NATIVE_FOLLOW_NO_STOP_FLIP_HIT, "follow_no_stop_flip");
+}
+
+// EFFECT_FLIP: selected hash in x1, BOMA in x20.
+#[skyline::hook(offset = 0x2297494, inline)]
+unsafe fn hook_private_native_flip(ctx: &mut skyline::hooks::InlineCtx) {
+    private_native_route_register(ctx, 20, 1, &PRIVATE_NATIVE_FLIP_HIT, "flip");
+}
+
+// EFFECT_FLIP_ALPHA: selected hash in x1, BOMA in x21.
+#[skyline::hook(offset = 0x22a0f98, inline)]
+unsafe fn hook_private_native_flip_alpha(ctx: &mut skyline::hooks::InlineCtx) {
+    private_native_route_register(ctx, 21, 1, &PRIVATE_NATIVE_FLIP_ALPHA_HIT, "flip_alpha");
+}
+
+// EFFECT_FOLLOW_FLIP_ALPHA: selected hash in x1, BOMA in x21.
+#[skyline::hook(offset = 0x22a1614, inline)]
+unsafe fn hook_private_native_follow_flip_alpha(ctx: &mut skyline::hooks::InlineCtx) {
+    private_native_route_register(ctx, 21, 1, &PRIVATE_NATIVE_FOLLOW_FLIP_ALPHA_HIT, "follow_flip_alpha");
+}
+
+// EFFECT_FOLLOW_FLIP_COLOR: selected hash in x1, BOMA in x21.
+#[skyline::hook(offset = 0x229b674, inline)]
+unsafe fn hook_private_native_follow_flip_color(ctx: &mut skyline::hooks::InlineCtx) {
+    private_native_route_register(ctx, 21, 1, &PRIVATE_NATIVE_FOLLOW_FLIP_COLOR_HIT, "follow_flip_color");
+}
+
+// EFFECT_FOLLOW_FLIP_arg13: selected hash in x20, BOMA in x22.
+#[skyline::hook(offset = 0x229586c, inline)]
+unsafe fn hook_private_native_follow_flip_arg13(ctx: &mut skyline::hooks::InlineCtx) {
+    private_native_route_register(ctx, 22, 20, &PRIVATE_NATIVE_FOLLOW_FLIP_ARG13_HIT, "follow_flip_arg13");
+}
+
+// EFFECT_FOLLOW_FLIP_RND: selected hash in x22, BOMA in x23.
+#[skyline::hook(offset = 0x22a0ad4, inline)]
+unsafe fn hook_private_native_follow_flip_rnd(ctx: &mut skyline::hooks::InlineCtx) {
+    private_native_route_register(ctx, 23, 22, &PRIVATE_NATIVE_FOLLOW_FLIP_RND_HIT, "follow_flip_rnd");
+}
+
 // Each optional route is independent of the two already validated routes.
 // Verify the full 20-byte patch window used by the far-branch trampoline.
 fn install_private_native_extra_routes() {
@@ -513,6 +579,62 @@ fn install_private_native_extra_routes() {
         skyline::install_hook!(hook_private_native_follow_pos_unsync);
     } else {
         skyline::println!("[SLight] PRIVATE_LIVE native follow_pos_unsync skipped: signature mismatch");
+    }
+    if unsafe { std::slice::from_raw_parts((text + 0x2294e68) as *const u8, 20) }
+        == [0xe8, 0xa2, 0x40, 0xf9, 0x09, 0x01, 0x40, 0xf9, 0x29, 0x41, 0x40, 0xf9, 0x00, 0x1d, 0xa8, 0x4e, 0x0a, 0x00, 0x80, 0x12]
+    {
+        skyline::install_hook!(hook_private_native_follow_flip);
+    } else {
+        skyline::println!("[SLight] PRIVATE_LIVE native follow_flip skipped: signature mismatch");
+    }
+    if unsafe { std::slice::from_raw_parts((text + 0x22960c8) as *const u8, 20) }
+        == [0xe8, 0x63, 0x42, 0x39, 0x1f, 0x01, 0x00, 0x71, 0xe8, 0x03, 0x12, 0x32, 0xe6, 0x03, 0x88, 0x1a, 0xe6, 0x8b, 0x00, 0xb9]
+    {
+        skyline::install_hook!(hook_private_native_follow_no_stop_flip);
+    } else {
+        skyline::println!("[SLight] PRIVATE_LIVE native follow_no_stop_flip skipped: signature mismatch");
+    }
+    if unsafe { std::slice::from_raw_parts((text + 0x2297494) as *const u8, 20) }
+        == [0x88, 0xa2, 0x40, 0xf9, 0xe9, 0x83, 0x00, 0x91, 0x23, 0x41, 0x00, 0x91, 0x24, 0x81, 0x00, 0x91, 0x25, 0x01, 0x01, 0x91]
+    {
+        skyline::install_hook!(hook_private_native_flip);
+    } else {
+        skyline::println!("[SLight] PRIVATE_LIVE native flip skipped: signature mismatch");
+    }
+    if unsafe { std::slice::from_raw_parts((text + 0x22a0f98) as *const u8, 20) }
+        == [0xa8, 0xa2, 0x40, 0xf9, 0xe9, 0x83, 0x00, 0x91, 0x23, 0x41, 0x00, 0x91, 0x24, 0x81, 0x00, 0x91, 0x25, 0x01, 0x01, 0x91]
+    {
+        skyline::install_hook!(hook_private_native_flip_alpha);
+    } else {
+        skyline::println!("[SLight] PRIVATE_LIVE native flip_alpha skipped: signature mismatch");
+    }
+    if unsafe { std::slice::from_raw_parts((text + 0x22a1614) as *const u8, 20) }
+        == [0xa8, 0xa2, 0x40, 0xf9, 0x0a, 0x01, 0x40, 0xf9, 0xe9, 0x43, 0x01, 0x91, 0xe0, 0x83, 0x40, 0xbd, 0xe2, 0x2f, 0x40, 0xf9]
+    {
+        skyline::install_hook!(hook_private_native_follow_flip_alpha);
+    } else {
+        skyline::println!("[SLight] PRIVATE_LIVE native follow_flip_alpha skipped: signature mismatch");
+    }
+    if unsafe { std::slice::from_raw_parts((text + 0x229b674) as *const u8, 20) }
+        == [0xa8, 0xa2, 0x40, 0xf9, 0x0a, 0x01, 0x40, 0xf9, 0xe9, 0x43, 0x01, 0x91, 0xe0, 0x83, 0x40, 0xbd, 0xe2, 0x2f, 0x40, 0xf9]
+    {
+        skyline::install_hook!(hook_private_native_follow_flip_color);
+    } else {
+        skyline::println!("[SLight] PRIVATE_LIVE native follow_flip_color skipped: signature mismatch");
+    }
+    if unsafe { std::slice::from_raw_parts((text + 0x229586c) as *const u8, 20) }
+        == [0xc0, 0xa2, 0x40, 0xf9, 0x09, 0x00, 0x40, 0xf9, 0xe8, 0x43, 0x01, 0x91, 0xe0, 0x83, 0x40, 0xbd, 0xe2, 0x2f, 0x40, 0xf9]
+    {
+        skyline::install_hook!(hook_private_native_follow_flip_arg13);
+    } else {
+        skyline::println!("[SLight] PRIVATE_LIVE native follow_flip_arg13 skipped: signature mismatch");
+    }
+    if unsafe { std::slice::from_raw_parts((text + 0x22a0ad4) as *const u8, 20) }
+        == [0xe8, 0xa2, 0x40, 0xf9, 0x09, 0x01, 0x40, 0xf9, 0x29, 0x41, 0x40, 0xf9, 0x00, 0x1d, 0xa8, 0x4e, 0x0a, 0x00, 0x80, 0x12]
+    {
+        skyline::install_hook!(hook_private_native_follow_flip_rnd);
+    } else {
+        skyline::println!("[SLight] PRIVATE_LIVE native follow_flip_rnd skipped: signature mismatch");
     }
 }
 
@@ -759,6 +881,14 @@ fn pump_private_live() {
     PRIVATE_NATIVE_FOLLOW_NO_SCALE_HIT.store(false, Ordering::Relaxed);
     PRIVATE_NATIVE_FOOT_HIT.store(false, Ordering::Relaxed);
     PRIVATE_NATIVE_DETACH_HIT.store(false, Ordering::Relaxed);
+    PRIVATE_NATIVE_FOLLOW_FLIP_HIT.store(false, Ordering::Relaxed);
+    PRIVATE_NATIVE_FOLLOW_NO_STOP_FLIP_HIT.store(false, Ordering::Relaxed);
+    PRIVATE_NATIVE_FLIP_HIT.store(false, Ordering::Relaxed);
+    PRIVATE_NATIVE_FLIP_ALPHA_HIT.store(false, Ordering::Relaxed);
+    PRIVATE_NATIVE_FOLLOW_FLIP_ALPHA_HIT.store(false, Ordering::Relaxed);
+    PRIVATE_NATIVE_FOLLOW_FLIP_COLOR_HIT.store(false, Ordering::Relaxed);
+    PRIVATE_NATIVE_FOLLOW_FLIP_ARG13_HIT.store(false, Ordering::Relaxed);
+    PRIVATE_NATIVE_FOLLOW_FLIP_RND_HIT.store(false, Ordering::Relaxed);
     PRIVATE_NATIVE_FOLLOW_COLOR_HIT.store(false, Ordering::Relaxed);
     PRIVATE_NATIVE_FOLLOW_ALPHA_HIT.store(false, Ordering::Relaxed);
     PRIVATE_NATIVE_FOLLOW_UNSYNC_HIT.store(false, Ordering::Relaxed);
