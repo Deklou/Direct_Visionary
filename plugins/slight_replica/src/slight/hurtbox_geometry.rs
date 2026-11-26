@@ -211,9 +211,14 @@ unsafe fn apply_geometry(boma: *mut BattleObjectModuleAccessor, rule: &GeometryR
         return None;
     }
     let after = write_geometry(boma, rule.index, current, requested, "apply")?;
-    Some(AppliedGeometry {
+    let edit = AppliedGeometry {
         index: rule.index, bone: rule.bone, original: current.geometry, written: after.geometry,
-    })
+    };
+    crate::slight::diag::note(format!(
+        "HURTBOX tracked boid={} accessor={:#x} index={} original={:?} written={:?}",
+        (*boma).battle_object_id, boma as usize, edit.index, edit.original, edit.written,
+    ));
+    Some(edit)
 }
 
 unsafe fn restore_geometry(boma: *mut BattleObjectModuleAccessor, edit: AppliedGeometry) {
@@ -227,7 +232,13 @@ unsafe fn restore_geometry(boma: *mut BattleObjectModuleAccessor, edit: AppliedG
         return;
     }
     // Restore only the geometry we changed, not the entire fighter's hit_data.
-    write_geometry(boma, edit.index, current, edit.original, "restore");
+    let restored = write_geometry(boma, edit.index, current, edit.original, "restore");
+    if restored.is_some_and(|v| geometry_matches(v.geometry, edit.original)) {
+        crate::slight::diag::note(format!(
+            "HURTBOX restored boid={} index={} geometry={:?}",
+            (*boma).battle_object_id, edit.index, edit.original,
+        ));
+    }
 }
 
 /// None: unedited volume (keep PRC fallback). Some(None): an edited volume
@@ -271,8 +282,8 @@ pub fn set_rules(rules: Vec<GeometryRule>) {
 
 // A fight-start notification is not a lifetime boundary. A fighter can be
 // temporarily inactive while its HitModule still owns the edited geometry.
-// Only a verified fighter callback can replace its saved identity; teardown
-// clears all remaining records.
+// Only a verified callback with the same full ID can replace its saved
+// identity; teardown clears all remaining records.
 
 /// Actual match teardown, not the repeatable fight-start notification.
 pub fn forget_match() {
@@ -297,18 +308,14 @@ pub unsafe fn tick(boma: *mut BattleObjectModuleAccessor) {
         return;
     }
     let revision = REVISION.load(Ordering::Acquire);
-    let previous = {
-        let mut applied = APPLIED.lock();
-        // Full IDs include a generation; an observed live replacement of the
-        // same engine slot retires the old record without writing to it.
-        applied.retain(|id, _| *id == boid
-            || (*id & crate::slight::agents::BOID_MASK) != (boid & crate::slight::agents::BOID_MASK));
-        applied.get(&boid).cloned()
-    };
+    // Distinct full battle-object IDs must never evict each other. In
+    // particular, their low nine bits are not a verified lifetime identity.
+    let previous = APPLIED.lock().get(&boid).cloned();
+    let training = app::smashball::is_training_mode();
+    let roster_ready = training && crate::slight::collision_view::has_reference_roster(target.fighter_kind);
 
     if let Some(state) = previous.as_ref() {
-        let ready = state.geometry_pending && app::smashball::is_training_mode()
-            && crate::slight::collision_view::has_reference_roster(target.fighter_kind);
+        let ready = state.geometry_pending && roster_ready;
         if state.target == target && state.revision == revision && state.accessor == boma as usize && !ready {
             for (bone, _) in &state.disabled_joints {
                 HitModule::set_status_joint(boma, Hash40::new_raw(*bone), app::HitStatus(3), 0);
@@ -360,9 +367,8 @@ pub unsafe fn tick(boma: *mut BattleObjectModuleAccessor) {
     }
 
     let mut geometry = Vec::new();
-    let training = app::smashball::is_training_mode();
     let geometry_pending = rules.iter().any(|rule| !rule.disabled && rule.apply_geometry)
-        && (!training || !crate::slight::collision_view::has_reference_roster(target.fighter_kind));
+        && !roster_ready;
     if training && !geometry_pending {
         for rule in &rules {
             if rule.disabled || !rule.apply_geometry { continue; }
@@ -379,13 +385,13 @@ pub unsafe fn tick(boma: *mut BattleObjectModuleAccessor) {
     if rules.is_empty() {
         APPLIED.lock().remove(&boid);
     } else {
+        crate::slight::diag::note(format!(
+            "hurtbox geometry snapshot: boid={boid} accessor={:#x} fighter={} costume={} revision={revision} rules={} tracked={} disabled={} pending={geometry_pending}",
+            boma as usize, target.fighter_kind, target.costume, rules.len(), geometry.len(), disabled_joints.len(),
+        ));
         APPLIED.lock().insert(boid, AppliedState {
             target, revision, disabled_joints, accessor: boma as usize, geometry, geometry_pending,
         });
-        crate::slight::diag::note(format!(
-            "hurtbox geometry applied: fighter {} costume {} {} rule(s), revision {}",
-            target.fighter_kind, target.costume, rules.len(), revision,
-        ));
     }
 }
 

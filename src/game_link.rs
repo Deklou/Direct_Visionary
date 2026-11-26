@@ -3017,6 +3017,9 @@ mod tests {
         assert!(!fight_start.contains("hurtbox_geometry::"));
         assert!(!geometry.contains("fn prune_inactive"));
         assert!(geometry.contains("agents::boid_from_module(boma)"));
+        assert!(!geometry.contains("BOID_MASK"));
+        assert!(!geometry.contains("applied.retain("));
+        assert!(geometry.contains("APPLIED.lock().get(&boid).cloned()"));
         assert!(geometry.contains("native_capsule(boma, edit.index).is_none()"));
         assert!(dispatch.contains("hurtbox_geometry::forget_match()"));
     }
