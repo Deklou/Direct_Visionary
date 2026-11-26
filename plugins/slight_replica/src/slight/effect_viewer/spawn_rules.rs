@@ -564,14 +564,10 @@ pub fn set_aliases(mut aliases: Vec<EffectAlias>) {
 }
 
 pub fn any_alias() -> bool {
-    super::effect_reload::private_live_has_alias()
-        || ALIASES.try_lock().map(|a| !a.is_empty()).unwrap_or(false)
+    ALIASES.try_lock().map(|a| !a.is_empty()).unwrap_or(false)
 }
 
 pub fn alias_for(from: u64, target: RuntimeTarget) -> Option<u64> {
-    if let Some(to) = super::effect_reload::private_clone_alias(from, target) {
-        return Some(to);
-    }
     let aliases = ALIASES.try_lock()?;
     crate::slight::rule_scope::effect_alias_for(&aliases, from, target)
 }

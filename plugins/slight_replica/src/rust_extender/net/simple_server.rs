@@ -291,12 +291,10 @@ unsafe fn configure_client(client: i32) -> i32 {
 
 unsafe fn handshake(client: i32, flags: i32) -> Option<u64> {
     let cid = CLIENT_ID.fetch_add(1, Ordering::SeqCst) + 1;
-    let private_live = crate::slight::effect_viewer::effect_reload::private_live_supported();
-    let scoped_eff = crate::slight::rule_scope::EXPERIMENTAL_EFF_LIVE_ENABLED;
     let frames = vec![
         r#"{"header":"RemoveAll","body":"{}"}"#.to_owned(),
         format!(
-            r#"{{"header":"GiveClientId","body":"{{\"GiveClientId\":{{\"client_id\":{cid},\"scoped_cancels\":true,\"scoped_acmd\":true,\"scoped_aliases\":true,\"scoped_eff_preview\":{scoped_eff},\"scoped_private_eff\":{private_live}}}}}"}}"#
+            r#"{{"header":"GiveClientId","body":"{{\"GiveClientId\":{{\"client_id\":{cid},\"scoped_cancels\":true,\"scoped_acmd\":true,\"scoped_aliases\":true}}}}"}}"#
         ),
     ];
     let mut batch = TxBatch::new(frames);
@@ -427,9 +425,6 @@ unsafe fn serve_client(client: i32, flags: i32) {
     // Stop publishing before restoring unsent frames. The next client receives
     // its own handshake before any queued application data.
     CLIENT_FD.store(-1, Ordering::Release);
-    // Queue behind any outstanding preview message; the game thread owns callbacks.
-    inbound_push(r#"{"scoped_eff_preview":null}"#.to_string());
-    inbound_push(r#"{"scoped_private_eff":null}"#.to_string());
     if let Some(tx) = batch {
         tx.requeue();
     }

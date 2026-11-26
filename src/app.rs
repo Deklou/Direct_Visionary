@@ -3302,7 +3302,6 @@ pub struct VisionaryApp {
     /// arcropolis callback) — their cross-fighter aliases are dropped so the REAL
     /// entry (loaded on match re-entry) isn't masked.
     live_eff_deployed: std::collections::HashSet<String>,
-    scoped_eff_preview: Option<crate::game_link::ScopedEffPreview>,
     /// Fighters whose merged-preview build failed this session (retried after the next
     /// transplant record instead of every frame; shown as ⚠ in the eff editor).
     merged_build_failed: std::collections::HashSet<String>,
@@ -3724,7 +3723,6 @@ impl VisionaryApp {
             transplant_replace_search: String::new(),
             redirect_prompt: None,
             live_eff_deployed: std::collections::HashSet::new(),
-            scoped_eff_preview: None,
             merged_build_failed: std::collections::HashSet::new(),
             live_eff_probe_due: None,
             param_labels_rx: Some(crate::param_labels::spawn_fetch()),
@@ -3938,9 +3936,6 @@ impl VisionaryApp {
     /// Rebuild the fighter list from the data root plus every mod root. Idempotent — called
     /// on data-root change and whenever the mod-root set changes.
     fn reindex_fighters(&mut self) {
-        if self.scoped_eff_preview.take().is_some() {
-            self.game_link.send_scoped_eff_preview(None);
-        }
         self.park_acmd_before_reindex();
         // Sub-fighters, bosses and enemies the roster list has never shown. This filters by
         // exact vanilla name only, so a mod that happens to be called e.g. "nanaex" is kept.
@@ -18328,9 +18323,6 @@ If you step every basis for a                          type and NONE of them mat
     /// Project loading calls this only after its all-family send barrier is lifted; ordinary
     /// rebuilds use it after their narrower rule batch ends.
     fn publish_live_rule_union(&self) {
-        if self.scoped_eff_preview.is_some() {
-            self.publish_scoped_eff_preview();
-        }
         self.send_live_hitbox_rules();
         self.send_live_spawn_rules();
         self.send_live_effect_control_rules();
@@ -21351,13 +21343,7 @@ If you step every basis for a                          type and NONE of them mat
     /// dump/mod EFF is deliberately outside this path and is never touched here.
     fn remove_live_eff_for_fighter(&mut self, fighter: &str) -> bool {
         if !crate::game_link::LEGACY_GLOBAL_EFFECTS_ENABLED {
-            let matches = self.scoped_eff_preview.as_ref()
-                .is_some_and(|preview| preview.fighter.eq_ignore_ascii_case(fighter));
-            if matches {
-                self.scoped_eff_preview = None;
-                self.game_link.send_scoped_eff_preview(None);
-            }
-            return matches;
+            return false;
         }
         let mut changed = false;
         self.live_eff_deployed.retain(|name| {
@@ -21430,8 +21416,6 @@ If you step every basis for a                          type and NONE of them mat
     }
 
     fn clear_all_game_edits(&mut self) {
-        self.scoped_eff_preview = None;
-        self.game_link.send_scoped_eff_preview(None);
         self.game_link.send_reset_pins();
         self.effect_rules_store.clear();
         self.effect_control_rules_store.clear();
@@ -31016,98 +31000,6 @@ If you step every basis for a                          type and NONE of them mat
         true
     }
 
-    fn publish_scoped_eff_preview(&self) {
-        let preview = self.scoped_eff_preview.as_ref().filter(|p| {
-            self.exclusive_fighter_slots(&p.fighter).as_deref() == Some(p.costume_slots.as_slice())
-                && fighter_kind_id(&p.fighter) == Some(p.fighter_kind)
-        });
-        self.game_link.send_scoped_eff_preview(preview);
-    }
-
-    // Experimental next-match preview of a fighter-owned EFF. Do not re-enable the
-    // global carrier or pins. An explicit send is required; project loading does not arm it.
-    fn stage_scoped_eff_preview(&mut self, rel: &str) -> String {
-        self.scoped_eff_preview = None;
-        self.game_link.send_scoped_eff_preview(None);
-        let fighter = crate::mod_project::fighter_from_source_rel(rel);
-        let Some(costume_slots) = self.exclusive_fighter_slots(&fighter) else {
-            return "EFF preview refused: shared or unverified costume ownership.".into();
-        };
-        if costume_slots.as_slice() != &[0, 1, 2, 3, 4, 5, 6, 7] {
-            return "EFF preview supports only the full standard vanilla costume group.".into();
-        }
-        let Some(fighter_kind) = fighter_kind_id(&fighter) else {
-            return "EFF preview refused: unknown fighter.".into();
-        };
-        let Some(eff) = self.eff_mods.get(&fighter) else {
-            return "Private EFF live clear queued; original requests restored.".into();
-        };
-        if eff.is_empty() {
-            return "Private EFF live clear queued; original requests restored.".into();
-        }
-        let own_prefix = format!("{fighter}_");
-        let canonical = format!("effect/fighter/{fighter}/ef_{fighter}.eff");
-        if !rel.eq_ignore_ascii_case(&canonical) || !eff.source_rel.eq_ignore_ascii_case(&canonical)
-            || !eff.transplants.is_empty() || !eff.textures.is_empty()
-            || !eff.textures_added.is_empty() || !eff.textures_removed.is_empty()
-            || !eff.rosters.is_empty() || !eff.entry_edits.is_empty()
-            || eff.authored.iter().any(|edit| !edit.entry_name.to_ascii_lowercase().starts_with(&own_prefix))
-        {
-            return "EFF preview supports only own-fighter emitter values; other edits are saved but inactive.".into();
-        }
-        if !self.game_link.supports_scoped_eff_preview() {
-            return "EFF preview needs the matching connected Skyline plugin.".into();
-        }
-        let Some(root) = self.state.data_root.as_ref() else {
-            return "EFF preview needs the original game data root.".into();
-        };
-        if self.eff_editor.export_root() != root.as_path() {
-            return "EFF preview refused: the effect root differs from the original game root.".into();
-        }
-        if self.extra_roots.iter().any(|root| root.join(&canonical).is_file()) {
-            return "EFF preview refused: an enabled mod supplies this effect file.".into();
-        }
-        let Ok(bytes) = std::fs::read(root.join(&canonical)) else {
-            return "EFF preview source file missing.".into();
-        };
-        let Ok(source) = effect_library::NamcoEffectFile::load(&bytes) else {
-            return "EFF preview source could not be parsed.".into();
-        };
-        if eff.authored.iter().any(|edit| !source.entry_names.iter().any(|name| name.eq_ignore_ascii_case(&edit.entry_name))) {
-            return "EFF preview refused: an edited entry is missing from the original file.".into();
-        }
-        let merged = match crate::eff_export::build_private_live_preview(&bytes, eff, root) {
-            Ok(bytes) => bytes,
-            Err(error) => return format!("Private EFF live build refused: {error}"),
-        };
-        let Some(sd) = crate::scratch_dirs::emulator_sd_root() else {
-            return "EFF preview: emulator SD root not found.".into();
-        };
-        let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) else {
-            return "EFF preview: system clock unavailable.".into();
-        };
-        let preview = crate::game_link::ScopedEffPreview {
-            fighter, fighter_kind, costume_slots, token: format!("{:032x}", now.as_nanos()),
-        };
-        if !preview.valid() {
-            return "EFF preview refused: invalid identity.".into();
-        }
-        let path = sd.join(preview.private_sd_rel_path());
-        let Some(parent) = path.parent() else { return "EFF preview path invalid.".into(); };
-        let write = std::fs::create_dir_all(parent).and_then(|_| {
-            let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&path)?;
-            std::io::Write::write_all(&mut file, &merged)
-        });
-        if let Err(error) = write {
-            return format!("EFF preview write failed: {error}");
-        }
-        if !self.game_link.send_scoped_eff_preview(Some(&preview)) {
-            return "EFF preview not sent: connection changed.".into();
-        }
-        self.scoped_eff_preview = Some(preview);
-        "Private EFF live snapshot queued; native loading and rendering are experimental (see PRIVATE_LIVE log).".into()
-    }
-
     /// Service an eff-editor "apply authored edits to the game" request.
     ///
     /// Authored PTCL values are per emitter and the runtime modifier protocol has no
@@ -31126,7 +31018,7 @@ If you step every basis for a                          type and NONE of them mat
         if !crate::game_link::LEGACY_GLOBAL_EFFECTS_ENABLED {
             self.eff_editor.carrier_expected = false;
             self.push_effect_aliases();
-            return self.stage_scoped_eff_preview(&rel);
+            return "EFF edits saved locally; live resource loading is disabled in scoped editing.".into();
         }
         let fighter = crate::mod_project::fighter_from_source_rel(&rel);
         if self.exclusive_fighter_slots(&fighter).is_none() {
@@ -35807,8 +35699,7 @@ impl eframe::App for VisionaryApp {
             // (the game has not taken our bytes yet), so the stall check fired instantly and
             // reported "the previous carrier is not releasing" after 0.0s.
             self.eff_editor.carrier_state_since = None;
-            self.eff_editor.awaiting_game = crate::game_link::LEGACY_GLOBAL_EFFECTS_ENABLED
-                .then(std::time::Instant::now);
+            self.eff_editor.awaiting_game = Some(std::time::Instant::now());
         } else if self.eff_editor.sending {
             // Deferred by one frame so the spinner paints before the (synchronous) rebuild
             // blocks the UI thread. Keep the frames coming so it actually animates.
@@ -36035,9 +35926,6 @@ impl eframe::App for VisionaryApp {
                 // Re-push the authoritative live state after every fresh plugin connection.
                 // This also restores state when the game restarted between socket sessions.
                 self.publish_live_rule_union();
-                if self.scoped_eff_preview.is_none() {
-                    self.game_link.send_scoped_eff_preview(None);
-                }
                 self.push_effect_aliases();
                 self.game_link.send_trait_rules(&self.live_trait_rules());
                 self.live_overrides.resend_tweaks(&self.game_link);

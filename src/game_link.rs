@@ -1327,7 +1327,6 @@ struct Shared {
     scoped_cancels_supported: bool,
     scoped_acmd_supported: bool,
     scoped_aliases_supported: bool,
-    scoped_eff_preview_supported: bool,
     connection_epoch: u64,
     collision_requests: BTreeMap<i32, u64>,
     kinds: BTreeMap<u64, LiveKind>,
@@ -1401,7 +1400,6 @@ const FULL_REPLACE_MARKERS: &[&str] = &[
     "\"donor_effs\":",
     "\"donor_bytes\":",
     "\"asset_bundle\":",
-    "\"scoped_private_eff\":",
     "\"effect_names\":",
 ];
 
@@ -1500,7 +1498,6 @@ impl Default for Shared {
             scoped_cancels_supported: false,
             scoped_acmd_supported: false,
             scoped_aliases_supported: false,
-            scoped_eff_preview_supported: false,
             connection_epoch: 0,
             collision_requests: BTreeMap::new(),
             kinds: BTreeMap::new(),
@@ -1876,32 +1873,6 @@ impl GameLink {
             && alias.from != alias.to && alias.from > 0 && alias.from <= 0xff_ffff_ffff
             && alias.to > 0 && alias.to <= 0xff_ffff_ffff);
         self.send_scoped_acmd_payload("effect_aliases", aliases, valid);
-    }
-
-    pub fn supports_scoped_eff_preview(&self) -> bool {
-        self.shared.lock().is_ok_and(|s| {
-            s.status == LinkStatus::Connected && s.client_id.is_some()
-                && s.scoped_eff_preview_supported
-        })
-    }
-
-    /// This is a separate, full replacement; old donor messages are still disabled.
-    pub fn send_scoped_eff_preview(&self, preview: Option<&ScopedEffPreview>) -> bool {
-        if self.sends_suppressed() {
-            return false;
-        }
-        let Ok(mut s) = self.shared.lock() else { return false; };
-        if s.status != LinkStatus::Connected || s.client_id.is_none()
-            || !s.scoped_eff_preview_supported {
-            return false;
-        }
-        let valid = preview.is_none_or(ScopedEffPreview::valid);
-        let preview = preview.filter(|p| p.valid());
-        let payload = serde_json::json!({ "scoped_private_eff": preview });
-        let frame = format!("<TCP_MESSAGE>{payload}</TCP_MESSAGE>");
-        queue_latest_full_replace(&mut s.outbox, frame);
-        s.edits_tx += 1;
-        valid
     }
 
     /// Cross-fighter donor eff files the plugin co-loads with each target fighter's
@@ -2401,7 +2372,6 @@ fn link_thread(shared: Arc<Mutex<Shared>>) {
             s.scoped_cancels_supported = false;
                 s.scoped_acmd_supported = false;
                 s.scoped_aliases_supported = false;
-                s.scoped_eff_preview_supported = false;
             s.last_rx = None;
         }
         let addr = plugin_addr();
@@ -2423,7 +2393,6 @@ fn link_thread(shared: Arc<Mutex<Shared>>) {
                 s.scoped_cancels_supported = false;
                 s.scoped_acmd_supported = false;
                 s.scoped_aliases_supported = false;
-                s.scoped_eff_preview_supported = false;
                 s.last_rx = None;
             }
             Err(e) => {
@@ -2435,7 +2404,6 @@ fn link_thread(shared: Arc<Mutex<Shared>>) {
                 s.scoped_cancels_supported = false;
                 s.scoped_acmd_supported = false;
                 s.scoped_aliases_supported = false;
-                s.scoped_eff_preview_supported = false;
                 s.last_rx = None;
             }
         }
@@ -2488,9 +2456,6 @@ fn serve_connection(shared: &Arc<Mutex<Shared>>, mut stream: TcpStream) -> Optio
             }
             if !s.scoped_aliases_supported {
                 pending.retain(|frame| !frame.contains("\"effect_aliases_scoped\":"));
-            }
-            if !s.scoped_eff_preview_supported {
-                pending.retain(|frame| !frame.contains("\"scoped_private_eff\":"));
             }
             pending
         };
@@ -2943,10 +2908,6 @@ fn handle_frame(shared: &Arc<Mutex<Shared>>, payload: &str) {
                 && body.get("GiveClientId")
                     .and_then(|data| data.get("scoped_aliases"))
                     .and_then(|value| value.as_bool()) == Some(true);
-            s.scoped_eff_preview_supported = client_id.is_some()
-                && body.get("GiveClientId")
-                    .and_then(|data| data.get("scoped_private_eff"))
-                    .and_then(|value| value.as_bool()) == Some(true);
         }
         _ => {}
     }
@@ -2955,7 +2916,7 @@ fn handle_frame(shared: &Arc<Mutex<Shared>>, payload: &str) {
 #[allow(dead_code)]
 #[path = "../plugins/slight_replica/src/slight/rule_scope.rs"]
 mod plugin_rule_scope;
-pub(crate) use plugin_rule_scope::{ScopedEffPreview, LEGACY_GLOBAL_EFFECTS_ENABLED};
+pub(crate) use plugin_rule_scope::LEGACY_GLOBAL_EFFECTS_ENABLED;
 
 #[cfg(test)]
 mod tests {
@@ -6835,32 +6796,6 @@ mod tests {
         assert_eq!(overrides.tweaked()[0].1.speed, 1.5);
         assert!(!overrides.any_dirty());
         assert!(link.shared.lock().unwrap().outbox.is_empty());
-    }
-
-    #[test]
-    fn scoped_acmd_eff_preview_negotiates_and_clears() {
-        let link = GameLink::default();
-        link.shared.lock().unwrap().status = LinkStatus::Connected;
-        let p = ScopedEffPreview {
-            fighter: "mario".into(), fighter_kind: 0, costume_slots: vec![0, 1, 2, 3, 4, 5, 6, 7],
-            token: "0123456789abcdef0123456789abcdef".into(),
-        };
-        assert!(!link.send_scoped_eff_preview(Some(&p)));
-        feed(&link, &[plugin_frame("GiveClientId", &serde_json::json!({
-            "GiveClientId": { "client_id": 4, "scoped_private_eff": true }
-        }))]);
-        assert!(link.supports_scoped_eff_preview());
-        assert!(link.send_scoped_eff_preview(Some(&p)));
-        assert!(!link.send_scoped_eff_preview(Some(&ScopedEffPreview { costume_slots: vec![], ..p.clone() })));
-        let pending = link.shared.lock().unwrap().outbox.clone();
-        assert_eq!(pending.len(), 1);
-        assert!(pending[0].contains("\"scoped_private_eff\":null"));
-        assert!(link.send_scoped_eff_preview(Some(&p)));
-        feed(&link, &[plugin_frame("GiveClientId", &serde_json::json!({
-            "GiveClientId": { "client_id": 5, "scoped_acmd": true, "scoped_eff_preview": true }
-        }))]);
-        assert!(!link.supports_scoped_eff_preview());
-        assert!(!link.send_scoped_eff_preview(Some(&p)));
     }
 
     #[test]

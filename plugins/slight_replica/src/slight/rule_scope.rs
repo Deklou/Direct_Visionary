@@ -4,63 +4,6 @@
 // per-character resource identity. Keep their saved data, but do not activate
 // them in the scoped editing build. ACMD rules and ordinary exported files are separate.
 pub const LEGACY_GLOBAL_EFFECTS_ENABLED: bool = false;
-// EFF live is deferred until its runtime isolation and rendering are validated.
-pub const EXPERIMENTAL_EFF_LIVE_ENABLED: bool = false;
-/// Explicit next-match EFF preview. The path is derived, never supplied by the wire.
-/// The editor must verify that the whole fighter resource has one logical owner.
-#[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
-pub struct ScopedEffPreview {
-    pub fighter: String,
-    pub fighter_kind: i32,
-    pub costume_slots: Vec<u8>,
-    pub token: String,
-}
-
-impl ScopedEffPreview {
-    pub fn valid(&self) -> bool {
-        self.fighter_kind >= 0
-            && !self.fighter.is_empty() && self.fighter.len() <= 32
-            && self.fighter.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_')
-            // The preview is path-wide, not costume-scoped at the resource loader.
-            // Only the full standard vanilla costume group is eligible for this experiment.
-            && self.costume_slots.as_slice() == &[0, 1, 2, 3, 4, 5, 6, 7]
-            && self.token.len() == 32
-            && self.token.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
-    }
-
-    pub fn arc_path(&self) -> String {
-        format!("effect/fighter/{0}/ef_{0}.eff", self.fighter)
-    }
-
-    pub fn sd_rel_path(&self) -> String {
-        format!("effect_viewer/scoped_live_eff/ef_{}_{}.eff", self.fighter, self.token)
-    }
-    /// Never publish a private clone at the old path-wide preview location.
-    pub fn private_sd_rel_path(&self) -> String {
-        format!("effect_viewer/private_live_eff/ef_{}_{}.eff", self.fighter, self.token)
-    }
-}
-
-#[cfg(test)]
-#[test]
-fn scoped_acmd_eff_preview_requires_canonical_identity() {
-    let p = ScopedEffPreview {
-        fighter: "mario".into(), fighter_kind: 0, costume_slots: vec![0, 1, 2, 3, 4, 5, 6, 7],
-        token: "0123456789abcdef0123456789abcdef".into(),
-    };
-    assert!(p.valid());
-    assert_eq!(p.arc_path(), "effect/fighter/mario/ef_mario.eff");
-    assert_eq!(p.sd_rel_path(), "effect_viewer/scoped_live_eff/ef_mario_0123456789abcdef0123456789abcdef.eff");
-    for fighter in ["", "../mario", "Mario", "assist/bomberman", "mario\\x"] {
-        assert!(!ScopedEffPreview { fighter: fighter.into(), ..p.clone() }.valid());
-    }
-    for costume_slots in [vec![], vec![0, 1], vec![0, 0], vec![1, 0], (0..=8).collect()] {
-        assert!(!ScopedEffPreview { costume_slots, ..p.clone() }.valid());
-    }
-    assert!(!ScopedEffPreview { token: "../old.eff".into(), ..p.clone() }.valid());
-    assert!(!ScopedEffPreview { fighter_kind: -1, ..p }.valid());
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RuntimeTarget {
     pub fighter_kind: i32,

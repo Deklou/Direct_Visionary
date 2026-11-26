@@ -289,23 +289,6 @@ fn parse_tcp_payload(raw: &str) -> Option<ParsedEdit> {
         return None;
     }
 
-    if let Some(value) = v.get("scoped_private_eff") {
-        let preview = serde_json::from_value::<Option<crate::slight::rule_scope::ScopedEffPreview>>(
-            value.clone()
-        ).ok().flatten();
-        crate::slight::effect_viewer::live_eff::replace_scoped_preview(None);
-        crate::slight::effect_viewer::effect_reload::replace_private_live_preview(preview);
-        return None;
-    }
-
-    if let Some(value) = v.get("scoped_eff_preview") {
-        let preview = serde_json::from_value::<Option<crate::slight::rule_scope::ScopedEffPreview>>(
-            value.clone()
-        ).ok().flatten();
-        crate::slight::effect_viewer::live_eff::replace_scoped_preview(preview);
-        return None;
-    }
-
     // Editor commands (no effect-edit payload).
     if let Some(cmd) = v.get("command").and_then(|c| c.as_str()) {
         match cmd {
