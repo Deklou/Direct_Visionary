@@ -194,6 +194,9 @@ pub fn observe_spawn(eff_hash: u64, name: &str, spawn_data: &EffectData) -> bool
 /// observed this session are parked in PENDING_PINS (claimed on first spawn) instead of
 /// being dropped — the editor pushes spawn-offset pins before the effect ever fires.
 pub fn apply_edit(edit: &ParsedEdit) -> Option<Pinned> {
+    if !crate::slight::rule_scope::LEGACY_GLOBAL_EFFECTS_ENABLED {
+        return None;
+    }
     let mut kinds = KINDS.lock();
     let Some(k) = kinds.get_mut(&edit.id) else {
         drop(kinds);
@@ -369,7 +372,9 @@ pub fn reset_all_pins() {
         }
     }
     PENDING_PINS.lock().clear();
-    let _ = std::fs::remove_file(PINS_FILE);
+    if crate::slight::rule_scope::LEGACY_GLOBAL_EFFECTS_ENABLED {
+        let _ = std::fs::remove_file(PINS_FILE);
+    }
     skyline::println!("[SLight] All pinned edits reset by editor");
 }
 
@@ -420,6 +425,9 @@ fn save_pins() {
 
 /// Load saved pins into PENDING_PINS (claimed as kinds spawn). Call once at install.
 pub fn load_saved_pins() {
+    if !crate::slight::rule_scope::LEGACY_GLOBAL_EFFECTS_ENABLED {
+        return;
+    }
     let Ok(text) = std::fs::read_to_string(PINS_FILE) else {
         return;
     };

@@ -240,7 +240,14 @@ pub fn verify_export_with_expression(
             residue,
             &mut report,
         );
-        if !sources.iter().any(|text| text.contains(&emitted)) {
+        let shipped = crate::acmd::move_script_aliases(move_name).iter().any(|alias| {
+            let emitted = crate::acmd::preview_effect_fn(calls, alias, tweaks, residue);
+            sources.iter().any(|text| {
+                text.contains(&emitted)
+                    || text.contains(&crate::roster::scaffold::costume_arm_source(&emitted))
+            })
+        });
+        if !shipped {
             report.blocker(
                 &subject,
                 "the generated effect script is missing from the exported project",
@@ -253,7 +260,14 @@ pub fn verify_export_with_expression(
         let script_move = crate::acmd::resolve_script_move_name(fighter, move_name);
         let emitted = crate::acmd::preview_sound_fn(script, &script_move);
         verify_sound_move(&subject, script, &emitted, &mut report);
-        if !sources.iter().any(|text| text.contains(&emitted)) {
+        let shipped = crate::acmd::move_script_aliases(move_name).iter().any(|alias| {
+            let emitted = crate::acmd::preview_sound_fn(script, alias);
+            sources.iter().any(|text| {
+                text.contains(&emitted)
+                    || text.contains(&crate::roster::scaffold::costume_arm_source(&emitted))
+            })
+        });
+        if !shipped {
             report.blocker(
                 &subject,
                 "the generated sound script is missing from the exported project",
@@ -266,7 +280,14 @@ pub fn verify_export_with_expression(
         let script_move = crate::acmd::resolve_script_move_name(fighter, move_name);
         let emitted = crate::acmd::preview_expression_fn(script, &script_move);
         verify_expression_move(&subject, script, &emitted, &mut report);
-        if !sources.iter().any(|text| text.contains(&emitted)) {
+        let shipped = crate::acmd::move_script_aliases(move_name).iter().any(|alias| {
+            let emitted = crate::acmd::preview_expression_fn(script, alias);
+            sources.iter().any(|text| {
+                text.contains(&emitted)
+                    || text.contains(&crate::roster::scaffold::costume_arm_source(&emitted))
+            })
+        });
+        if !shipped {
             report.blocker(
                 &subject,
                 "the generated expression script is missing from the exported project",

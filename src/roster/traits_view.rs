@@ -59,6 +59,7 @@ impl TraitsView {
         labels: &HashMap<u64, String>,
         index: &RosterIndex,
         params: &mut BTreeMap<String, ParamMod>,
+        data_root: Option<&PathBuf>,
     ) {
         let Some(path) = FighterTraits::locate(roots) else {
             self.draw_missing_file(ui);
@@ -110,6 +111,18 @@ impl TraitsView {
             return;
         };
 
+        if !super::edit_scope::exclusive_fighter_in_roots(index, &fighter, roots, data_root) {
+            self.draw_shared_notice(ui, entry.display_name.as_str(), &fighter);
+            let saved = params.get(&fighter).is_some_and(|param| !traits::edits_for(param).is_empty());
+            if saved && ui.button("Remove saved fighter-wide trait edits").clicked() {
+                if let Some(param) = params.get_mut(&fighter) {
+                    param.files.remove(traits::FIGHTER_PARAM_PATH);
+                }
+                self.drafts.clear();
+            }
+            return;
+        }
+
         // Reload when the selection moved to a different fighter.
         if self.loaded.as_ref().map(|traits| traits.fighter.as_str()) != Some(fighter.as_str()) {
             self.drafts.clear();
@@ -142,10 +155,6 @@ impl TraitsView {
         let Some(loaded) = self.loaded.take() else {
             return;
         };
-
-        if entry.backing.shares_engine_fighter() {
-            self.draw_shared_notice(ui, entry.display_name.as_str(), &fighter);
-        }
 
         let edits = params.entry(fighter.clone()).or_default();
         let count = traits::edits_for(edits).len();
@@ -315,7 +324,7 @@ impl TraitsView {
                     ui.colored_label(Color32::from_rgb(240, 200, 120), "⚠");
                     ui.label(
                         RichText::new(format!(
-                            "{display_name} is a costume of {donor} — these values belong to {donor} as a whole."
+                            "Traits unavailable for {display_name}: {donor} is shared or its costume ownership is unverified."
                         ))
                         .strong(),
                     );
@@ -323,10 +332,7 @@ impl TraitsView {
                 ui.add_space(2.0);
                 ui.label(
                     RichText::new(
-                        "The game stores them per fighter, not per costume — there is no \
-                         per-costume version of any of them. Changing a value here changes it \
-                         for the donor and for every other costume of the donor, in the same \
-                         match.",
+                        "The game stores these values per fighter, not per costume. Editing, live application and export are blocked until the fighter has one verified owner. Saved values are preserved.",
                     )
                     .small()
                     .weak(),

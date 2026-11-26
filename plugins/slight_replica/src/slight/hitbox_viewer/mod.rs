@@ -300,6 +300,7 @@ const KINETIC_KEY_CLEAR_SPEED_ALL: u64 = u64::MAX - 3;
 
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct CaptureLine {
+    pub costume: u8,
     /// Fighter kind (smash::app::utility::get_kind) of the performing agent.
     pub kind: i32,
     /// MotionModule::motion_kind (hash40 of the motion name, e.g. "attack_air_n").
@@ -328,6 +329,7 @@ pub struct CaptureLine {
 /// script instead of whatever had arrived a few frames into the move.
 #[derive(Clone, Copy, Debug, serde::Serialize)]
 pub struct CaptureEnd {
+    pub costume: u8,
     pub kind: i32,
     pub motion: u64,
     /// The playback that finished — pairs with [`CaptureLine::run`].
@@ -341,7 +343,7 @@ pub struct CaptureEnd {
 /// aerial, a cancel, a branch that only fires sometimes — left the UNION of those runs in the
 /// bucket and the editor showed spawns that never occur together.
 ///
-/// Ids are global and strictly increasing. A `(fighter kind, motion)` is claimed by the first
+/// Ids are global and strictly increasing. A `(fighter kind, costume, motion)` is claimed by the first
 /// battle object that produces a capture line and is never assigned another run until captures
 /// are explicitly cleared. This keeps another instance, replay, cancel follow-up, or reconnect
 /// from replacing a completed snapshot.
@@ -351,7 +353,7 @@ fn next_run() -> u32 {
     NEXT_RUN.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
-/// One immutable capture owner per fighter-kind + motion. The claim exists as soon as the first
+/// One immutable capture owner per fighter-kind + costume + motion. The claim exists as soon as the first
 /// line lands, so another battle object cannot interleave a second run while the move is still
 /// executing. It remains after completion so later activity cannot supersede the snapshot.
 #[derive(Clone, Copy)]
@@ -382,6 +384,7 @@ static CLEAR_CAPTURES_REQUESTED: std::sync::atomic::AtomicBool =
 /// What one battle object is currently playing, for end-of-motion detection.
 #[derive(Clone, Copy)]
 struct MotionWatch {
+    costume: u8,
     motion: u64,
     kind: i32,
     /// Last MotionModule::frame seen — a decrease means the motion restarted.
@@ -415,7 +418,7 @@ struct CaptureState {
     seen: HashMap<u32, HashSet<u64>>,
     pending: Vec<CaptureLine>,
     ends: Vec<CaptureEnd>,
-    claims: HashMap<(i32, u64), CaptureClaim>,
+    claims: HashMap<(i32, u8, u64), CaptureClaim>,
     watch: HashMap<u32, MotionWatch>,
 }
 
@@ -426,8 +429,7 @@ static CAPTURE_STATE: LazyLock<Mutex<CaptureState>> =
 static CAPTURE_CONTENTION_DROPS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-/// Compact, lock-free capture accounting keyed exactly like the capture cache: fighter kind +
-/// motion. Hook workers only touch atomics; the low-frequency network facade snapshots changed
+/// Compact, lock-free capture accounting aggregated by fighter kind + motion (diagnostics only). Hook workers only touch atomics; the low-frequency network facade snapshots changed
 /// rows for the desktop. This must never acquire `CAPTURE_STATE`, especially on the failure path
 /// whose whole purpose is reporting that `CAPTURE_STATE` was contended.
 const CAPTURE_DEBUG_SLOTS: usize = 256;
@@ -848,6 +850,9 @@ unsafe fn record_for_boma_inner(
     let motion = smash::app::lua_bind::MotionModule::motion_kind(boma);
     let frame = smash::app::lua_bind::MotionModule::frame(boma);
     let kind = smash::app::utility::get_kind(&mut *boma);
+    let Ok(costume) = u8::try_from(smash::app::lua_bind::WorkModule::get_int(
+        boma, *smash::lib::lua_const::FIGHTER_INSTANCE_WORK_ID_INT_COLOR,
+    )) else { return; };
     let boid = (*boma).battle_object_id;
     let debug = capture_debug_attempt(kind, motion, frame);
 
@@ -878,7 +883,7 @@ unsafe fn record_for_boma_inner(
 
         // Resolve the run BEFORE dedupe — the key is scoped to it, and a new playback must not
         // be silently folded into the previous one's key set.
-        let (run, completed) = mark_capture_motion(&mut state, boid, motion, kind, frame, func);
+        let (run, completed) = mark_capture_motion(&mut state, boid, motion, kind, costume, frame, func);
         if let Some(run) = run {
             // Arm the clear-all gate: a clear is only worth capturing once something is out to
             // clear.
@@ -888,6 +893,7 @@ unsafe fn record_for_boma_inner(
 
             if state.seen.entry(run).or_default().insert(key) {
                 let line = CaptureLine {
+                    costume,
                     kind,
                     motion,
                     frame,
@@ -1047,7 +1053,7 @@ pub fn archive_replay_active() -> bool {
     capture_archive::replay_active()
 }
 
-/// Claim the first playback of `(kind, motion)` for one battle object and return its run id.
+/// Claim the first playback of `(kind, costume, motion)` for one battle object and return its run id.
 /// Existing claims are immutable: later performances and other instances are ignored.
 ///
 /// This can be the first thing to observe a motion change (an ACMD script can run before the
@@ -1059,12 +1065,13 @@ fn mark_capture_motion(
     boid: u32,
     motion: u64,
     kind: i32,
+    costume: u8,
     frame: f32,
     // Only for the drop report below — a claim collision is far easier to read when it names
     // the call that was discarded.
     func: &'static str,
 ) -> (Option<u32>, Option<CaptureEnd>) {
-    let mut finished: Option<(i32, u64, u32)> = None;
+    let mut finished: Option<(i32, u8, u64, u32)> = None;
     // Battle object ids are reused across matches; keep the map from growing unbounded.
     if state.watch.len() > 128 {
         state.watch.clear();
@@ -1072,7 +1079,7 @@ fn mark_capture_motion(
     let continuing = state
         .watch
         .get(&boid)
-        .is_some_and(|w| w.motion == motion && !w.ended && frame + 0.5 >= w.frame);
+        .is_some_and(|w| w.kind == kind && w.costume == costume && w.motion == motion && !w.ended && frame + 0.5 >= w.frame);
     if continuing {
         let w = state
             .watch
@@ -1085,7 +1092,7 @@ fn mark_capture_motion(
     }
     if let Some(w) = state.watch.remove(&boid) {
         if w.captured && !w.ended {
-            finished = Some((w.kind, w.motion, w.run));
+            finished = Some((w.kind, w.costume, w.motion, w.run));
         }
     }
     MOTION_WATCH_ACTIVE.store(
@@ -1093,11 +1100,11 @@ fn mark_capture_motion(
         std::sync::atomic::Ordering::Relaxed,
     );
     let completed =
-        finished.and_then(|(kind, motion, run)| finish_capture(state, boid, kind, motion, run));
+        finished.and_then(|(kind, costume, motion, run)| finish_capture(state, boid, kind, costume, motion, run));
 
     // Copied out so the refusal arm can read the holder while the insert arms take a mutable
     // borrow.
-    let held = state.claims.get(&(kind, motion)).copied();
+    let held = state.claims.get(&(kind, costume, motion)).copied();
     let run = match held {
         // **The same object returning to a motion it already owns — resume its run.**
         //
@@ -1130,7 +1137,7 @@ fn mark_capture_motion(
         Some(h) if h.boid == boid => {
             let run = next_run();
             state.claims.insert(
-                (kind, motion),
+                (kind, costume, motion),
                 CaptureClaim {
                     boid,
                     run,
@@ -1155,7 +1162,7 @@ fn mark_capture_motion(
         None => {
             let run = next_run();
             state.claims.insert(
-                (kind, motion),
+                (kind, costume, motion),
                 CaptureClaim {
                     boid,
                     run,
@@ -1169,6 +1176,7 @@ fn mark_capture_motion(
     state.watch.insert(
         boid,
         MotionWatch {
+            costume,
             motion,
             kind,
             frame,
@@ -1214,13 +1222,13 @@ fn close_collision_if_open(boid: u32) -> bool {
     note_collision(&mut state, boid, false)
 }
 
-fn push_end(state: &mut CaptureState, kind: i32, motion: u64, run: u32) -> Option<CaptureEnd> {
+fn push_end(state: &mut CaptureState, kind: i32, costume: u8, motion: u64, run: u32) -> Option<CaptureEnd> {
     // Collapse duplicate completion paths for the same claimed run (end frame and motion switch
     // can be observed on adjacent callbacks).
     if state.ends.iter().any(|e| e.run == run) {
         return None;
     }
-    let end = CaptureEnd { kind, motion, run };
+    let end = CaptureEnd { kind, costume, motion, run };
     state.ends.push(end);
     Some(end)
 }
@@ -1229,11 +1237,12 @@ fn finish_capture(
     state: &mut CaptureState,
     boid: u32,
     kind: i32,
+    costume: u8,
     motion: u64,
     run: u32,
 ) -> Option<CaptureEnd> {
     let (naturally_ended, should_emit) = {
-        let Some(claim) = state.claims.get_mut(&(kind, motion)) else {
+        let Some(claim) = state.claims.get_mut(&(kind, costume, motion)) else {
             return None;
         };
         if claim.boid != boid || claim.run != run {
@@ -1245,7 +1254,7 @@ fn finish_capture(
         (naturally_ended, should_emit)
     };
     let end = should_emit
-        .then(|| push_end(state, kind, motion, run))
+        .then(|| push_end(state, kind, costume, motion, run))
         .flatten();
     // A naturally completed run can never receive another authored line. Drop only its
     // in-memory dedupe set; an interrupted run may resume on the same motion and still needs its
@@ -1290,13 +1299,19 @@ pub unsafe fn capture_tick(lua_state: u64) {
     let Some(watched) = watched else {
         return;
     };
+    if smash::app::utility::get_category(&mut *boma)
+        != *smash::lib::lua_const::BATTLE_OBJECT_CATEGORY_FIGHTER { return; }
+    let kind = smash::app::utility::get_kind(&mut *boma);
+    let Ok(costume) = u8::try_from(smash::app::lua_bind::WorkModule::get_int(
+        boma, *smash::lib::lua_const::FIGHTER_INSTANCE_WORK_ID_INT_COLOR,
+    )) else { return; };
     let motion = smash::app::lua_bind::MotionModule::motion_kind(boma);
     let frame = smash::app::lua_bind::MotionModule::frame(boma);
     let end = smash::app::lua_bind::MotionModule::end_frame(boma);
 
-    let mut finished: Option<(i32, u64, u32)> = None;
+    let mut finished: Option<(i32, u8, u64, u32)> = None;
     // Set only when the playback reached `end_frame` — a charge hold must not look like this.
-    let mut ended_naturally: Option<(i32, u64, u32)> = None;
+    let mut ended_naturally: Option<(i32, u8, u64, u32)> = None;
     let completed = {
         let Some(mut state) = try_capture_state() else {
             return;
@@ -1309,10 +1324,10 @@ pub unsafe fn capture_tick(lua_state: u64) {
         if current.run != watched.run || current.motion != watched.motion {
             return;
         }
-        if current.motion != motion || frame + 0.5 < current.frame {
+        if current.kind != kind || current.costume != costume || current.motion != motion || frame + 0.5 < current.frame {
             // Switched away (or looped back to frame 0): the previous playback is over.
             if current.captured && !current.ended {
-                finished = Some((current.kind, current.motion, current.run));
+                finished = Some((current.kind, current.costume, current.motion, current.run));
             }
             state.watch.remove(&boid);
         } else {
@@ -1325,8 +1340,8 @@ pub unsafe fn capture_tick(lua_state: u64) {
             // last frame still gets recorded before the editor is told to adopt.
             if w.captured && !w.ended && end > 0.0 && frame >= end {
                 w.ended = true;
-                ended_naturally = Some((w.kind, w.motion, w.run));
-                finished = Some((w.kind, w.motion, w.run));
+                ended_naturally = Some((w.kind, w.costume, w.motion, w.run));
+                finished = Some((w.kind, w.costume, w.motion, w.run));
             }
         }
         MOTION_WATCH_ACTIVE.store(
@@ -1337,14 +1352,14 @@ pub unsafe fn capture_tick(lua_state: u64) {
         // The claim outlives the watch entry, and that is the point: the entry is dropped the
         // moment the motion frame steps backwards, so only the claim can distinguish a finished
         // playback from one suspended by a charge hold.
-        if let Some((kind, motion, run)) = ended_naturally {
-            if let Some(claim) = state.claims.get_mut(&(kind, motion)) {
+        if let Some((kind, costume, motion, run)) = ended_naturally {
+            if let Some(claim) = state.claims.get_mut(&(kind, costume, motion)) {
                 if claim.run == run {
                     claim.ended = true;
                 }
             }
         }
-        finished.and_then(|(kind, motion, run)| finish_capture(&mut state, boid, kind, motion, run))
+        finished.and_then(|(kind, costume, motion, run)| finish_capture(&mut state, boid, kind, costume, motion, run))
     };
     if let Some(end) = completed {
         capture_archive::append_end(end);
@@ -1492,8 +1507,15 @@ pub struct InjectRule {
     pub command: Option<String>,
 }
 
+use crate::slight::rule_scope::RuntimeTarget;
+
 #[derive(Clone, Debug, serde::Deserialize)]
 pub struct HitboxRule {
+    /// Runtime fighter kind. Missing in older TCP messages: safe no-op, never a wildcard.
+    #[serde(default)]
+    pub fighter_kind: Option<i32>,
+    #[serde(default)]
+    pub costume_slots: Option<Vec<u8>>,
     /// hash40 of the motion name ("attack_air_n").
     pub motion: u64,
     /// Collision family this rule targets (0 attack / 1 grab / 2 wind). Old editors omit
@@ -1532,12 +1554,34 @@ pub struct HitboxRule {
 }
 
 impl HitboxRule {
-    fn matches(&self, category: u8, motion: u64, id: u64, frame: f32) -> bool {
-        self.category == category
+    fn matches(&self, target: RuntimeTarget, category: u8, motion: u64, id: u64, frame: f32) -> bool {
+        target.matches(self.fighter_kind, self.costume_slots.as_deref())
+            && self.category == category
             && self.motion == motion
             && self.hitbox_id.map(|h| h == id).unwrap_or(true)
             && self.frame_start.map(|s| frame >= s).unwrap_or(true)
             && self.frame_end.map(|e| frame <= e).unwrap_or(true)
+    }
+}
+
+#[cfg(test)]
+mod fighter_scope_tests {
+    use super::*;
+
+    #[test]
+    fn identical_attack_hi3_and_attack_11_names_are_fighter_scoped() {
+        for motion in [0xacbfc42e6, 0x99c52257e] {
+            let rule: HitboxRule = serde_json::from_str(&format!(
+                r#"{{"fighter_kind":24,"costume_slots":[8,9],"motion":{motion},"category":9}}"#
+            )).unwrap();
+            assert!(rule.matches(RuntimeTarget { fighter_kind: 24, costume: 8 }, CAT_MOTION_RATE, motion, 0, 2.0));
+            assert!(!rule.matches(RuntimeTarget { fighter_kind: 1, costume: 8 }, CAT_MOTION_RATE, motion, 0, 2.0));
+            assert!(!rule.matches(RuntimeTarget { fighter_kind: 24, costume: 0 }, CAT_MOTION_RATE, motion, 0, 2.0));
+            let unscoped: HitboxRule = serde_json::from_str(&format!(
+                r#"{{"motion":{motion},"category":9}}"#
+            )).unwrap();
+            assert!(!unscoped.matches(RuntimeTarget { fighter_kind: 24, costume: 8 }, CAT_MOTION_RATE, motion, 0, 2.0));
+        }
     }
 }
 
@@ -1626,9 +1670,25 @@ fn any_rules() -> bool {
     HAVE_RULES.load(std::sync::atomic::Ordering::Acquire)
 }
 
-/// The suppress/override action matching (motion, id, frame), if any. Frame-scoped so one
-/// hit of a multi-hit move (same id, different frame) can be edited without touching the rest.
-fn action_for(
+/// Runtime identity is required before any live rule can change a fighter.
+pub(crate) unsafe fn rule_target(boma: *mut smash::app::BattleObjectModuleAccessor) -> Option<RuntimeTarget> {
+    if boma.is_null()
+        || smash::app::utility::get_category(&mut *boma)
+            != *smash::lib::lua_const::BATTLE_OBJECT_CATEGORY_FIGHTER
+    {
+        return None;
+    }
+    Some(RuntimeTarget {
+        fighter_kind: smash::app::utility::get_kind(&mut *boma),
+        costume: smash::app::lua_bind::WorkModule::get_int(
+            boma, *smash::lib::lua_const::FIGHTER_INSTANCE_WORK_ID_INT_COLOR,
+        ),
+    })
+}
+
+/// Pure matcher shared by sv_animcmd hooks and direct Module hooks.
+fn action_for_target(
+    target: RuntimeTarget,
     category: u8,
     motion: u64,
     id: u64,
@@ -1637,26 +1697,36 @@ fn action_for(
     let rules = RULES.lock();
     rules
         .iter()
-        .find(|r| r.inject.is_none() && r.matches(category, motion, id, frame))
+        .find(|r| r.inject.is_none() && r.matches(target, category, motion, id, frame))
         .map(|r| (r.suppress, r.overrides.clone()))
 }
 
-/// As [`action_for`], but with the exact direct-call name as a second discriminator. Shared
-/// `CAT_WORK_FLAG` rules must not let an `on_flag` edit reach an `off_flag` call with the same
-/// numeric flag and frame.
-fn action_for_func(
+unsafe fn action_for(
+    boma: *mut smash::app::BattleObjectModuleAccessor,
+    category: u8,
+    motion: u64,
+    id: u64,
+    frame: f32,
+) -> Option<(bool, Option<HbOverrides>)> {
+    action_for_target(rule_target(boma)?, category, motion, id, frame)
+}
+
+/// As action_for, with the exact direct-call name as a second discriminator.
+unsafe fn action_for_func(
+    boma: *mut smash::app::BattleObjectModuleAccessor,
     category: u8,
     motion: u64,
     id: u64,
     frame: f32,
     func: &str,
 ) -> Option<(bool, Option<HbOverrides>)> {
+    let target = rule_target(boma)?;
     let rules = RULES.lock();
     rules
         .iter()
         .find(|r| {
             r.inject.is_none()
-                && r.matches(category, motion, id, frame)
+                && r.matches(target, category, motion, id, frame)
                 && r.func.as_deref().is_none_or(|candidate| candidate == func)
         })
         .map(|r| (r.suppress, r.overrides.clone()))
@@ -1725,12 +1795,14 @@ fn numeric_arg_f32(arg: &LuaArg) -> Option<f32> {
     }
 }
 
-fn expression_action(
+unsafe fn expression_action(
+    boma: *mut smash::app::BattleObjectModuleAccessor,
     motion: u64,
     frame: f32,
     func: &str,
     args: &[LuaArg],
 ) -> Option<(bool, Option<HbOverrides>)> {
+    let target = rule_target(boma)?;
     let key = expression_key(func, args);
     let rules = RULES.lock();
     rules
@@ -1739,7 +1811,7 @@ fn expression_action(
             rule.inject.is_none()
                 && rule.category == CAT_EXPRESSION
                 && rule.func.as_deref() == Some(func)
-                && rule.matches(CAT_EXPRESSION, motion, key, frame)
+                && rule.matches(target, CAT_EXPRESSION, motion, key, frame)
         })
         .map(|rule| (rule.suppress, rule.overrides.clone()))
 }
@@ -1779,7 +1851,7 @@ macro_rules! expression_hook {
                     let motion = smash::app::lua_bind::MotionModule::motion_kind(boma);
                     let frame = smash::app::lua_bind::MotionModule::frame(boma);
                     if let Some((suppress, overrides)) =
-                        expression_action(motion, frame, $func, &args)
+                        expression_action(boma, motion, frame, $func, &args)
                     {
                         if suppress {
                             return;
@@ -1811,7 +1883,7 @@ unsafe fn hook_reverse_lr(lua_state: u64) {
         if !boma.is_null() {
             let motion = smash::app::lua_bind::MotionModule::motion_kind(boma);
             let frame = smash::app::lua_bind::MotionModule::frame(boma);
-            if let Some((suppress, _)) = action_for(CAT_REVERSE_LR, motion, 0, frame) {
+            if let Some((suppress, _)) = action_for(boma, CAT_REVERSE_LR, motion, 0, frame) {
                 if suppress {
                     return;
                 }
@@ -1844,7 +1916,7 @@ unsafe fn hook_clr_speed(lua_state: u64) {
                 return;
             };
             let key = numeric_point_key("CLR_SPEED", &[kind]);
-            if let Some((suppress, overrides)) = action_for(CAT_CLR_SPEED, motion, key, frame) {
+            if let Some((suppress, overrides)) = action_for(boma, CAT_CLR_SPEED, motion, key, frame) {
                 if suppress {
                     return;
                 }
@@ -1873,7 +1945,7 @@ unsafe fn hook_set_air(lua_state: u64) {
         if !boma.is_null() {
             let motion = smash::app::lua_bind::MotionModule::motion_kind(boma);
             let frame = smash::app::lua_bind::MotionModule::frame(boma);
-            if let Some((suppress, _)) = action_for(CAT_SET_AIR, motion, KINETIC_KEY_SET_AIR, frame)
+            if let Some((suppress, _)) = action_for(boma, CAT_SET_AIR, motion, KINETIC_KEY_SET_AIR, frame)
             {
                 if suppress {
                     return;
@@ -1892,6 +1964,7 @@ unsafe fn hook_kinetic_clear_speed_all(boma: *mut smash::app::BattleObjectModule
         let motion = smash::app::lua_bind::MotionModule::motion_kind(boma);
         let frame = smash::app::lua_bind::MotionModule::frame(boma);
         if let Some((suppress, _)) = action_for(
+            boma,
             CAT_KINETIC_CLEAR_SPEED_ALL,
             motion,
             KINETIC_KEY_CLEAR_SPEED_ALL,
@@ -1930,7 +2003,7 @@ unsafe fn hook_kinetic_set_consider_ground_friction(
             ],
         );
         if let Some((suppress, overrides)) =
-            action_for(CAT_KINETIC_SET_CONSIDER_GROUND_FRICTION, motion, key, frame)
+            action_for(boma, CAT_KINETIC_SET_CONSIDER_GROUND_FRICTION, motion, key, frame)
         {
             if suppress {
                 return;
@@ -1974,7 +2047,7 @@ unsafe fn hook_change_kinetic(
         let motion = smash::app::lua_bind::MotionModule::motion_kind(boma);
         let frame = smash::app::lua_bind::MotionModule::frame(boma);
         let key = numeric_point_key("KineticModule::change_kinetic", &[kinetic_type as f32]);
-        if let Some((suppress, overrides)) = action_for(CAT_CHANGE_KINETIC, motion, key, frame) {
+        if let Some((suppress, overrides)) = action_for(boma, CAT_CHANGE_KINETIC, motion, key, frame) {
             if suppress {
                 // The call's return value is ignored by the measured ACMD source. Zero is the
                 // neutral success-like result used for a suppressed primitive in this hook.
@@ -2003,7 +2076,7 @@ macro_rules! kinetic_energy_hook {
                 let motion = smash::app::lua_bind::MotionModule::motion_kind(boma);
                 let frame = smash::app::lua_bind::MotionModule::frame(boma);
                 let key = numeric_point_key($func, &[kinetic_energy_id as f32]);
-                if let Some((suppress, overrides)) = action_for($category, motion, key, frame) {
+                if let Some((suppress, overrides)) = action_for(boma, $category, motion, key, frame) {
                     if suppress {
                         return 0;
                     }
@@ -2067,7 +2140,7 @@ unsafe fn hook_kinetic_add_speed(
         let motion = smash::app::lua_bind::MotionModule::motion_kind(boma);
         let frame = smash::app::lua_bind::MotionModule::frame(boma);
         let key = numeric_point_key("KineticModule::add_speed", &[vector.x, vector.y, vector.z]);
-        if let Some((suppress, overrides)) = action_for(CAT_KINETIC_ADD_SPEED, motion, key, frame) {
+        if let Some((suppress, overrides)) = action_for(boma, CAT_KINETIC_ADD_SPEED, motion, key, frame) {
             if suppress {
                 return 0;
             }
@@ -2106,7 +2179,7 @@ macro_rules! work_flag_hook {
                 let frame = smash::app::lua_bind::MotionModule::frame(boma);
                 let key = numeric_point_key($func, &[flag as f32]);
                 if let Some((suppress, overrides)) =
-                    action_for_func(CAT_WORK_FLAG, motion, key, frame, $func)
+                    action_for_func(boma, CAT_WORK_FLAG, motion, key, frame, $func)
                 {
                     if suppress {
                         return;
@@ -2152,7 +2225,7 @@ macro_rules! work_transition_term_hook {
                 let frame = smash::app::lua_bind::MotionModule::frame(boma);
                 let key = numeric_point_key($func, &[transition_term as f32]);
                 if let Some((suppress, overrides)) =
-                    action_for_func(CAT_WORK_TRANSITION_TERM, motion, key, frame, $func)
+                    action_for_func(boma, CAT_WORK_TRANSITION_TERM, motion, key, frame, $func)
                 {
                     if suppress {
                         return;
@@ -2202,6 +2275,7 @@ unsafe fn hook_work_module_inc_int(boma: *mut smash::app::BattleObjectModuleAcce
         let frame = smash::app::lua_bind::MotionModule::frame(boma);
         let key = integer_point_key("WorkModule::inc_int", &[slot as i64]);
         if let Some((suppress, overrides)) = action_for_func(
+            boma,
             CAT_WORK_MODULE_INC_INT,
             motion,
             key,
@@ -2242,6 +2316,7 @@ unsafe fn hook_work_module_set_int(
         let frame = smash::app::lua_bind::MotionModule::frame(boma);
         let key = numeric_point_key("WorkModule::set_int", &[value as f32, slot as f32]);
         if let Some((suppress, overrides)) = action_for_func(
+            boma,
             CAT_WORK_MODULE_SET,
             motion,
             key,
@@ -2286,6 +2361,7 @@ unsafe fn hook_work_module_set_int64(
         let frame = smash::app::lua_bind::MotionModule::frame(boma);
         let key = integer_point_key("WorkModule::set_int64", &[value, slot as i64]);
         if let Some((suppress, overrides)) = action_for_func(
+            boma,
             CAT_WORK_MODULE_SET,
             motion,
             key,
@@ -2324,6 +2400,7 @@ unsafe fn hook_work_module_set_float(
         let frame = smash::app::lua_bind::MotionModule::frame(boma);
         let key = numeric_point_key("WorkModule::set_float", &[value, slot as f32]);
         if let Some((suppress, overrides)) = action_for_func(
+            boma,
             CAT_WORK_MODULE_SET,
             motion,
             key,
@@ -2372,7 +2449,7 @@ unsafe fn hook_set_speed_ex(lua_state: u64) {
                 Some(LuaArg::Num(value)) => *value as u64,
                 _ => u64::MAX,
             };
-            if let Some((suppress, overrides)) = action_for(CAT_SPEED_EX, motion, kind, frame) {
+            if let Some((suppress, overrides)) = action_for(boma, CAT_SPEED_EX, motion, kind, frame) {
                 if suppress {
                     return;
                 }
@@ -2410,7 +2487,7 @@ unsafe fn hook_set_speed(lua_state: u64) {
         if !boma.is_null() {
             let motion = smash::app::lua_bind::MotionModule::motion_kind(boma);
             let frame = smash::app::lua_bind::MotionModule::frame(boma);
-            if let Some((suppress, overrides)) = action_for(CAT_SPEED, motion, 0, frame) {
+            if let Some((suppress, overrides)) = action_for(boma, CAT_SPEED, motion, 0, frame) {
                 if suppress {
                     return;
                 }
@@ -2449,7 +2526,7 @@ unsafe fn hook_add_speed_no_limit(lua_state: u64) {
             let motion = smash::app::lua_bind::MotionModule::motion_kind(boma);
             let frame = smash::app::lua_bind::MotionModule::frame(boma);
             if let Some((suppress, overrides)) =
-                action_for(CAT_ADD_SPEED_NO_LIMIT, motion, 0, frame)
+                action_for(boma, CAT_ADD_SPEED_NO_LIMIT, motion, 0, frame)
             {
                 if suppress {
                     return;
@@ -2494,7 +2571,7 @@ unsafe fn hook_correct(lua_state: u64) {
                 Some(LuaArg::Num(value)) => *value as u64,
                 _ => u64::MAX,
             };
-            if let Some((suppress, overrides)) = action_for(CAT_CORRECT, motion, kind, frame) {
+            if let Some((suppress, overrides)) = action_for(boma, CAT_CORRECT, motion, kind, frame) {
                 if suppress {
                     return;
                 }
@@ -2541,7 +2618,7 @@ unsafe fn hook_ft_catch_stop(lua_state: u64) {
             if let Some(numeric) = numeric {
                 let key = numeric_point_key("FT_CATCH_STOP", &numeric);
                 if let Some((suppress, overrides)) =
-                    action_for(CAT_FT_CATCH_STOP, motion, key, frame)
+                    action_for(boma, CAT_FT_CATCH_STOP, motion, key, frame)
                 {
                     if suppress {
                         return;
@@ -2589,7 +2666,7 @@ unsafe fn hook_ft_start_adjust_motion_frame(lua_state: u64) {
             };
             let key = numeric_point_key("FT_START_ADJUST_MOTION_FRAME_arg1", &[value]);
             if let Some((suppress, overrides)) =
-                action_for(CAT_FT_START_ADJUST_MOTION_FRAME, motion, key, frame)
+                action_for(boma, CAT_FT_START_ADJUST_MOTION_FRAME, motion, key, frame)
             {
                 if suppress {
                     return;
@@ -2673,7 +2750,7 @@ unsafe fn hook_control_set_rumble(
         let motion = smash::app::lua_bind::MotionModule::motion_kind(boma);
         let frame = smash::app::lua_bind::MotionModule::frame(boma);
         if let Some((suppress, overrides)) =
-            expression_action(motion, frame, "ControlModule::set_rumble", &args)
+            expression_action(boma, motion, frame, "ControlModule::set_rumble", &args)
         {
             if suppress {
                 return;
@@ -2707,12 +2784,15 @@ unsafe fn hook_control_set_rumble(
 
 /// Inject rules for a motion, tagged with the collision family to fire through.
 fn injection_fingerprint(
+    target: RuntimeTarget,
     motion: u64,
     category: u8,
     injection_key: Option<u64>,
     injection: &InjectRule,
 ) -> u64 {
-    let mut hash = fnv(0xcbf2_9ce4_8422_2325, motion);
+    let mut hash = fnv(0xcbf2_9ce4_8422_2325, target.fighter_kind as u64);
+    hash = fnv(hash, target.costume as u64);
+    hash = fnv(hash, motion);
     hash = fnv(hash, category as u64);
     // `hitbox_id` is a per-call discriminator for sound and expression additions. Keep it out of
     // the other families' fingerprints so their established injection deduplication remains
@@ -2730,12 +2810,13 @@ fn injection_fingerprint(
     hash
 }
 
-fn injections_for(motion: u64, frame: f32) -> Vec<(u64, u8, InjectRule)> {
+fn injections_for(target: RuntimeTarget, motion: u64, frame: f32) -> Vec<(u64, u8, InjectRule)> {
     let rules = RULES.lock();
     rules
         .iter()
         .filter(|r| {
-            r.motion == motion
+            target.matches(r.fighter_kind, r.costume_slots.as_deref())
+                && r.motion == motion
                 && r.inject.is_some()
                 && (!matches!(r.category, CAT_MOTION_MODULE_SET_RATE | CAT_ATTACK_LIFETIME)
                     || r.frame_end.map(|end| frame <= end).unwrap_or(true))
@@ -2743,7 +2824,7 @@ fn injections_for(motion: u64, frame: f32) -> Vec<(u64, u8, InjectRule)> {
         .map(|rule| {
             let injection = rule.inject.clone().unwrap();
             (
-                injection_fingerprint(rule.motion, rule.category, rule.hitbox_id, &injection),
+                injection_fingerprint(target, rule.motion, rule.category, rule.hitbox_id, &injection),
                 rule.category,
                 injection,
             )
@@ -2958,7 +3039,7 @@ macro_rules! attack_hook {
                             _ => u64::MAX,
                         };
                         if let Some((suppress, overrides)) =
-                            action_for(CAT_ATTACK, motion, id, frame)
+                            action_for(boma, CAT_ATTACK, motion, id, frame)
                         {
                             if suppress {
                                 return; // hitbox never comes out
@@ -2999,7 +3080,7 @@ unsafe fn hook_attack_fp(lua_state: u64) {
                     Some(LuaArg::Num(value)) => *value as u64,
                     _ => u64::MAX,
                 };
-                if let Some((suppress, overrides)) = action_for(CAT_ATTACK_FP, motion, id, frame) {
+                if let Some((suppress, overrides)) = action_for(boma, CAT_ATTACK_FP, motion, id, frame) {
                     if suppress {
                         return;
                     }
@@ -3131,7 +3212,7 @@ unsafe fn hook_catch(lua_state: u64) {
                     Some(LuaArg::Num(n)) => *n as u64,
                     _ => u64::MAX,
                 };
-                if let Some((suppress, overrides)) = action_for(CAT_GRAB, motion, id, frame) {
+                if let Some((suppress, overrides)) = action_for(boma, CAT_GRAB, motion, id, frame) {
                     crate::slight::diag::note(format!(
                         "grab rule hit (motion {motion:#x} id {id} frame {frame:.1} suppress {suppress})"
                     ));
@@ -3214,7 +3295,7 @@ unsafe fn hook_search(lua_state: u64) {
                     Some(LuaArg::Num(n)) => *n as u64,
                     _ => u64::MAX,
                 };
-                if let Some((suppress, overrides)) = action_for(CAT_SEARCH, motion, id, frame) {
+                if let Some((suppress, overrides)) = action_for(boma, CAT_SEARCH, motion, id, frame) {
                     crate::slight::diag::note(format!(
                         "search rule hit (motion {motion:#x} id {id} frame {frame:.1} suppress {suppress})"
                     ));
@@ -3262,7 +3343,7 @@ macro_rules! wind_hook {
                             Some(LuaArg::Num(id)) => *id as u64,
                             _ => u64::MAX,
                         };
-                        if let Some((suppress, overrides)) = action_for(CAT_WIND, motion, id, frame)
+                        if let Some((suppress, overrides)) = action_for(boma, CAT_WIND, motion, id, frame)
                         {
                             if suppress {
                                 return;
@@ -3338,7 +3419,7 @@ unsafe fn hook_attack_abs(lua_state: u64) {
                     Some(LuaArg::Num(k)) => *k as u64,
                     _ => u64::MAX,
                 };
-                if let Some((suppress, overrides)) = action_for(CAT_ABS, motion, kind, frame) {
+                if let Some((suppress, overrides)) = action_for(boma, CAT_ABS, motion, kind, frame) {
                     if suppress {
                         return;
                     }
@@ -3465,7 +3546,7 @@ unsafe fn hurt_action(
     // Hurtbox targets share one category, and `WHOLE_HIT`/`HIT_NODE`/`HIT_NO` do not
     // have interchangeable argument layouts.  Match the command as well as the target
     // sentinel so a same-frame COL_PRI or WHOLE_HIT rule can never rewrite a status slot.
-    let Some((suppress, overrides)) = action_for_func(CAT_HURT, motion, target_key, frame, func)
+    let Some((suppress, overrides)) = action_for_func(boma, CAT_HURT, motion, target_key, frame, func)
     else {
         return false;
     };
@@ -3645,7 +3726,7 @@ unsafe fn attack_mod_action(
     };
     let motion = smash::app::lua_bind::MotionModule::motion_kind(boma);
     let frame = smash::app::lua_bind::MotionModule::frame(boma);
-    let Some((suppress, overrides)) = action_for(category, motion, id, frame) else {
+    let Some((suppress, overrides)) = action_for(boma, category, motion, id, frame) else {
         return false;
     };
     if suppress {
@@ -3739,7 +3820,8 @@ pub unsafe fn inject_tick(lua_state: u64) {
     }
     let motion = smash::app::lua_bind::MotionModule::motion_kind(boma);
     let frame = smash::app::lua_bind::MotionModule::frame(boma);
-    let injections = injections_for(motion, frame);
+    let Some(target) = rule_target(boma) else { return; };
+    let injections = injections_for(target, motion, frame);
     if injections.is_empty() {
         return;
     }

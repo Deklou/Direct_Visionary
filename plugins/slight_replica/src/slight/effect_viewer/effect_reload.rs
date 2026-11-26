@@ -1486,6 +1486,9 @@ pub fn mark(step: &str) {
 
 /// Store editor-supplied stripped donor buffers (keyed by donor eff FILE path).
 pub fn set_donor_bytes(list: Vec<(String, Vec<u8>)>) {
+    if !crate::slight::rule_scope::LEGACY_GLOBAL_EFFECTS_ENABLED {
+        return;
+    }
     // Each editor snapshot starts a clean diagnostic trail. The old append-only file made
     // an earlier Alucard experiment look like it was still part of a later Bomberman load.
     let _ = std::fs::write("sd:/effect_viewer_marks.txt", "");
@@ -1661,6 +1664,9 @@ pub fn pump_coload_tick() {
 
 /// Resolve a requested effect kind to the real co-loaded donor kind, if one exists.
 pub fn coload_remap(hash: u64) -> Option<u64> {
+    if !crate::slight::rule_scope::LEGACY_GLOBAL_EFFECTS_ENABLED {
+        return None;
+    }
     let r = CO_LOADED_REMAP
         .lock()
         .get(&(hash & 0xff_ffff_ffff))
@@ -1807,6 +1813,9 @@ pub fn request_asset_carrier_reload(generation: u64) {
 /// (executed on the game thread by [`pump_donor_queue`]). Keys + donors are normalized
 /// to effect FOLDERS (the unit load_effects actually works in).
 pub fn set_donor_specs(specs: Vec<DonorSpec>) {
+    if !crate::slight::rule_scope::LEGACY_GLOBAL_EFFECTS_ENABLED {
+        return;
+    }
     // Any FIGHTER target may own the carrier — the editor builds the carrier from whichever
     // fighter is selected, so pinning this to `effect/fighter/kirby` silently dropped the
     // carrier for every other character (the spec was accepted, but nothing was ever staged).

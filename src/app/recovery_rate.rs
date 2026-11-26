@@ -219,13 +219,7 @@ impl VisionaryApp {
             self.hitbox_rules_store.remove(&key);
         }
 
-        let rules: Vec<HitboxRuleWire> = self
-            .hitbox_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        self.game_link.send_hitbox_rules(&rules);
+        self.send_live_hitbox_rules();
         self.state.status = if enabled && !ranges.is_empty() {
             format!("{} animation speed range(s) sent for live preview", ranges.len())
         } else {

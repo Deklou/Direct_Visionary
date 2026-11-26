@@ -5341,6 +5341,10 @@ pub fn build_mod_project_full(
 /// single-slot character, 8 for a c08–c15 one).
 pub type SlotGates = std::collections::HashMap<(String, String), (Vec<u8>, String)>;
 
+/// Costume gates for edited effect_, sound_ and expression_ functions.
+pub type CategorySlotGates =
+    std::collections::HashMap<(String, String, String), (Vec<u8>, String)>;
+
 /// Like [`build_mod_project_full`] with editable `expression_` scripts included.
 pub fn build_mod_project_full_with_expression(
     edits: &[(String, String, crate::data::AcmdScript)],
@@ -5372,6 +5376,66 @@ pub fn build_mod_project_with_slot_gates(
     live_tweaks: &[crate::mod_project::LiveTweak],
     plugin_name: &str,
     slot_gates: &SlotGates,
+) -> ModProject {
+    build_mod_project_with_all_slot_gates(
+        edits,
+        effect_edits,
+        sound_edits,
+        expression_edits,
+        live_tweaks,
+        plugin_name,
+        slot_gates,
+        &CategorySlotGates::new(),
+    )
+}
+
+fn append_gated_script(
+    output: &mut String,
+    name: &str,
+    body: &str,
+    gate: Option<&(Vec<u8>, String)>,
+) {
+    match gate {
+        Some((slots, original)) => output.push_str(
+            &crate::roster::scaffold::costume_gated_source_multi(name, slots, body, original),
+        ),
+        None => output.push_str(body),
+    }
+    output.push('\n');
+}
+
+fn gated_script_move(
+    fighter: &str,
+    move_name: &str,
+    prefix: &str,
+    gate: Option<&(Vec<u8>, String)>,
+) -> String {
+    let mut script_move = resolve_script_move_name(fighter, move_name);
+    if let Some((_, original)) = gate {
+        if let Some(declared) = declared_fn_name(original) {
+            let candidates = acmd_script_candidates(prefix, move_name);
+            let moves = move_script_aliases(move_name);
+            if let Some(index) = candidates.iter().position(|name| name == &declared) {
+                if let Some(matched) = moves.get(index) {
+                    script_move = matched.clone();
+                }
+            }
+        }
+    }
+    script_move
+}
+
+/// Emit costume gates for all four ACMD categories, keeping vanilla fallback scripts.
+#[allow(clippy::too_many_arguments)]
+pub fn build_mod_project_with_all_slot_gates(
+    edits: &[(String, String, crate::data::AcmdScript)],
+    effect_edits: &[EffectExport],
+    sound_edits: &[(String, String, crate::data::AcmdScript)],
+    expression_edits: &[(String, String, crate::data::AcmdScript)],
+    live_tweaks: &[crate::mod_project::LiveTweak],
+    plugin_name: &str,
+    slot_gates: &SlotGates,
+    category_gates: &CategorySlotGates,
 ) -> ModProject {
     use std::collections::HashMap;
 
@@ -5604,10 +5668,14 @@ pub fn install() {{
             let mut sorted_fx = fx_moves.clone();
             sorted_fx.sort_by_key(|(m, _, _)| *m);
             for (move_name, calls, residue) in &sorted_fx {
-                let script_move = resolve_script_move_name(fighter, move_name);
+                let gate = category_gates.get(&(
+                    (*fighter).to_string(),
+                    (*move_name).to_string(),
+                    "effect".to_string(),
+                ));
+                let script_move = gated_script_move(fighter, move_name, "effect", gate);
                 let (fn_name, fn_src) = emit_effect_move_fn(calls, &script_move, &tweaks, residue);
-                acmd_src.push_str(&fn_src);
-                acmd_src.push('\n');
+                append_gated_script(&mut acmd_src, &fn_name, &fn_src, gate);
                 fn_entries.push((fn_name.clone(), fn_name));
             }
         }
@@ -5617,10 +5685,14 @@ pub fn install() {{
             let mut sorted_sfx = sfx_moves.clone();
             sorted_sfx.sort_by_key(|(m, _)| *m);
             for (move_name, script) in &sorted_sfx {
-                let script_move = resolve_script_move_name(fighter, move_name);
+                let gate = category_gates.get(&(
+                    (*fighter).to_string(),
+                    (*move_name).to_string(),
+                    "sound".to_string(),
+                ));
+                let script_move = gated_script_move(fighter, move_name, "sound", gate);
                 let (fn_name, fn_src) = emit_sound_move_fn(script, &script_move);
-                acmd_src.push_str(&fn_src);
-                acmd_src.push('\n');
+                append_gated_script(&mut acmd_src, &fn_name, &fn_src, gate);
                 fn_entries.push((fn_name.clone(), fn_name));
             }
         }
@@ -5630,10 +5702,14 @@ pub fn install() {{
             let mut sorted_expression = expression_moves.clone();
             sorted_expression.sort_by_key(|(m, _)| *m);
             for (move_name, script) in &sorted_expression {
-                let script_move = resolve_script_move_name(fighter, move_name);
+                let gate = category_gates.get(&(
+                    (*fighter).to_string(),
+                    (*move_name).to_string(),
+                    "expression".to_string(),
+                ));
+                let script_move = gated_script_move(fighter, move_name, "expression", gate);
                 let (fn_name, fn_src) = emit_expression_move_fn(script, &script_move);
-                acmd_src.push_str(&fn_src);
-                acmd_src.push('\n');
+                append_gated_script(&mut acmd_src, &fn_name, &fn_src, gate);
                 fn_entries.push((fn_name.clone(), fn_name));
             }
         }

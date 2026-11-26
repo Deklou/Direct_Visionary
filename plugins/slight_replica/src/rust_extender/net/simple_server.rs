@@ -294,7 +294,7 @@ unsafe fn handshake(client: i32, flags: i32) -> Option<u64> {
     let frames = vec![
         r#"{"header":"RemoveAll","body":"{}"}"#.to_owned(),
         format!(
-            r#"{{"header":"GiveClientId","body":"{{\"GiveClientId\":{{\"client_id\":{cid}}}}}"}}"#
+            r#"{{"header":"GiveClientId","body":"{{\"GiveClientId\":{{\"client_id\":{cid},\"scoped_cancels\":true,\"scoped_acmd\":true,\"scoped_aliases\":true}}}}"}}"#
         ),
     ];
     let mut batch = TxBatch::new(frames);

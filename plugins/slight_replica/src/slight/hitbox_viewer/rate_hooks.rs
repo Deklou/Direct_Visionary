@@ -71,8 +71,8 @@ fn rate_arg(arg: &LuaArg) -> Option<f32> {
 /// exposed to. A rate rule can miss on the motion or on the frame window, and from outside the
 /// two are indistinguishable: both look like "the edit did not apply". This is the third time
 /// that shape has cost a game boot on this project.
-fn rate_action(motion: u64, frame: f32) -> Option<(bool, Option<HbOverrides>)> {
-    let hit = super::action_for(CAT_MOTION_RATE, motion, 0, frame);
+fn rate_action(target: super::RuntimeTarget, motion: u64, frame: f32) -> Option<(bool, Option<HbOverrides>)> {
+    let hit = super::action_for_target(target, CAT_MOTION_RATE, motion, 0, frame);
     if hit.is_none() && MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < MISS_BUDGET {
         let loaded: Vec<String> = {
             let rules = super::RULES.lock();
@@ -134,9 +134,12 @@ unsafe fn rate_action_for_call(lua_state: u64, args: &[LuaArg]) -> bool {
         ));
         return false;
     };
+    let Some(target) = super::rule_target(boma) else {
+        return false;
+    };
     let motion = smash::app::lua_bind::MotionModule::motion_kind(boma);
     let frame = smash::app::lua_bind::MotionModule::frame(boma);
-    let Some((suppress, overrides)) = rate_action(motion, frame) else {
+    let Some((suppress, overrides)) = rate_action(target, motion, frame) else {
         return false;
     };
     crate::slight::diag::note(format!(
@@ -199,7 +202,7 @@ unsafe fn hook_motion_module_set_rate(
         let frame = smash::app::lua_bind::MotionModule::frame(boma);
         let key = super::numeric_point_key("MotionModule::set_rate", &[rate]);
         if let Some((suppress, overrides)) =
-            super::action_for(CAT_MOTION_MODULE_SET_RATE, motion, key, frame)
+            super::action_for(boma, CAT_MOTION_MODULE_SET_RATE, motion, key, frame)
         {
             if suppress {
                 return;
@@ -233,7 +236,7 @@ unsafe fn hook_motion_module_set_helper_calculation(
             &[if enabled { 1.0 } else { 0.0 }],
         );
         if let Some((suppress, overrides)) =
-            super::action_for(CAT_MOTION_MODULE_SET_HELPER_CALCULATION, motion, key, frame)
+            super::action_for(boma, CAT_MOTION_MODULE_SET_HELPER_CALCULATION, motion, key, frame)
         {
             if suppress {
                 return;
@@ -266,7 +269,7 @@ unsafe fn hook_motion_module_set_rate_partial(
         let key =
             super::numeric_point_key("MotionModule::set_rate_partial", &[part_kind as f32, rate]);
         if let Some((suppress, overrides)) =
-            super::action_for(CAT_MOTION_MODULE_SET_RATE_PARTIAL, motion, key, frame)
+            super::action_for(boma, CAT_MOTION_MODULE_SET_RATE_PARTIAL, motion, key, frame)
         {
             if suppress {
                 return;
@@ -311,7 +314,7 @@ unsafe fn hook_motion_module_set_frame_partial(
             &[part_kind as f32, frame_value],
         );
         if let Some((suppress, overrides)) =
-            super::action_for(CAT_MOTION_MODULE_SET_FRAME_PARTIAL, motion, key, frame)
+            super::action_for(boma, CAT_MOTION_MODULE_SET_FRAME_PARTIAL, motion, key, frame)
         {
             if suppress {
                 return;

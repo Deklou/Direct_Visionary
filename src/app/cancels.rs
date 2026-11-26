@@ -1,13 +1,49 @@
 //! Custom cancel editor: independently timed rules, each with several target actions.
 
 use super::VisionaryApp;
-use crate::cancel_rules::{self, CancelCondition, CancelRule, CancelTarget};
+use crate::cancel_rules::{self, CancelBinding, CancelCondition, CancelRule, CancelTarget};
+use crate::roster::{RosterKey, index::RosterIndex};
 use egui::Ui;
 
 impl VisionaryApp {
+    pub(super) fn current_cancel_binding(&self, fighter: &str, key: &RosterKey) -> Option<CancelBinding> {
+        let entry = self.state.fighters.iter().find(|entry| entry.name.eq_ignore_ascii_case(fighter))?;
+        let index = RosterIndex::build(
+            std::slice::from_ref(entry), &self.roster.library, &self.roster.project, None,
+        );
+        let binding = cancel_rules::resolve_binding(&index, fighter, key, &self.cancel_base_slots)?;
+        if !binding.scope.slots.iter().all(|slot| entry.slots.contains(slot)) {
+            return None;
+        }
+        if binding.authored_name_id.is_some() {
+            let owner = self.roster.project.authored.iter().find(|owner| &owner.key == key)?;
+            let root = owner.files_root.as_ref()?;
+            let owns_provider = |provider: &crate::roster::library::ImportedMod| provider.root.starts_with(root);
+            if !self.roster.library.enabled().any(owns_provider) {
+                return None;
+            }
+            // A different enabled provider claiming the same modded slots is ambiguous.
+            if self.roster.library.enabled().any(|provider| {
+                !owns_provider(provider) && provider.manifest.fighters.get(&binding.scope.fighter)
+                    .is_some_and(|provision| binding.scope.slots.iter().any(|slot| provision.slots.contains(slot)))
+            }) {
+                return None;
+            }
+        }
+        Some(binding)
+    }
+
     pub(super) fn publish_cancel_rules(&self) {
-        self.game_link
-            .send_cancel_rules(&cancel_rules::enabled_wires(&self.cancel_rules_store));
+        if self.game_link.supports_scoped_cancels() {
+            let wires = cancel_rules::resolved_wires(&self.cancel_rules_store, |fighter, key| {
+                self.current_cancel_binding(fighter, key)
+            });
+            if self.game_link.send_scoped_cancel_rules(&wires) {
+                return;
+            }
+        }
+        // An old or disconnected NRO must never receive a non-empty unscoped fallback.
+        self.game_link.clear_cancel_rules();
     }
 
     pub(super) fn draw_cancel_rules_section(&mut self, ui: &mut Ui) {
@@ -18,15 +54,57 @@ impl VisionaryApp {
         let (Some(fighter), Some(motion)) = (fighter, motion) else {
             return;
         };
+        let key = self.roster.cancel_edit_target().cloned()
+            .unwrap_or_else(|| RosterKey::fighter(&fighter));
+        ui.label(egui::RichText::new("Custom cancels").strong());
+        let Some(binding) = self.current_cancel_binding(&fighter, &key) else {
+            ui.weak("No verified character/costume target. Check the base game folder and Roster edit target.");
+            return;
+        };
+        if !binding.scope.matches(&fighter, Some(self.selected_costume_slot)) {
+            ui.weak("Preview a costume owned by the selected Roster edit target before editing cancels.");
+            return;
+        }
+        ui.label(format!("Target: {} — {}", key, binding.scope.slots.iter()
+            .map(|slot| format!("c{slot:02}")).collect::<Vec<_>>().join(", ")));
+        if !self.game_link.supports_scoped_cancels() {
+            ui.weak("Live cancels require a compatible Skyline plugin. Edits can be saved but are not sent.");
+        }
         let has_native_combo = matches!(motion.as_str(), "attack_11" | "attack_12" | "attack_13");
-        let mut rules = self.cancel_rules_store
+        let mut all_rules = self.cancel_rules_store
             .get(&fighter)
             .and_then(|moves| moves.get(&motion))
             .cloned()
             .unwrap_or_default();
+        let unbound = all_rules.iter().filter(|rule| rule.binding.is_none()).count();
+        let stale = all_rules.iter().filter(|rule| rule.binding.as_ref().is_some_and(|saved| {
+            saved.scope.key == binding.scope.key && saved != &binding
+        })).count();
+        let mut reassigned = false;
+        if unbound > 0 {
+            ui.weak(format!("{unbound} legacy cancel(s) have no confirmed target and are inactive."));
+            if ui.button("Assign legacy cancels to this target").clicked() {
+                for rule in all_rules.iter_mut().filter(|rule| rule.binding.is_none()) {
+                    rule.binding = Some(binding.clone());
+                }
+                reassigned = true;
+            }
+        }
+        if stale > 0 {
+            ui.weak(format!("{stale} saved cancel(s) have a changed target and are inactive."));
+            if ui.button("Confirm changed target for these cancels").clicked() {
+                for rule in all_rules.iter_mut().filter(|rule| rule.binding.as_ref().is_some_and(|saved| {
+                    saved.scope.key == binding.scope.key && saved != &binding
+                })) {
+                    rule.binding = Some(binding.clone());
+                }
+                reassigned = true;
+            }
+        }
+        let mut rules: Vec<_> = all_rules.iter()
+            .filter(|rule| rule.binding.as_ref() == Some(&binding))
+            .cloned().collect();
         let original = rules.clone();
-
-        ui.label(egui::RichText::new("Custom cancels").strong());
         ui.weak("Each rule has its own window and condition. Select several target actions in one rule.");
         if rules.is_empty() {
             ui.weak("No custom cancels on this move. Vanilla transitions are unchanged.");
@@ -49,7 +127,7 @@ impl VisionaryApp {
                 index + 1, window, targets, if rule.enabled { "" } else { " (off)" },
             );
             egui::CollapsingHeader::new(heading)
-                .id_salt(("cancel_rule", fighter.as_str(), motion.as_str(), index))
+                .id_salt(("cancel_rule", key.as_str(), motion.as_str(), index))
                 .default_open(true)
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
@@ -146,7 +224,7 @@ impl VisionaryApp {
             rules.remove(index);
         }
         if ui.button("＋ Add cancel").clicked() {
-            rules.push(CancelRule::default());
+            rules.push(CancelRule { binding: Some(binding.clone()), ..Default::default() });
         }
         ui.separator();
         ui.weak("Ground-only; the game's native transition checks choose priority when inputs overlap.");
@@ -156,8 +234,10 @@ impl VisionaryApp {
         ));
         ui.weak("Live plugin only; standalone Smashline export is not implemented.");
 
-        if rules != original {
-            if rules.is_empty() {
+        if rules != original || reassigned {
+            // Do not overwrite other logical characters sharing this fighter and motion.
+            cancel_rules::replace_bound_rules(&mut all_rules, &binding, rules);
+            if all_rules.is_empty() {
                 let empty_fighter = self.cancel_rules_store
                     .get_mut(&fighter)
                     .map(|moves| {
@@ -172,7 +252,7 @@ impl VisionaryApp {
                 self.cancel_rules_store
                     .entry(fighter)
                     .or_default()
-                    .insert(motion, rules);
+                    .insert(motion, all_rules);
             }
             self.publish_cancel_rules();
         }

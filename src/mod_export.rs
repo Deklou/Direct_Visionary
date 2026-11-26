@@ -67,6 +67,14 @@ pub struct GeneratedSource {
 /// project. Effect-call deltas are not sufficient by themselves because the generated script
 /// replaces the entire original effect script.
 pub fn source_project(project: &ModProjectFile) -> Result<Option<GeneratedSource>> {
+    if project.fighters.values().any(|fighter| fighter.scoped_acmd.iter().any(|bank| bank.edits.has_edits())) {
+        return source_project_scoped(project);
+    }
+    source_project_legacy(project)
+}
+
+fn source_project_legacy(project: &ModProjectFile) -> Result<Option<GeneratedSource>> {
+    validate_authored_owners(project)?;
     let mut acmd_edits = Vec::new();
     let mut effect_edits = Vec::new();
     let mut sound_edits = Vec::new();
@@ -77,10 +85,16 @@ pub fn source_project(project: &ModProjectFile) -> Result<Option<GeneratedSource
     let mut exported_effect_names = HashSet::new();
     let mut capture_warnings = Vec::new();
     let mut slot_gates = crate::acmd::SlotGates::new();
+    let mut category_gates = crate::acmd::CategorySlotGates::new();
 
     let mut fighters: Vec<_> = project.fighters.iter().collect();
     fighters.sort_by(|a, b| a.0.cmp(b.0));
     for (fighter, edits) in fighters {
+        let has_shared_fighter = project
+            .roster
+            .authored
+            .iter()
+            .any(|entry| entry.donor.eq_ignore_ascii_case(fighter));
         let mut moves: Vec<_> = edits.acmd.iter().collect();
         moves.sort_by(|a, b| a.0.cmp(b.0));
         for (move_name, record) in moves {
@@ -88,32 +102,32 @@ pub fn source_project(project: &ModProjectFile) -> Result<Option<GeneratedSource
             // Without it the generated script would remove this move from every other costume
             // of the fighter, so a missing original is refused rather than exported wide.
             let scopes = record.effective_scopes();
+            if scopes.is_empty() && (has_shared_fighter || !edits.costume_slots.is_empty()) {
+                bail!(
+                    "{fighter}/{move_name}: game_ edit has no verified per-move costume scope. \
+                     Export refused to protect other costumes."
+                );
+            }
             if !scopes.is_empty() {
-                match edits
-                    .move_sources
-                    .get(move_name)
-                    .map(|snapshot| snapshot.body.trim())
-                    .filter(|body| !body.is_empty())
-                {
-                    Some(body) => {
-                        slot_gates.insert(
-                            (fighter.clone(), move_name.clone()),
-                            (scopes.clone(), body.to_string()),
+                validate_record_owner(project, fighter, move_name, &scopes)?;
+                let original = original_category(edits, move_name, "game", fighter)?;
+                slot_gates.insert(
+                    (fighter.clone(), move_name.clone()),
+                    (scopes.clone(), original),
+                );
+                for (category, edited) in [
+                    ("effect", edits.effect_calls_full.contains_key(move_name)),
+                    ("sound", edits.sound_scripts.contains_key(move_name)),
+                    ("expression", edits.expression_scripts.contains_key(move_name)),
+                ] {
+                    if edited {
+                        category_gates.insert(
+                            (fighter.clone(), move_name.clone(), category.to_string()),
+                            (
+                                scopes.clone(),
+                                original_category(edits, move_name, category, fighter)?,
+                            ),
                         );
-                    }
-                    None => {
-                        let slot_list = scopes
-                            .iter()
-                            .map(|slot| format!("c{slot:02}"))
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        bail!(
-                            "{fighter}'s {move_name} is set to costume(s) {slot_list} only, but the \
-                             fighter's own version of it was not saved with the project. Exporting \
-                             it now would remove {move_name} from every other costume of \
-                             {fighter}. Open the move in the editor once so its original is \
-                             recorded, then export again."
-                        )
                     }
                 }
             }
@@ -123,6 +137,9 @@ pub fn source_project(project: &ModProjectFile) -> Result<Option<GeneratedSource
         let mut effect_moves: Vec<_> = edits.effect_calls_full.iter().collect();
         effect_moves.sort_by(|a, b| a.0.cmp(b.0));
         for (move_name, calls) in effect_moves {
+            ensure_category_scope(
+                edits, fighter, move_name, "effect", has_shared_fighter, &category_gates,
+            )?;
             let calls = calls
                 .iter()
                 .cloned()
@@ -158,11 +175,17 @@ pub fn source_project(project: &ModProjectFile) -> Result<Option<GeneratedSource
         let mut sound_moves: Vec<_> = edits.sound_scripts.iter().collect();
         sound_moves.sort_by(|a, b| a.0.cmp(b.0));
         for (move_name, script) in sound_moves {
+            ensure_category_scope(
+                edits, fighter, move_name, "sound", has_shared_fighter, &category_gates,
+            )?;
             sound_edits.push((fighter.clone(), move_name.clone(), script.clone()));
         }
         let mut expression_moves: Vec<_> = edits.expression_scripts.iter().collect();
         expression_moves.sort_by(|a, b| a.0.cmp(b.0));
         for (move_name, script) in expression_moves {
+            ensure_category_scope(
+                edits, fighter, move_name, "expression", has_shared_fighter, &category_gates,
+            )?;
             expression_edits.push((fighter.clone(), move_name.clone(), script.clone()));
         }
 
@@ -220,7 +243,7 @@ pub fn source_project(project: &ModProjectFile) -> Result<Option<GeneratedSource
     {
         return Ok(None);
     }
-    let built = crate::acmd::build_mod_project_with_slot_gates(
+    let built = crate::acmd::build_mod_project_with_all_slot_gates(
         &acmd_edits,
         &effect_edits,
         &sound_edits,
@@ -228,6 +251,7 @@ pub fn source_project(project: &ModProjectFile) -> Result<Option<GeneratedSource
         &tweaks,
         &plugin_name(project),
         &slot_gates,
+        &category_gates,
     );
 
     // Nothing reaches disk until the generated code has been read back and matched against the
@@ -256,6 +280,306 @@ pub fn source_project(project: &ModProjectFile) -> Result<Option<GeneratedSource
         project: built,
         warnings,
     }))
+}
+
+/// Validate the saved ownership before generating anything. The app additionally checks
+/// these bindings against its current roster and trusted base-game costume list.
+fn validate_scoped_export_owner(
+    project: &ModProjectFile,
+    fighter: &str,
+    binding: &crate::cancel_rules::CancelBinding,
+) -> Result<()> {
+    let scope = &binding.scope;
+    if scope.fighter != fighter || scope.slots.is_empty()
+        || !scope.slots.windows(2).all(|pair| pair[0] < pair[1])
+        || fighter.is_empty() || !fighter.bytes().all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == b'_')
+    {
+        bail!("{fighter}: invalid ACMD owner or costume list");
+    }
+    let authored = project.roster.authored.iter().filter(|entry| entry.donor.eq_ignore_ascii_case(fighter));
+    match &binding.authored_name_id {
+        Some(name) if !name.is_empty() => {
+            if !authored.clone().any(|entry| entry.key == scope.key && entry.name_id == *name && entry.all_slots() == scope.slots) {
+                bail!("{fighter}: the saved ACMD owner no longer matches the authored character");
+            }
+        }
+        None if scope.key == crate::roster::RosterKey::fighter(fighter) => {
+            if authored.clone().any(|entry| entry.all_slots().iter().any(|slot| scope.slots.contains(slot))) {
+                bail!("{fighter}: the original character overlaps an authored costume");
+            }
+        }
+        _ => bail!("{fighter}: invalid ACMD owner identity"),
+    }
+    Ok(())
+}
+
+/// Smashline groups registrations by agent and complete costume list. Register each logical
+/// owner once, and never mix a fighter-wide replacement with these groups for the same fighter.
+fn source_project_scoped(project: &ModProjectFile) -> Result<Option<GeneratedSource>> {
+    use crate::mod_project::{AcmdEdits, FighterMod};
+    validate_authored_owners(project)?;
+    if project.fighters.values().any(|fighter| !fighter.live_tweaks.is_empty()) {
+        bail!("Global effect pins cannot be combined with character-scoped ACMD source export yet.");
+    }
+
+    let mut legacy = project.clone();
+    let mut owners = Vec::new();
+    let mut fighters: Vec<_> = project.fighters.iter().collect();
+    fighters.sort_by(|a, b| a.0.cmp(b.0));
+    for (fighter, data) in fighters {
+        let mut banks: Vec<_> = data.scoped_acmd.iter().filter(|bank| bank.edits.has_edits()).collect();
+        banks.sort_by(|a, b| a.binding.scope.slots.cmp(&b.binding.scope.slots));
+        legacy.fighters.get_mut(fighter).expect("cloned fighter").scoped_acmd.clear();
+        if banks.is_empty() {
+            continue;
+        }
+        let mut old = data.clone();
+        if AcmdEdits::take_from_fighter(&mut old).has_edits() {
+            bail!("{fighter}: assign the historical ACMD edits before exporting scoped banks");
+        }
+        let mut occupied = HashSet::new();
+        for bank in banks {
+            validate_scoped_export_owner(project, fighter, &bank.binding)?;
+            let slots = &bank.binding.scope.slots;
+            if slots.iter().any(|slot| !occupied.insert(*slot)) {
+                bail!("{fighter}: overlapping or duplicate ACMD owners");
+            }
+            let mut edits = bank.edits.clone();
+            for (move_name, record) in &mut edits.acmd {
+                let stored = record.effective_scopes();
+                if record.fighter != *fighter || record.move_name != *move_name
+                    || (!stored.is_empty() && stored != *slots)
+                {
+                    bail!("{fighter}/{move_name}: the move does not belong to its saved ACMD owner");
+                }
+                // The complete bank is scoped by its native registration, not by a
+                // separately generated fighter-wide dispatcher for this one move.
+                record.slot_scope = None;
+                record.slot_scopes.clear();
+            }
+            let mut fm = FighterMod::default();
+            edits.put_into_fighter(&mut fm);
+            // Check the actual script spelling from this owner's own snapshot. In
+            // particular do not guess a forward-tilt alias from another costume.
+            for (category, moves) in [
+                ("game", fm.acmd.keys().collect::<Vec<_>>()),
+                ("effect", fm.effect_calls_full.keys().collect()),
+                ("sound", fm.sound_scripts.keys().collect()),
+                ("expression", fm.expression_scripts.keys().collect()),
+            ] {
+                for move_name in moves {
+                    let original = original_category(&fm, move_name, category, fighter)?;
+                    let function: syn::ItemFn = syn::parse_str(&original)
+                        .with_context(|| format!("{fighter}/{move_name}: invalid original {category}_ function"))?;
+                    let expected = crate::acmd::acmd_script_name(category,
+                        &crate::acmd::resolve_script_move_name(fighter, move_name));
+                    if function.sig.ident.to_string().replace('_', "") != expected.replace('_', "") {
+                        bail!("{fighter}/{move_name}: {category}_ script spelling is ambiguous");
+                    }
+                }
+            }
+            let owner_project = ModProjectFile {
+                version: project.version,
+                name: project.name.clone(),
+                fighters: HashMap::from([(fighter.clone(), fm)]),
+                ..Default::default()
+            };
+            let generated = source_project_legacy(&owner_project)?
+                .context("scoped ACMD bank generated no source")?;
+            owners.push((fighter.clone(), slots.clone(), generated));
+        }
+    }
+
+    let (mut built, mut warnings) = match source_project_legacy(&legacy)? {
+        Some(generated) => (generated.project, generated.warnings),
+        None => (crate::acmd::build_mod_project_full_with_expression(
+            &[], &[], &[], &[], &[], &plugin_name(project)), Vec::new()),
+    };
+    let mut modules = Vec::new();
+    for (fighter, slots, generated) in owners {
+        let mut index = modules.len();
+        let module = loop {
+            let candidate = format!("visionary_scope_{index}");
+            if !modules.contains(&candidate) && !built.files.iter().any(|file| file.rel_path.starts_with(&format!("src/{candidate}/"))) {
+                break candidate;
+            }
+            index += 1;
+        };
+        let source = generated.project.files.iter().find(|file| file.rel_path.ends_with("/acmd.rs"))
+            .context("missing scoped ACMD module")?;
+        let scoped = guard_scoped_functions(&source.contents, &slots)?;
+        let slot_list = slots.iter().map(u8::to_string).collect::<Vec<_>>().join(", ");
+        let install = format!(
+            "mod acmd;\n\npub fn install() {{\n    let agent = &mut smashline::Agent::new(\"{fighter}\");\n    agent.set_costume(vec![{slot_list}]);\n    acmd::install(agent);\n    agent.install();\n}}\n"
+        );
+        built.files.push(crate::acmd::GeneratedFile { rel_path: format!("src/{module}/mod.rs"), contents: install });
+        built.files.push(crate::acmd::GeneratedFile { rel_path: format!("src/{module}/acmd.rs"), contents: scoped });
+        warnings.extend(generated.warnings.into_iter().map(|warning| format!("{fighter} [{slot_list}]: {warning}")));
+        modules.push(module);
+    }
+    let lib = built.files.iter_mut().find(|file| file.rel_path == "src/lib.rs")
+        .context("missing generated lib.rs")?;
+    let decls = modules.iter().map(|module| format!("mod {module};\n")).collect::<String>();
+    let installs = modules.iter().map(|module| format!("    {module}::install();\n")).collect::<String>();
+    if !lib.contents.contains("#[skyline::main") || !lib.contents.contains("pub fn main() {\n") {
+        bail!("unexpected generated plugin entry point");
+    }
+    lib.contents = lib.contents.replacen("#[skyline::main", &format!("{decls}#[skyline::main"), 1)
+        .replacen("pub fn main() {\n", &format!("pub fn main() {{\n{installs}"), 1);
+    lib.contents.push_str(r#"
+// Smashline's public original_acmd() panics when the native function is absent.
+// This uses the same optional lookup and ABI as the pinned Smashline revision.
+unsafe fn visionary_original_acmd(
+    agent: &mut smash::lua2cpp::L2CAgentBase,
+    name: smash::phx::Hash40,
+) {
+    type Original = unsafe extern "C" fn(&mut smash::lua2cpp::L2CAgentBase);
+    type Lookup = extern "C" fn(&mut smash::lua2cpp::L2CAgentBase, smash::phx::Hash40) -> Option<Original>;
+    let mut address = 0usize;
+    let result = skyline::nn::ro::LookupSymbol(&mut address, b"smashline_get_original_acmd\0".as_ptr() as _);
+    if result == 0 && address != 0 {
+        let lookup: Lookup = std::mem::transmute(address);
+        if let Some(original) = lookup(agent, name) {
+            original(agent);
+        }
+    }
+}
+"#);
+    let report = crate::acmd_verify::verify_export_with_expression(
+        &built, &[], &[], &[], &[], &[], &HashMap::new(),
+    );
+    if report.has_blockers() {
+        bail!("the generated scoped mod source did not pass verification:\n{}", report.blocker_summary());
+    }
+    warnings.sort();
+    warnings.dedup();
+    Ok(Some(GeneratedSource { project: built, warnings }))
+}
+
+/// The pinned Smashline revision defaults an unknown entry costume to zero. Do not
+/// let that select a c00 edit: verify the fighter's actual color before executing it.
+/// An unexpected registration runs the native original, not another owner's snapshot.
+fn guard_scoped_functions(source: &str, slots: &[u8]) -> Result<String> {
+    let install = "pub fn install(agent: &mut smashline::Agent) {\n";
+    let (body, registrations) = source.split_once(install).context("missing ACMD install function")?;
+    let mut body = body.to_string();
+    let mut wrappers = String::new();
+    let condition = slots.iter().map(u8::to_string).collect::<Vec<_>>().join(" | ");
+    let mut count = 0;
+    for line in registrations.lines().filter(|line| !line.trim().is_empty() && line.trim() != "}") {
+        let args = line.trim().strip_prefix("agent.acmd(\"").context("unexpected ACMD registration")?;
+        let (script, rest) = args.split_once("\", ").context("missing ACMD script name")?;
+        let (function, _) = rest.split_once(", smashline::Priority::Default);")
+            .context("unexpected ACMD registration priority")?;
+        let header = format!("fn {function}(");
+        if body.matches(&header).count() != 1 {
+            bail!("missing or duplicate scoped ACMD function {function}");
+        }
+        let arm = format!("{function}_costume");
+        body = body.replacen(&header, &format!("fn {arm}("), 1);
+        wrappers.push_str(&format!(
+            "unsafe extern \"C\" fn {function}(agent: &mut L2CAgentBase) {{\n    if !agent.module_accessor.is_null() && matches!(WorkModule::get_int(agent.module_accessor, *FIGHTER_INSTANCE_WORK_ID_INT_COLOR), {condition}) {{\n        {arm}(agent);\n    }} else {{\n        crate::visionary_original_acmd(agent, Hash40::new(\"{script}\"));\n    }}\n}}\n\n"
+        ));
+        count += 1;
+    }
+    if count == 0 {
+        bail!("scoped ACMD module has no registrations");
+    }
+    Ok(format!("{body}{wrappers}{install}{registrations}"))
+}
+
+/// Reject conflicting authored characters even when the selection screen can display both.
+fn validate_authored_owners(project: &ModProjectFile) -> Result<()> {
+    let mut occupied = std::collections::BTreeMap::<(String, u8), String>::new();
+    for entry in &project.roster.authored {
+        let donor = entry.donor.to_ascii_lowercase();
+        if donor.is_empty() || entry.key != crate::roster::RosterKey::slot(&donor, entry.slot) {
+            bail!("invalid authored character identity: {}", entry.key);
+        }
+        let mut owned = std::collections::BTreeSet::new();
+        for slot in std::iter::once(entry.slot).chain(entry.slots.iter().copied()) {
+            if !owned.insert(slot) {
+                bail!("{} declares costume c{slot:02} more than once", entry.key);
+            }
+            if let Some(first) = occupied.insert((donor.clone(), slot), entry.key.to_string()) {
+                bail!(
+                    "{first} and {} both claim {donor} costume c{slot:02}",
+                    entry.key,
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// An exported move may not change its authored character by silently changing slots.
+fn validate_record_owner(
+    project: &ModProjectFile,
+    fighter: &str,
+    move_name: &str,
+    scopes: &[u8],
+) -> Result<()> {
+    let owners: Vec<_> = project
+        .roster
+        .authored
+        .iter()
+        .filter(|entry| entry.donor.eq_ignore_ascii_case(fighter))
+        .collect();
+    if owners.is_empty() {
+        // Historical slot-scoped projects can lack a roster identity; preserve
+        // their explicit gate while never inferring an unscoped owner from it.
+        return Ok(());
+    }
+    if !owners.iter().any(|entry| entry.all_slots() == scopes) {
+        bail!(
+            "{fighter}/{move_name}: scoped costumes do not match any authored character. \
+             Recheck the target before exporting; no other costumes were changed."
+        );
+    }
+    Ok(())
+}
+
+/// A shared-fighter category must have the donor's matching original as fallback.
+fn original_category(
+    edits: &crate::mod_project::FighterMod,
+    move_name: &str,
+    category: &str,
+    fighter: &str,
+) -> Result<String> {
+    let original = edits
+        .move_sources
+        .get(move_name)
+        .and_then(|snapshot| crate::acmd::extract_function(&snapshot.body, &format!("{category}_")));
+    original.ok_or_else(|| {
+        anyhow::anyhow!(
+            "{fighter}/{move_name}: missing original {category}_ function. Exporting this edit \
+             would change or remove the move on every other costume. Reload the original move \
+             with all ACMD categories before exporting."
+        )
+    })
+}
+
+/// A fighter-level scope does not prove which particular move owns a secondary category.
+/// Never silently widen an edited effect, sound or expression script.
+fn ensure_category_scope(
+    edits: &crate::mod_project::FighterMod,
+    fighter: &str,
+    move_name: &str,
+    category: &str,
+    has_shared_fighter: bool,
+    gates: &crate::acmd::CategorySlotGates,
+) -> Result<()> {
+    let key = (fighter.to_string(), move_name.to_string(), category.to_string());
+    if gates.contains_key(&key) {
+        return Ok(());
+    }
+    if has_shared_fighter || !edits.costume_slots.is_empty() {
+        bail!(
+            "{fighter}/{move_name}: {category}_ edit has no verified per-move costume scope. \
+             Export refused to protect other costumes."
+        );
+    }
+    Ok(())
 }
 
 /// Materialize a generated Cargo project at exactly `root` (without adding another surprise
@@ -1272,10 +1596,297 @@ mod slot_gate_tests {
         assert!(message.contains("attack_11"), "{message}");
     }
 
+    const FOUR_CATEGORIES: &str = concat!(
+        "unsafe extern \"C\" fn game_attack11(agent: &mut L2CAgentBase) {\n",
+        "    frame(agent.lua_state_agent, 2.0);\n}\n",
+        "unsafe extern \"C\" fn effect_attack11(agent: &mut L2CAgentBase) {\n",
+        "    frame(agent.lua_state_agent, 3.0);\n}\n",
+        "unsafe extern \"C\" fn sound_attack11(agent: &mut L2CAgentBase) {\n",
+        "    frame(agent.lua_state_agent, 4.0);\n}\n",
+        "unsafe extern \"C\" fn expression_attack11(agent: &mut L2CAgentBase) {\n",
+        "    frame(agent.lua_state_agent, 5.0);\n}\n",
+    );
+
+    #[test]
+    fn all_four_categories_are_costume_gated_with_original_fallbacks() {
+        let mut project = project(Some(8), Some(FOUR_CATEGORIES));
+        let fighter = project.fighters.get_mut("mario").unwrap();
+        fighter.effect_calls_full.insert("attack_11".into(), Vec::new());
+        fighter.sound_scripts.insert("attack_11".into(), Default::default());
+        fighter.expression_scripts.insert("attack_11".into(), Default::default());
+
+        let source = generated(&project);
+        for prefix in ["game", "effect", "sound", "expression"] {
+            assert!(
+                source.contains(&format!("fn {prefix}_attack11_original(")),
+                "{prefix} must preserve the original script: {source}"
+            );
+            assert!(
+                source.contains(&format!("fn {prefix}_attack11_costume(")),
+                "{prefix} must have a costume arm: {source}"
+            );
+        }
+        assert_eq!(source.matches("if color == 8 {").count(), 4, "{source}");
+    }
+
+    #[test]
+    fn a_partial_export_preserves_ownership_and_refuses_an_unscoped_move() {
+        use crate::mod_project::{scope_acmd_project, AcmdProjectScope};
+
+        let mut original = project(None, None);
+        original.roster.authored.push(crate::mod_project::AuthoredEntry {
+            key: crate::roster::RosterKey::slot("mario", 8),
+            donor: "mario".into(),
+            slot: 8,
+            slots: vec![9],
+            display_name: "My Mario".into(),
+            name_id: "my_mario".into(),
+            moveset_scaffolded: false,
+            files_root: None,
+        });
+        let partial = scope_acmd_project(
+            &original,
+            AcmdProjectScope::Move { fighter: "mario", move_name: "attack_11" },
+        );
+        assert_eq!(partial.roster.authored.len(), 1);
+        let error = match source_project(&partial) {
+            Ok(_) => panic!("a partial export must retain the scope safety metadata"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("no verified per-move costume scope"), "{error}");
+    }
+
+    #[test]
+    fn a_mod_moved_to_other_slots_invalidates_old_move_scope() {
+        let mut project = project(Some(8), Some(ORIGINAL));
+        project.roster.authored.push(crate::mod_project::AuthoredEntry {
+            key: crate::roster::RosterKey::slot("mario", 16),
+            donor: "mario".into(),
+            slot: 16,
+            slots: vec![17],
+            display_name: "My Mario".into(),
+            name_id: "my_mario".into(),
+            moveset_scaffolded: false,
+            files_root: None,
+        });
+        let error = match source_project(&project) {
+            Ok(_) => panic!("stale scope must never reach the export"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("do not match any authored character"), "{error}");
+    }
+
+    #[test]
+    fn two_authored_characters_cannot_own_the_same_costume() {
+        let mut project = project(None, None);
+        project.fighters.clear();
+        for (primary, more) in [(8, 9), (9, 10)] {
+            project.roster.authored.push(crate::mod_project::AuthoredEntry {
+                key: crate::roster::RosterKey::slot("mario", primary),
+                donor: "mario".into(),
+                slot: primary,
+                slots: vec![more],
+                display_name: "Custom".into(),
+                name_id: format!("mod_{primary}"),
+                moveset_scaffolded: false,
+                files_root: None,
+            });
+        }
+        let error = match source_project(&project) {
+            Ok(_) => panic!("two mods cannot silently share costume c09"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("both claim mario costume c09"), "{error}");
+    }
+
+    #[test]
+    fn a_scoped_secondary_category_without_original_is_refused() {
+        let mut project = project(Some(8), Some(ORIGINAL));
+        project
+            .fighters
+            .get_mut("mario")
+            .unwrap()
+            .sound_scripts
+            .insert("attack_11".into(), Default::default());
+        let error = match source_project(&project) {
+            Ok(_) => panic!("the original sound script is required"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("original sound_"), "{error}");
+    }
+
+    #[test]
+    fn an_ambiguous_game_edit_is_not_exported_globally() {
+        let mut project = project(None, None);
+        project.fighters.get_mut("mario").unwrap().costume_slots = vec![8];
+        let error = match source_project(&project) {
+            Ok(_) => panic!("a game edit without a move scope must not reach every costume"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("game_ edit has no verified per-move costume scope"), "{error}");
+    }
+
+    #[test]
+    fn an_unscoped_game_edit_with_an_authored_character_is_ambiguous() {
+        let mut project = project(None, None);
+        project.roster.authored.push(crate::mod_project::AuthoredEntry {
+            key: crate::roster::RosterKey::slot("mario", 8),
+            donor: "mario".into(),
+            slot: 8,
+            slots: Vec::new(),
+            display_name: "My Mario".into(),
+            name_id: "my_mario".into(),
+            moveset_scaffolded: false,
+            files_root: None,
+        });
+        let error = match source_project(&project) {
+            Ok(_) => panic!("adding a costume must not widen an existing game edit"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("game_ edit has no verified per-move costume scope"), "{error}");
+    }
+
+    #[test]
+    fn an_ambiguous_effect_only_edit_is_not_exported_globally() {
+        let mut project = project(None, None);
+        let fighter = project.fighters.get_mut("mario").unwrap();
+        fighter.acmd.clear();
+        fighter.costume_slots = vec![8, 9];
+        fighter.effect_calls_full.insert("attack_11".into(), Vec::new());
+        let error = match source_project(&project) {
+            Ok(_) => panic!("an unbound effect would affect all costumes"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("no verified per-move costume scope"), "{error}");
+    }
+
     /// An empty stored body is the same problem as a missing one, and is what a project saved
     /// from a move that never loaded its source actually contains.
     #[test]
     fn an_empty_stored_original_counts_as_missing() {
         assert!(source_project(&project(Some(8), Some("   \n"))).is_err());
+    }
+}
+
+#[cfg(test)]
+mod scoped_acmd_export_tests {
+    use super::*;
+    use crate::cancel_rules::CancelBinding;
+    use crate::mod_project::{AcmdEdits, AuthoredEntry, MoveSourceSnapshot, ScopedAcmdEdits};
+    use crate::roster::{RosterKey, edit_scope::EditScope};
+
+    fn bank(slot: u8, frame: u8) -> ScopedAcmdEdits {
+        let binding = CancelBinding {
+            scope: EditScope {
+                fighter: "mario".into(),
+                key: if slot == 0 { RosterKey::fighter("mario") } else { RosterKey::slot("mario", slot) },
+                slots: (slot..slot+2).collect(),
+            },
+            authored_name_id: (slot != 0).then(|| format!("mario_{slot}")),
+        };
+        let name = "attack_11".to_string();
+        let original = ["game", "effect", "sound", "expression"].iter().map(|category|
+            format!("unsafe extern \"C\" fn {category}_attack11(agent: &mut L2CAgentBase) {{\n    frame(agent.lua_state_agent, 2.0);\n}}\n")
+        ).collect::<String>();
+        let source = format!("unsafe extern \"C\" fn game_attack11(agent: &mut L2CAgentBase) {{\n    frame(agent.lua_state_agent, {frame}.0);\n}}\n");
+        let mut edits = AcmdEdits::default();
+        edits.acmd.insert(name.clone(), crate::data::EditRecord {
+            fighter: "mario".into(), fighter_display: "Mario".into(), move_name: name.clone(),
+            script: crate::acmd::parse_acmd_script(&source),
+            hitboxes_pristine: Vec::new(), hitboxes: Vec::new(),
+            slot_scope: Some(slot), slot_scopes: vec![slot+1],
+        });
+        edits.effect_calls_full.insert(name.clone(), Vec::new());
+        edits.sound_scripts.insert(name.clone(), Default::default());
+        edits.expression_scripts.insert(name.clone(), Default::default());
+        edits.move_sources.insert(name, MoveSourceSnapshot { body: original, captures: Vec::new() });
+        ScopedAcmdEdits { binding, edits }
+    }
+
+    fn project() -> ModProjectFile {
+        let mut project = ModProjectFile { name: "scoped_test".into(), ..Default::default() };
+        for slot in [8, 16] {
+            project.roster.authored.push(AuthoredEntry {
+                key: RosterKey::slot("mario", slot), donor: "mario".into(), slot, slots: vec![slot+1],
+                display_name: format!("Mod {slot}"), name_id: format!("mario_{slot}"),
+                moveset_scaffolded: false, files_root: None,
+            });
+        }
+        project.fighters.entry("mario".into()).or_default().scoped_acmd =
+            vec![bank(0, 4), bank(8, 8), bank(16, 12)];
+        project
+    }
+
+    #[test]
+    fn scoped_acmd_exports_three_owners_and_all_four_categories() {
+        let generated = source_project(&project()).unwrap().unwrap();
+        for (index, slot, frame) in [(0, 0, 4), (1, 8, 8), (2, 16, 12)] {
+            let get = |name: &str| &generated.project.files.iter()
+                .find(|file| file.rel_path == format!("src/visionary_scope_{index}/{name}")).unwrap().contents;
+            let module = get("mod.rs");
+            let acmd = get("acmd.rs");
+            assert!(module.contains(&format!("agent.set_costume(vec![{slot}, {}]);", slot+1)));
+            assert!(acmd.contains(&format!("frame(agent.lua_state_agent, {frame}.0)")), "{acmd}");
+            assert!(acmd.contains(&format!("), {slot} | {})", slot+1)), "{acmd}");
+            for category in ["game", "effect", "sound", "expression"] {
+                assert_eq!(acmd.matches(&format!("agent.acmd(\"{category}_attack11\"")).count(), 1);
+                assert!(acmd.contains(&format!("{category}_attack11_costume(agent);")));
+                assert!(acmd.contains(&format!("crate::visionary_original_acmd(agent, Hash40::new(\"{category}_attack11\"))")));
+            }
+        }
+    }
+
+    #[test]
+    fn scoped_acmd_export_refuses_stale_and_duplicate_owners() {
+        let mut stale = project();
+        stale.roster.authored[0].name_id = "other".into();
+        assert!(source_project(&stale).is_err());
+        let mut duplicate = project();
+        let banks = &mut duplicate.fighters.get_mut("mario").unwrap().scoped_acmd;
+        banks.push(bank(8, 20));
+        assert!(source_project(&duplicate).is_err());
+    }
+
+    #[test]
+    fn scoped_acmd_export_refuses_unassigned_edits_and_missing_original() {
+        let mut mixed = project();
+        let fighter = mixed.fighters.get_mut("mario").unwrap();
+        bank(0, 20).edits.put_into_fighter(fighter);
+        assert!(source_project(&mixed).is_err());
+        let mut missing = project();
+        missing.fighters.get_mut("mario").unwrap().scoped_acmd[0].edits.move_sources.clear();
+        assert!(source_project(&missing).is_err());
+    }
+}
+
+#[cfg(test)]
+mod scoped_acmd_export_selection_tests {
+    use super::*;
+    use crate::mod_project::{AcmdProjectScope, scope_acmd_project};
+
+    #[test]
+    fn scoped_acmd_partial_export_retains_global_pins_and_refuses_unsafe_mix() {
+        use crate::cancel_rules::CancelBinding;
+        use crate::mod_project::{AcmdEdits, ScopedAcmdEdits};
+        use crate::roster::{RosterKey, edit_scope::EditScope};
+        let mut project = ModProjectFile { name: "partial".into(), ..Default::default() };
+        let mut edits = AcmdEdits::default();
+        edits.sound_scripts.insert("attack_11".into(), Default::default());
+        project.fighters.entry("mario".into()).or_default().scoped_acmd.push(ScopedAcmdEdits {
+            binding: CancelBinding {
+                scope: EditScope { key: RosterKey::fighter("mario"), fighter: "mario".into(), slots: vec![0, 1] },
+                authored_name_id: None,
+            },
+            edits,
+        });
+        project.fighters.entry("kirby".into()).or_default().live_tweaks.push(LiveTweak {
+            effect_name: "sys_test".into(), color: None, speed: Some(2.0),
+        });
+        for scope in [AcmdProjectScope::All, AcmdProjectScope::Move { fighter: "mario", move_name: "attack_11" }] {
+            let scoped = scope_acmd_project(&project, scope);
+            assert_eq!(scoped.fighters["kirby"].live_tweaks.len(), 1);
+            let Err(error) = source_project(&scoped) else { panic!("global pins unexpectedly exported"); };
+            assert!(error.to_string().contains("Global effect pins"));
+        }
     }
 }

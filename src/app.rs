@@ -3,6 +3,7 @@ use crate::renderer::{HitboxRenderState, ViewportCallback};
 use egui::{Color32, RichText, ScrollArea, Ui};
 mod recovery_rate;
 mod cancels;
+mod acmd_banks;
 mod hitbox_lifetime;
 /// Main egui application for Visionary.
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -2825,7 +2826,8 @@ struct LiveApplyReport {
     restored_moves: usize,
     /// The first fully materialized project move, used to give Resume one real editor target
     /// after the live-rule replay has finished.
-    resume_target: Option<(String, String)>,
+    resume_target: Option<(String, u8, String)>,
+    inactive_acmd_banks: usize,
     missing_source: BTreeSet<String>,
     missing_fighter: BTreeSet<String>,
     missing_capture_donor: BTreeSet<String>,
@@ -2837,6 +2839,9 @@ impl LiveApplyReport {
         let mut notes = Vec::new();
         if self.restored_moves > 0 {
             notes.push(format!("{} move(s) restored live", self.restored_moves));
+        }
+        if self.inactive_acmd_banks > 0 {
+            notes.push(format!("{} character bank(s) have no verified current owner", self.inactive_acmd_banks));
         }
         if !self.missing_source.is_empty() {
             notes.push(format!(
@@ -3126,6 +3131,11 @@ pub struct VisionaryApp {
     acmd_receiver: Option<std::sync::mpsc::Receiver<AcmdFetchResult>>,
     /// Merged source/capture snapshots remembered for every move visited this session.
     move_source_cache: HashMap<String, crate::mod_project::MoveSourceSnapshot>,
+    active_acmd_binding: Option<crate::cancel_rules::CancelBinding>,
+    parked_legacy_acmd: Option<crate::mod_project::AcmdEdits>,
+    legacy_acmd_costumes: HashMap<String, Vec<u8>>,
+    scoped_acmd_banks: HashMap<String, Vec<crate::mod_project::ScopedAcmdEdits>>,
+    parked_live_acmd: Vec<acmd_banks::ScopedLiveAcmd>,
     /// Selection is held here while the source mismatch modal is open.
     source_mismatch_prompt: Option<PendingMoveSourceMismatch>,
     /// Loads and caches `.eff` files for the viewport's effect preview, and resolves the names
@@ -3226,11 +3236,8 @@ pub struct VisionaryApp {
     /// Live effect point-control rules per "fighter/move" (detach and area toggles). These
     /// use the captured primitive arguments as their identity, rather than an effect-kind hash.
     effect_control_rules_store: HashMap<String, Vec<crate::game_link::EffectControlRuleWire>>,
-    /// Project load is materializing moves other than the UI target. Those moves may use only
-    /// their exported capture snapshot; the original selected move may additionally fall back
-    /// to the currently live capture bucket.
+    /// During project replay, only verified saved captures may be used as donors.
     rebuilding_project_live: bool,
-    replay_live_fallback_key: Option<String>,
     /// Rule families that declined a project-wide live materialization because their captured
     /// identity or runtime value was not safe to reconstruct. Kept separate from the final
     /// report while the ordinary pushers run against a temporary move selection.
@@ -3336,9 +3343,12 @@ pub struct VisionaryApp {
     /// TCP client to the slight_replica plugin (:7878).
     game_link: crate::game_link::GameLink,
     cancel_rules_store: HashMap<String, HashMap<String, Vec<crate::cancel_rules::CancelRule>>>,
+    cancel_base_slots: BTreeMap<String, Vec<u8>>,
     /// Debounced live-pin push for an edited effect call (index, last edit time).
     /// Shared per-kind runtime overrides (Effects panel + Eff Editor game panel).
     live_overrides: crate::game_link::LiveOverrides,
+    // Old kind-global tweaks remain under their original saved fighter; never infer a new owner.
+    parked_legacy_tweaks: HashMap<String, Vec<crate::mod_project::LiveTweak>>,
     /// Authored .eff edits per fighter (project store; synced from the eff editor).
     eff_mods: HashMap<String, crate::mod_project::EffMod>,
     /// Call sites that asked to publish a donor/carrier snapshot this UI frame. Publication is
@@ -3637,6 +3647,11 @@ impl VisionaryApp {
             pending_project_move_selection: None,
             acmd_receiver: None,
             move_source_cache: HashMap::new(),
+            active_acmd_binding: None,
+            parked_legacy_acmd: None,
+            legacy_acmd_costumes: HashMap::new(),
+            scoped_acmd_banks: HashMap::new(),
+            parked_live_acmd: Vec::new(),
             source_mismatch_prompt: None,
             pending_project_script: None,
             bone_names: Vec::new(),
@@ -3682,7 +3697,6 @@ impl VisionaryApp {
             effect_rules_store: HashMap::new(),
             effect_control_rules_store: HashMap::new(),
             rebuilding_project_live: false,
-            replay_live_fallback_key: None,
             replay_missing_capture: BTreeSet::new(),
             replay_missing_constant: BTreeSet::new(),
             hitbox_watch: None,
@@ -3731,8 +3745,10 @@ impl VisionaryApp {
             eff_editor: crate::eff_editor::EffEditor::default(),
             game_link: crate::game_link::GameLink::default(),
             cancel_rules_store: HashMap::new(),
+            cancel_base_slots: BTreeMap::new(),
             last_live_trait_rules: Vec::new(),
             live_overrides: crate::game_link::LiveOverrides::default(),
+            parked_legacy_tweaks: HashMap::new(),
             eff_mods: HashMap::new(),
             carrier_push_callers: Vec::new(),
             project_name: "unnamed_mod".into(),
@@ -3852,8 +3868,10 @@ impl VisionaryApp {
     }
 
     fn set_data_root(&mut self, path: PathBuf) {
+        self.park_acmd_before_reindex();
         save_config_path("data_root", &path);
         self.state.fighters.clear();
+        self.cancel_base_slots.clear();
         self.state.labels.clear();
         self.state.status = format!("Loading from {}...", path.display());
 
@@ -3904,6 +3922,7 @@ impl VisionaryApp {
         let fighter_dir = path.join("fighter");
         if !fighter_dir.is_dir() {
             self.state.status = "No fighter/ directory found.".to_string();
+            self.publish_live_rule_union();
             return;
         }
 
@@ -3921,6 +3940,7 @@ impl VisionaryApp {
     /// Rebuild the fighter list from the data root plus every mod root. Idempotent — called
     /// on data-root change and whenever the mod-root set changes.
     fn reindex_fighters(&mut self) {
+        self.park_acmd_before_reindex();
         // Sub-fighters, bosses and enemies the roster list has never shown. This filters by
         // exact vanilla name only, so a mod that happens to be called e.g. "nanaex" is kept.
         // `element` is the Pyra/Mythra swap manager, not a playable moveset — the same role
@@ -3947,6 +3967,7 @@ impl VisionaryApp {
 
         let roots = self.all_roots();
         self.state.fighters.clear();
+        self.cancel_base_slots.clear();
 
         // Fighter name → the root that owns it. A mod root may either ADD a new fighter or
         // extend an existing one with more slots; the first root to define a fighter owns
@@ -4010,6 +4031,10 @@ impl VisionaryApp {
                     crate::data::FighterSource::ModRoot
                 };
 
+                if root_idx == 0 && self.state.data_root.is_some() {
+                    let base_slots = crate::data::discover_costume_slots(std::slice::from_ref(root), &name);
+                    self.cancel_base_slots.insert(name.clone(), base_slots);
+                }
                 let entry = crate::data::FighterEntry {
                     name,
                     display_name,
@@ -4048,6 +4073,7 @@ impl VisionaryApp {
         }
         status.push('.');
         self.state.status = status;
+        self.publish_live_rule_union();
     }
 
     /// Restore every fighter hidden by the roster filter and rebuild the list from the current
@@ -4086,6 +4112,13 @@ impl VisionaryApp {
         };
         let fighter = self.state.fighters[index].name.clone();
         let was_selected = self.state.selected_fighter == Some(index);
+        if was_selected {
+            self.commit_current_edits();
+            self.park_acmd_workspace();
+        }
+        self.scoped_acmd_banks.remove(&fighter);
+        self.parked_live_acmd.retain(|bank| !bank.binding.scope.fighter.eq_ignore_ascii_case(&fighter));
+        self.legacy_acmd_costumes.remove(&fighter);
 
         // Remove only app-owned merged previews and overlays. The source effect file remains the
         // canonical file in the dump/mod root.
@@ -4197,6 +4230,7 @@ impl VisionaryApp {
         let cache_result = crate::acmd::forget_fighter_cache(&fighter);
 
         self.state.fighters.remove(index);
+        self.publish_cancel_rules();
         if was_selected {
             self.state.selected_fighter = None;
             self.state.selected_move = None;
@@ -4238,27 +4272,9 @@ impl VisionaryApp {
         // Replace the plugin's full rule lists so the forgotten fighter's rules disappear while
         // every other fighter's rules remain live. The alias/carrier publication is coalesced
         // and flushed later in the normal update loop.
-        let spawn: Vec<crate::game_link::SpawnRuleWire> = self
-            .effect_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        self.game_link.send_spawn_rules(&spawn);
-        let controls: Vec<crate::game_link::EffectControlRuleWire> = self
-            .effect_control_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        self.game_link.send_effect_control_rules(&controls);
-        let hitboxes: Vec<crate::game_link::HitboxRuleWire> = self
-            .hitbox_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        self.game_link.send_hitbox_rules(&hitboxes);
+        self.send_live_spawn_rules();
+        self.send_live_effect_control_rules();
+        self.send_live_hitbox_rules();
         self.push_effect_aliases();
 
         self.forgotten_fighters.insert(fighter.to_ascii_lowercase());
@@ -4817,11 +4833,15 @@ impl VisionaryApp {
     /// rather than assuming the fighter's base slot. Shared by [`select_fighter`] (base slot)
     /// and [`select_costume_slot`] (an explicitly chosen slot).
     fn select_fighter_slot(&mut self, idx: usize, slot: u8) {
-        self.selected_costume_slot = slot;
         // A click is an explicit navigation decision, so it supersedes a project-resume move
         // that may still be waiting for this fighter's background motion scan.
         self.pending_project_move_selection = None;
         self.commit_current_edits();
+        self.park_acmd_workspace();
+        self.pending_capture = None;
+        self.selected_costume_slot = slot;
+        let fighter_name = self.state.fighters[idx].name.clone();
+        self.open_acmd_workspace(&fighter_name, slot);
         self.source_mismatch_prompt = None;
         self.state.selected_fighter = Some(idx);
         self.state.selected_move = None;
@@ -5240,8 +5260,8 @@ impl VisionaryApp {
     /// Restore a usable editor target after the project replay. Replaying every saved move
     /// temporarily uses selection-dependent rule builders; it must never leave one of those
     /// temporary selections highlighted in the sidebar without loading its model or scripts.
-    fn restore_project_editor_selection(&mut self, target: Option<(String, String)>) {
-        let Some((fighter_name, move_name)) = target else {
+    fn restore_project_editor_selection(&mut self, target: Option<(String, u8, String)>) {
+        let Some((fighter_name, slot, move_name)) = target else {
             self.state.selected_fighter = None;
             self.state.selected_move = None;
             clear_move_state(&mut self.state);
@@ -5259,12 +5279,19 @@ impl VisionaryApp {
             return;
         };
 
-        self.select_fighter(fighter_index);
+        self.select_fighter_slot(fighter_index, slot);
         self.pending_project_move_selection = Some((fighter_name, move_name));
     }
 
     fn select_move(&mut self, move_entry: MoveEntry) {
         if self.source_mismatch_prompt.is_some() {
+            return;
+        }
+        let verified = self.state.selected_fighter
+            .and_then(|index| self.state.fighters.get(index))
+            .and_then(|fighter| self.acmd_binding_for_slot(&fighter.name, self.selected_costume_slot));
+        if verified.is_none() || verified != self.active_acmd_binding {
+            self.state.status = "Choose a verified character costume before opening an ACMD move. Unassigned edits remain saved.".into();
             return;
         }
         // Panel edits are keyed at the end of the frame, but a click can navigate before that
@@ -5285,12 +5312,7 @@ impl VisionaryApp {
                     if body != saved.body {
                         let captures = self.captures_for_move(&fighter_name, move_entry.hash);
                         let captures = if captures.is_empty() {
-                            saved
-                                .captures
-                                .iter()
-                                .filter(|capture| capture.motion == move_entry.hash)
-                                .cloned()
-                                .collect()
+                            self.verified_acmd_donors(&fighter_name, move_entry.hash, &saved.captures)
                         } else {
                             captures
                         };
@@ -5525,12 +5547,7 @@ impl VisionaryApp {
                 let motion = Self::motion_hash_from_name(move_name);
                 let captures = self.captures_for_move(fighter, motion);
                 let captures = if captures.is_empty() {
-                    saved
-                        .captures
-                        .iter()
-                        .filter(|capture| capture.motion == motion)
-                        .cloned()
-                        .collect()
+                    self.verified_acmd_donors(fighter, motion, &saved.captures)
                 } else {
                     captures
                 };
@@ -9511,6 +9528,20 @@ impl VisionaryApp {
                 ui.add_space(6.0);
             }
 
+            if !self.parked_legacy_tweaks.is_empty() {
+                ui.weak("Legacy global effect tweaks are saved but inactive; no character owner can be verified.");
+                let mut fighters: Vec<_> = self.parked_legacy_tweaks.keys().cloned().collect();
+                fighters.sort();
+                for fighter in fighters {
+                    let count = self.parked_legacy_tweaks[&fighter].len();
+                    ui.horizontal(|ui| {
+                        ui.label(format!("{fighter}: {count} inactive effect tweak(s)"));
+                        if ui.small_button("Remove saved tweaks").clicked() {
+                            self.parked_legacy_tweaks.remove(&fighter);
+                        }
+                    });
+                }
+            }
             // ── Live color/speed tweaks (kind-global runtime multipliers) ──
             let tweaks = self.live_overrides.tweaked();
             if !tweaks.is_empty() {
@@ -9920,13 +9951,7 @@ impl VisionaryApp {
                 self.hitbox_watch = Some((key.clone(), self.state.hitboxes.clone()));
                 self.hitbox_dirty_at = None;
             }
-            let all: Vec<crate::game_link::HitboxRuleWire> = self
-                .hitbox_rules_store
-                .values()
-                .flatten()
-                .cloned()
-                .collect();
-            self.game_link.send_hitbox_rules(&all);
+            self.send_live_hitbox_rules();
             self.state.status = format!("Restored {f}/{m} hitboxes to the source data.");
         }
         if let Some(f) = remove_fighter {
@@ -9945,13 +9970,7 @@ impl VisionaryApp {
                 }
                 self.hitbox_dirty_at = None;
             }
-            let all: Vec<crate::game_link::HitboxRuleWire> = self
-                .hitbox_rules_store
-                .values()
-                .flatten()
-                .cloned()
-                .collect();
-            self.game_link.send_hitbox_rules(&all);
+            self.send_live_hitbox_rules();
             self.state.status = format!("Restored all {f} hitboxes to their source data.");
         }
         if let Some(key) = remove_call_key {
@@ -10030,6 +10049,7 @@ impl VisionaryApp {
         project: crate::mod_project::ModProjectFile,
         selected_move: Option<(&str, &str)>,
     ) {
+        if !self.validate_acmd_export_bindings(&project) { return; }
         let generated = match crate::mod_export::source_project(&project) {
             Ok(Some(generated)) => generated,
             Ok(None) => {
@@ -10156,11 +10176,11 @@ impl VisionaryApp {
         } else {
             rebuild_script_from_hitboxes(&self.state.script, &self.state.hitboxes)
         };
-        // When the Roster window has a character you added set as the edit target, this move
-        // belongs to that costume rather than to the fighter as a whole. The export then gates
-        // it, so the donor's other costumes keep their own version of the move. A multi-skin
-        // character scopes to every slot it owns, so one moveset covers c08–c15.
-        let slot_scopes = self.roster.slot_scopes_for(&fighter.name);
+        // The owner was established when this workspace was opened. A change of preview
+        // costume or roster cannot retrospectively reassign its edits.
+        let slot_scopes = self.active_acmd_binding.as_ref()
+            .filter(|binding| binding.scope.fighter.eq_ignore_ascii_case(&fighter.name))
+            .map(|binding| binding.scope.slots.clone()).unwrap_or_default();
         self.state.edit_log.save_scoped_multi(
             &fighter.name,
             &fighter.display_name,
@@ -10363,6 +10383,7 @@ impl VisionaryApp {
             }
         }
 
+        self.draw_acmd_workspace_target(ui);
         ui.separator();
         sidebar_section_heading(
             ui,
@@ -11955,13 +11976,7 @@ impl VisionaryApp {
         } else {
             self.hitbox_rules_store.insert(key, rules);
         }
-        let all: Vec<crate::game_link::HitboxRuleWire> = self
-            .hitbox_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        self.game_link.send_hitbox_rules(&all);
+        self.send_live_hitbox_rules();
         if structural {
             self.state.status = if structural_live_supported {
                 "Sound structural edit staged for export, source sync, and live suppress/inject rules."
@@ -12620,13 +12635,7 @@ impl VisionaryApp {
         } else {
             self.hitbox_rules_store.insert(frame_key, frame_rules);
         }
-        let all: Vec<crate::game_link::HitboxRuleWire> = self
-            .hitbox_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        self.game_link.send_hitbox_rules(&all);
+        self.send_live_hitbox_rules();
         if unrepresentable > 0 || partial_unrepresentable > 0 || frame_unrepresentable > 0 {
             if unrepresentable > 0 {
                 self.note_live_replay_capture_limit("expression");
@@ -18317,12 +18326,7 @@ If you step every basis for a                          type and NONE of them mat
             .map(|record| record.hitboxes.clone())
             .unwrap_or_else(|| hitboxes_pristine.clone());
         let motion = Self::motion_hash_from_name(move_name);
-        let captures = source
-            .captures
-            .iter()
-            .filter(|capture| capture.motion == motion)
-            .cloned()
-            .collect();
+        let captures = self.verified_acmd_donors(fighter, motion, &source.captures);
         Some(MoveReplayContext {
             fighter: fighter.to_string(),
             move_name: move_name.to_string(),
@@ -18394,7 +18398,7 @@ If you step every basis for a                          type and NONE of them mat
             .iter()
             .filter_map(|(fighter, params)| {
                 let fields = crate::roster::traits::edits_for(params);
-                (!fields.is_empty()).then(|| crate::game_link::TraitRuleWire {
+                (!fields.is_empty() && self.exclusive_fighter_slots(fighter).is_some()).then(|| crate::game_link::TraitRuleWire {
                     fighter: fighter.clone(),
                     fields: fields.clone(),
                 })
@@ -18410,31 +18414,31 @@ If you step every basis for a                          type and NONE of them mat
         }
     }
 
+    fn send_live_spawn_rules(&self) {
+        self.send_scoped_acmd_union(&self.effect_rules_store, |bank| &bank.spawns, |rules| {
+            self.game_link.send_scoped_spawn_rules(rules);
+        });
+    }
+
+    fn send_live_effect_control_rules(&self) {
+        self.send_scoped_acmd_union(&self.effect_control_rules_store, |bank| &bank.controls, |rules| {
+            self.game_link.send_scoped_effect_control_rules(rules);
+        });
+    }
+
+    fn send_live_hitbox_rules(&self) {
+        self.send_scoped_acmd_union(&self.hitbox_rules_store, |bank| &bank.hitboxes, |rules| {
+            self.game_link.send_scoped_hitbox_rules(rules);
+        });
+    }
+
     /// Publish the complete flattened ACMD live-rule union currently staged in the keyed stores.
     /// Project loading calls this only after its all-family send barrier is lifted; ordinary
     /// rebuilds use it after their narrower rule batch ends.
     fn publish_live_rule_union(&self) {
-        let hitboxes: Vec<_> = self
-            .hitbox_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        let effects: Vec<_> = self
-            .effect_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        let controls: Vec<_> = self
-            .effect_control_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        self.game_link.send_hitbox_rules(&hitboxes);
-        self.game_link.send_spawn_rules(&effects);
-        self.game_link.send_effect_control_rules(&controls);
+        self.send_live_hitbox_rules();
+        self.send_live_spawn_rules();
+        self.send_live_effect_control_rules();
         self.publish_cancel_rules();
     }
 
@@ -18443,127 +18447,104 @@ If you step every basis for a                          type and NONE of them mat
     /// existing builders all take their identity and capture set from the current move, while
     /// their keyed stores keep the resulting rules alive after the next iteration.
     fn rebuild_all_saved_live_rules(&mut self) -> LiveApplyReport {
-        let selected = (
-            self.state.selected_fighter,
-            self.state.selected_move.clone(),
-        );
-        let mut keys = BTreeSet::new();
-        keys.extend(self.move_source_cache.keys().cloned());
-        keys.extend(self.state.effect_call_edits.keys().cloned());
-        keys.extend(self.state.effect_call_full.keys().cloned());
-        keys.extend(self.state.sound_script_edits.keys().cloned());
-        keys.extend(self.state.expression_script_edits.keys().cloned());
-        keys.extend(
-            self.state
-                .edit_log
-                .entries
-                .iter()
-                .flat_map(|(fighter, moves)| {
-                    moves
-                        .keys()
-                        .map(move |move_name| Self::move_key(fighter, move_name))
-                }),
-        );
-
+        // Called on project replacement, before loading the resumed editor selection.
+        // Legacy maps remain parked and never participate in this reconstruction.
         self.hitbox_rules_store.clear();
         self.effect_rules_store.clear();
         self.effect_control_rules_store.clear();
+        self.parked_live_acmd.clear();
         self.replay_missing_capture.clear();
         self.replay_missing_constant.clear();
-        self.replay_live_fallback_key = selected.0.and_then(|fighter_index| {
-            selected.1.as_ref().and_then(|move_entry| {
-                self.state
-                    .fighters
-                    .get(fighter_index)
-                    .map(|fighter| Self::move_key(&fighter.name, &move_entry.name))
-            })
-        });
         self.rebuilding_project_live = true;
         self.game_link.begin_rule_batch();
         let mut report = LiveApplyReport::default();
-
-        for key in keys {
-            let Some((fighter, move_name)) = key.split_once('/') else {
+        let previous_slot = self.selected_costume_slot;
+        let mut owners: Vec<_> = self.scoped_acmd_banks.iter()
+            .flat_map(|(fighter, banks)| banks.iter().filter(|bank| bank.edits.has_edits())
+                .map(move |bank| (fighter.clone(), bank.binding.clone())))
+            .collect();
+        owners.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.scope.slots.cmp(&b.1.scope.slots)));
+        for (fighter, binding) in owners {
+            let Some(fighter_index) = self.state.fighters.iter()
+                .position(|entry| entry.name.eq_ignore_ascii_case(&fighter)) else {
+                report.missing_fighter.insert(fighter);
                 continue;
             };
-            let Some(fighter_index) = self
-                .state
-                .fighters
-                .iter()
-                .position(|entry| entry.name.eq_ignore_ascii_case(fighter))
-            else {
-                report.missing_fighter.insert(fighter.to_string());
+            let Some(&slot) = binding.scope.slots.first() else {
+                report.inactive_acmd_banks += 1;
                 continue;
             };
-            let Some(snapshot) = self.move_source_cache.get(&key).cloned() else {
-                report.missing_source.insert(key);
+            if self.acmd_binding_for_slot(&fighter, slot).as_ref() != Some(&binding) {
+                report.inactive_acmd_banks += 1;
                 continue;
-            };
-            let Some(context) = self.materialize_move_replay_context(fighter, move_name, &snapshot)
-            else {
-                report.missing_source.insert(key);
+            }
+            self.selected_costume_slot = slot;
+            self.open_acmd_workspace(&fighter, slot);
+            if self.active_acmd_binding.as_ref() != Some(&binding) {
+                report.inactive_acmd_banks += 1;
                 continue;
-            };
-            report
-                .resume_target
-                .get_or_insert_with(|| (fighter.to_string(), move_name.to_string()));
-            self.state.selected_fighter = Some(fighter_index);
-            self.state.selected_move = Some(MoveEntry {
-                name: move_name.to_string(),
-                hash: context.motion,
-                frame_count: 0,
-                anim_path: None,
-            });
+            }
+            self.normalize_effect_call_storage();
+            let mut keys = BTreeSet::new();
+            keys.extend(self.move_source_cache.keys().filter(|key| fighter_key_matches(key, &fighter)).cloned());
+            keys.extend(self.state.effect_call_edits.keys().filter(|key| fighter_key_matches(key, &fighter)).cloned());
+            keys.extend(self.state.effect_call_full.keys().filter(|key| fighter_key_matches(key, &fighter)).cloned());
+            keys.extend(self.state.sound_script_edits.keys().filter(|key| fighter_key_matches(key, &fighter)).cloned());
+            keys.extend(self.state.expression_script_edits.keys().filter(|key| fighter_key_matches(key, &fighter)).cloned());
+            if let Some(moves) = self.state.edit_log.entries.get(&fighter) {
+                keys.extend(moves.keys().map(|move_name| Self::move_key(&fighter, move_name)));
+            }
+            for key in keys {
+                let Some((_, move_name)) = key.split_once('/') else { continue; };
+                let Some(snapshot) = self.move_source_cache.get(&key).cloned() else {
+                    report.missing_source.insert(format!("{} / {key}", binding.scope.key));
+                    continue;
+                };
+                let Some(context) = self.materialize_move_replay_context(&fighter, move_name, &snapshot) else {
+                    report.missing_source.insert(format!("{} / {key}", binding.scope.key));
+                    continue;
+                };
+                if context.source.body.is_empty() && context.captures.is_empty() {
+                    report.missing_source.insert(format!("{} / {key}", binding.scope.key));
+                    continue;
+                }
+                self.state.selected_fighter = Some(fighter_index);
+                self.state.selected_move = Some(MoveEntry {
+                    name: move_name.to_string(),
+                    hash: context.motion,
+                    frame_count: 0,
+                    anim_path: None,
+                });
+                clear_move_state(&mut self.state);
+                self.apply_move_replay_context(context);
+                self.refresh_current_live_rules();
+                self.push_motion_rate_rules();
+                let effect_limits = self.push_effect_rules();
+                if effect_limits.missing_capture_donor {
+                    report.missing_capture_donor.insert(format!("{} / {key} effect", binding.scope.key));
+                }
+                if effect_limits.missing_runtime_constant {
+                    report.missing_runtime_constant.insert(format!("{} / {key} effect", binding.scope.key));
+                }
+                report.resume_target.get_or_insert_with(|| (fighter.clone(), slot, move_name.to_string()));
+                report.restored_moves += 1;
+            }
+            for key in self.push_all_saved_hitbox_rules() {
+                report.missing_capture_donor.insert(format!("{} / {key} collision", binding.scope.key));
+            }
+            self.park_acmd_workspace();
+            self.state.selected_fighter = None;
+            self.state.selected_move = None;
             clear_move_state(&mut self.state);
-            if context.source.body.is_empty() && context.captures.is_empty() {
-                report.missing_source.insert(key);
-                continue;
-            }
-            self.apply_move_replay_context(context);
-            // `apply_acmd_body` handles the common game/effect path. Calling the aggregate once
-            // more also covers sound/expression-only moves and the less common point families.
-            self.refresh_current_live_rules();
-            self.push_motion_rate_rules();
-            let effect_limits = self.push_effect_rules();
-            if effect_limits.missing_capture_donor {
-                report.missing_capture_donor.insert(format!("{key} effect"));
-            }
-            if effect_limits.missing_runtime_constant {
-                report
-                    .missing_runtime_constant
-                    .insert(format!("{key} effect"));
-            }
-            report.restored_moves += 1;
         }
-
-        // The record-based hitbox rebuild also covers legacy records whose source snapshot was
-        // absent, while the per-move pass above supplies the persisted capture donors for new
-        // and retimed calls.
-        for key in self.push_all_saved_hitbox_rules() {
-            report
-                .missing_capture_donor
-                .insert(format!("{key} collision"));
-        }
-
-        // The loop above uses direct selection assignments only because the live-rule builders
-        // are selection-based. Those assignments are implementation detail, not UI navigation:
-        // retaining one would highlight a fighter or move whose assets were never loaded.
+        self.selected_costume_slot = previous_slot;
         self.state.selected_fighter = None;
         self.state.selected_move = None;
         clear_move_state(&mut self.state);
-
         self.rebuilding_project_live = false;
-        self.replay_live_fallback_key = None;
-        report
-            .missing_capture_donor
-            .extend(std::mem::take(&mut self.replay_missing_capture));
-        report
-            .missing_runtime_constant
-            .extend(std::mem::take(&mut self.replay_missing_constant));
-
+        report.missing_capture_donor.extend(std::mem::take(&mut self.replay_missing_capture));
+        report.missing_runtime_constant.extend(std::mem::take(&mut self.replay_missing_constant));
         self.game_link.end_rule_batch();
-        // Every pusher normally sends as it updates its keyed store. This final publish
-        // guarantees the complete union is present after the last move has been materialized.
         self.publish_live_rule_union();
         report
     }
@@ -19107,17 +19088,8 @@ If you step every basis for a                          type and NONE of them mat
         for (fighter, moves) in &self.cancel_rules_store {
             project.fighters.entry(fighter.clone()).or_default().cancel_rules = moves.clone();
         }
-        // Scope every fighter's edits to the slot-add mod they were made against, if any. This
-        // is recorded per fighter rather than derived at export time because the export runs
-        // from a saved project, which may be reopened with different roots configured — or
-        // none.
-        let roots = self.all_roots();
-        let data_root = self.state.data_root.clone();
-        let previewed = self.selected_costume_slot;
-        for (fighter, fm) in project.fighters.iter_mut() {
-            fm.costume_slots =
-                crate::data::mod_costume_slots(&roots, fighter, previewed, data_root.as_deref());
-        }
+        // Legacy scopes are retained from the saved file, never inferred from whichever
+        // costume happens to be previewed while saving another character's edits.
         let effect_keys: std::collections::BTreeSet<&String> = self
             .state
             .effect_call_edits
@@ -19185,6 +19157,9 @@ If you step every basis for a                          type and NONE of them mat
                 continue;
             }
             project.fighters.entry(fighter.clone()).or_default().eff = Some(eff.clone());
+        }
+        for (fighter, tweaks) in &self.parked_legacy_tweaks {
+            project.fighters.entry(fighter.clone()).or_default().live_tweaks = tweaks.clone();
         }
         // User-set live color×/speed multipliers → LiveTweaks, attached to every fighter
         // whose spawn lists use the effect (falls back to the selected fighter).
@@ -19258,6 +19233,7 @@ If you step every basis for a                          type and NONE of them mat
                 .capture_branch_warnings
                 .insert(move_name.to_string(), warning.clone());
         }
+        self.save_acmd_workspaces(&mut project);
         project
     }
 
@@ -19614,6 +19590,15 @@ If you step every basis for a                          type and NONE of them mat
         };
         self.game_link.begin_project_batch();
         self.clear_all_game_edits();
+        self.reset_acmd_workspaces();
+        self.state.selected_fighter = None;
+        self.state.selected_move = None;
+        self.acmd_receiver = None;
+        self.pending_project_script = None;
+        self.pending_project_move_selection = None;
+        self.move_list_receiver = None;
+        self.move_list.clear();
+        clear_move_state(&mut self.state);
         self.eff_editor.reset_project_state();
         self.state.edit_log.entries.clear();
         self.state.effect_call_edits.clear();
@@ -19627,7 +19612,9 @@ If you step every basis for a                          type and NONE of them mat
         self.source_mismatch_prompt = None;
         self.eff_mods.clear();
         self.live_overrides = crate::game_link::LiveOverrides::default();
+        self.parked_legacy_tweaks.clear();
         self.roster.project = crate::mod_project::RosterMod::default();
+        self.roster.clear_edit_target();
         self.roster.params.clear();
         self.edit_history.clear();
         self.game_link.end_project_batch();
@@ -20630,6 +20617,16 @@ If you step every basis for a                          type and NONE of them mat
             return;
         }
         let project = self.build_project();
+        if !self.validate_acmd_export_bindings(&project) { return; }
+        for (fighter, edits) in &project.fighters {
+            if (!crate::roster::traits::edits_for(&edits.params).is_empty()
+                || edits.eff.as_ref().is_some_and(|eff| !eff.is_empty()))
+                && self.exclusive_fighter_slots(fighter).is_none()
+            {
+                self.state.status = format!("Export refused: {fighter} has shared or unverified fighter-wide edits.");
+                return;
+            }
+        }
         // The manual workspace overlay is a first-class export even when there are no serialized
         // ACMD/EFF edits. This is the common model/animation iteration case.
         let has_workspace_overlay = self
@@ -20971,6 +20968,7 @@ If you step every basis for a                          type and NONE of them mat
         // cleared before the replacement has been materialized.
         self.game_link.begin_project_batch();
         self.clear_all_game_edits();
+        self.reset_acmd_workspaces();
         let previously_loaded_eff = self
             .eff_editor
             .loaded_rel()
@@ -20987,9 +20985,9 @@ If you step every basis for a                          type and NONE of them mat
         self.move_source_cache.clear();
         self.source_mismatch_prompt = None;
         self.rebuilding_project_live = false;
-        self.replay_live_fallback_key = None;
         self.eff_mods.clear();
         self.live_overrides = crate::game_link::LiveOverrides::default();
+        self.parked_legacy_tweaks.clear();
         self.state.hitboxes = self.state.hitboxes_pristine.clone();
         if let Some(relative) = previously_loaded_eff {
             let base = self.resolve_eff_source(&relative);
@@ -21001,6 +20999,7 @@ If you step every basis for a                          type and NONE of them mat
         // Loading is replacement here too: the roster window's edits belong to the project
         // that was open, not to the one being loaded.
         self.roster.project = std::mem::take(&mut project.roster);
+        self.roster.clear_edit_target();
         self.roster.params = project
             .fighters
             .iter()
@@ -21011,6 +21010,12 @@ If you step every basis for a                          type and NONE of them mat
         let mut n_calls = 0;
         let mut n_eff = 0;
         for (fighter, mut fm) in project.fighters {
+            if !fm.costume_slots.is_empty() {
+                self.legacy_acmd_costumes.insert(fighter.clone(), fm.costume_slots.clone());
+            }
+            if !fm.scoped_acmd.is_empty() {
+                self.scoped_acmd_banks.insert(fighter.clone(), std::mem::take(&mut fm.scoped_acmd));
+            }
             if !fm.cancel_rules.is_empty() {
                 self.cancel_rules_store.insert(fighter.clone(), std::mem::take(&mut fm.cancel_rules));
             }
@@ -21118,7 +21123,13 @@ If you step every basis for a                          type and NONE of them mat
                     + eff.entry_edits.len();
                 self.eff_mods.insert(fighter.clone(), eff);
             }
-            // Live color/speed tweaks: restore into the override store and re-send.
+            // No ownership can be recovered from a legacy kind-global multiplier.
+            if !crate::game_link::LEGACY_GLOBAL_EFFECTS_ENABLED {
+                if !fm.live_tweaks.is_empty() {
+                    self.parked_legacy_tweaks.insert(fighter.clone(), fm.live_tweaks);
+                }
+                continue;
+            }
             for t in fm.live_tweaks {
                 let hash = effect_name_hash(&t.effect_name);
                 let mut init = crate::game_link::RpmEffectData {
@@ -21418,6 +21429,10 @@ If you step every basis for a                          type and NONE of them mat
     ///
     /// Called once at startup. Loading a project re-publishes everything it needs.
     fn clear_stale_live_state() {
+        // The new plugin ignores legacy manifests/pins. Keep existing SD files untouched.
+        if !crate::game_link::LEGACY_GLOBAL_EFFECTS_ENABLED {
+            return;
+        }
         let Some(sd) = crate::scratch_dirs::emulator_sd_root() else {
             return;
         };
@@ -21440,6 +21455,9 @@ If you step every basis for a                          type and NONE of them mat
     /// Remove one fighter's app-owned live EFF manifest entry and merged payload. The source
     /// dump/mod EFF is deliberately outside this path and is never touched here.
     fn remove_live_eff_for_fighter(&mut self, fighter: &str) -> bool {
+        if !crate::game_link::LEGACY_GLOBAL_EFFECTS_ENABLED {
+            return false;
+        }
         let mut changed = false;
         self.live_eff_deployed.retain(|name| {
             let keep = !name.eq_ignore_ascii_case(fighter);
@@ -21515,12 +21533,13 @@ If you step every basis for a                          type and NONE of them mat
         self.effect_rules_store.clear();
         self.effect_control_rules_store.clear();
         self.hitbox_rules_store.clear();
+        self.parked_live_acmd.clear();
         self.cancel_rules_store.clear();
-        self.game_link.send_cancel_rules(&[]);
+        self.game_link.clear_cancel_rules();
         self.game_link.send_trait_rules(&[]);
-        self.game_link.send_spawn_rules(&[]);
-        self.game_link.send_effect_control_rules(&[]);
-        self.game_link.send_hitbox_rules(&[]);
+        self.send_live_spawn_rules();
+        self.send_live_effect_control_rules();
+        self.send_live_hitbox_rules();
         self.game_link.send_effect_aliases(&[]);
         // Asset-bundle callbacks are a distinct full snapshot from the effect carrier. Clear it
         // on project replacement too, otherwise a later genuine fighter load could read files
@@ -21542,28 +21561,32 @@ If you step every basis for a                          type and NONE of them mat
         self.game_link.send_donor_bytes(&[]);
         self.game_link.send_donor_effs(&[]);
         self.carrier_push_callers.clear();
-        // Stop serving merged eff files: wipe the SD-side manifest + files (the plugin's
-        // registrations stay for this boot but resolve to nothing → vanilla files load).
-        if let Some(dir) = crate::scratch_dirs::emulator_sd_root()
-            .map(|sd| sd.join("effect_viewer").join("live_eff"))
-            .filter(|d| d.is_dir())
-        {
-            let _ = std::fs::remove_dir_all(&dir);
-            self.game_link.send_live_eff_reload();
-        }
-        // Also remove the guaranteed-fallback Arcropolis mod staged by deploy_live_eff
-        // (takes effect on the next boot — the off-switch mirror of the staged mod).
-        if let Some(dir) = crate::scratch_dirs::emulator_sd_root()
-            .map(|sd| sd.join("ultimate").join("mods").join("effect_viewer_live"))
-            .filter(|d| d.is_dir())
-        {
-            let _ = std::fs::remove_dir_all(&dir);
+        if crate::game_link::LEGACY_GLOBAL_EFFECTS_ENABLED {
+            // Stop serving merged eff files: wipe the SD-side manifest + files (the plugin's
+            // registrations stay for this boot but resolve to nothing → vanilla files load).
+            if let Some(dir) = crate::scratch_dirs::emulator_sd_root()
+                .map(|sd| sd.join("effect_viewer").join("live_eff"))
+                .filter(|d| d.is_dir())
+            {
+                let _ = std::fs::remove_dir_all(&dir);
+                self.game_link.send_live_eff_reload();
+            }
+            // Also remove the guaranteed-fallback Arcropolis mod staged by deploy_live_eff
+            // (takes effect on the next boot — the off-switch mirror of the staged mod).
+            if let Some(dir) = crate::scratch_dirs::emulator_sd_root()
+                .map(|sd| sd.join("ultimate").join("mods").join("effect_viewer_live"))
+                .filter(|d| d.is_dir())
+            {
+                let _ = std::fs::remove_dir_all(&dir);
+            }
         }
         self.live_eff_deployed.clear();
         self.pin_sync_prompt = None;
-        self.state.status = "Cleared all in-game edits (saved pins + live rules + aliases + \
-             live carrier + live eff files)."
-            .into();
+        self.state.status = if crate::game_link::LEGACY_GLOBAL_EFFECTS_ENABLED {
+            "Cleared all in-game edits (saved pins + live rules + aliases + live carrier + live eff files)."
+        } else {
+            "Cleared scoped live rules; legacy global effect files were not changed."
+        }.into();
     }
 
     // ── Live ACMD capture + live hitbox rules ─────────────────────────────────
@@ -21706,13 +21729,7 @@ If you step every basis for a                          type and NONE of them mat
         } else {
             self.hitbox_rules_store.insert(key, rules);
         }
-        let all: Vec<crate::game_link::HitboxRuleWire> = self
-            .hitbox_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        self.game_link.send_hitbox_rules(&all);
+        self.send_live_hitbox_rules();
     }
 
     /// The authoritative `motion_list.bin` hash for a visible move (what
@@ -21760,9 +21777,27 @@ If you step every basis for a                          type and NONE of them mat
     ///   * run — the plugin tags each playback, and only the newest is loaded. Without it,
     ///     performing a move grounded and then aerial left the union of both branches and the
     ///     editor showed spawns that never occur together.
+    fn scoped_capture_target(&self) -> Option<(i32, u8)> {
+        let fighter = &self.state.fighters.get(self.state.selected_fighter?)?.name;
+        let slot = self.selected_costume_slot;
+        let binding = self.acmd_binding_for_slot(fighter, slot)?;
+        if self.active_acmd_binding.as_ref() != Some(&binding) {
+            return None;
+        }
+        Some((fighter_kind_id(fighter)?, slot))
+    }
+
+    fn selected_scoped_live_captures(&self, motion: u64) -> Vec<crate::game_link::CaptureLine> {
+        let Some((kind, slot)) = self.scoped_capture_target() else { return Vec::new(); };
+        self.game_link.latest_run_for_costume(motion, kind, slot)
+    }
+
     fn captures_for_move(&self, fighter: &str, motion: u64) -> Vec<crate::game_link::CaptureLine> {
-        self.game_link
-            .latest_run_for(motion, fighter_kind_id(fighter))
+        if self.state.selected_fighter.and_then(|index| self.state.fighters.get(index))
+            .is_none_or(|entry| !entry.name.eq_ignore_ascii_case(fighter)) {
+            return Vec::new();
+        }
+        self.selected_scoped_live_captures(motion)
     }
 
     /// Forget the persisted donor for the current move as well as the plugin's in-memory
@@ -21799,25 +21834,16 @@ If you step every basis for a                          type and NONE of them mat
             key.as_ref()
                 .and_then(|key| self.move_source_cache.get(key))
                 .map(|snapshot| {
-                    snapshot
-                        .captures
-                        .iter()
-                        .filter(|capture| capture.motion == motion)
-                        .cloned()
-                        .collect::<Vec<_>>()
+                    let Some(binding) = self.active_acmd_binding.as_ref() else { return Vec::new(); };
+                    self.verified_acmd_donors(&binding.scope.fighter, motion, &snapshot.captures)
                 })
                 .unwrap_or_default()
         };
         // Only when this move actually HAS a stored donor: with no snapshot there is nothing
         // authoritative to prefer, and the replay path fell through to the live run before.
-        let stored_is_authoritative = self.rebuilding_project_live
-            && key.as_ref().is_some_and(|key| {
-                self.move_source_cache.contains_key(key)
-                    && self.replay_live_fallback_key.as_deref() != Some(key.as_str())
-            });
+        let stored_is_authoritative = self.rebuilding_project_live;
         select_donor_captures(stored_is_authoritative, snapshot_captures, || {
-            self.game_link
-                .latest_run_for(motion, self.current_fighter_kind())
+            self.selected_scoped_live_captures(motion)
         })
     }
 
@@ -21881,15 +21907,16 @@ If you step every basis for a                          type and NONE of them mat
         let Some(motion) = self.current_motion_hash() else {
             return;
         };
-        let kind = self.current_fighter_kind();
-        let lines = self.game_link.captures_count(motion, kind);
+        let Some((kind, costume)) = self.scoped_capture_target() else { return; };
+        let Some(run) = self.game_link.latest_run_id_for_costume(motion, kind, costume) else { return; };
+        let lines = self.game_link.captures_count_for_costume(motion, kind, costume);
         if lines == 0 {
             return;
         }
         let now = std::time::Instant::now();
         match &mut self.pending_capture {
             // Same locked playback, more lines: the script is still running — keep waiting.
-            Some(p) if p.motion == motion => {
+            Some(p) if p.motion == motion && p.kind == kind && p.costume == costume && p.run == run => {
                 if lines != p.lines {
                     p.lines = lines;
                     p.last_line = now;
@@ -21915,7 +21942,8 @@ If you step every basis for a                          type and NONE of them mat
                     self.pending_capture = Some(PendingCapture {
                         motion,
                         kind,
-                        run: self.game_link.latest_run_id(motion, kind).unwrap_or(0),
+                        costume,
+                        run,
                         lines,
                         first_line: now,
                         last_line: now,
@@ -21935,21 +21963,23 @@ If you step every basis for a                          type and NONE of them mat
         let Some(p) = self.pending_capture.as_ref() else {
             return;
         };
-        let (motion, kind, run, first_line, last_line) =
-            (p.motion, p.kind, p.run, p.first_line, p.last_line);
+        let (motion, kind, costume, run, first_line, last_line) =
+            (p.motion, p.kind, p.costume, p.run, p.first_line, p.last_line);
 
         // Moved off the move, or real data arrived from elsewhere (GitHub fetch) — drop it.
         // A manual "⟳ Live" click mid-window is deliberately NOT a cancel: letting the window
         // run to completion means the click still works and then self-corrects to the full
         // script instead of leaving the truncated one in place.
         if self.current_motion_hash() != Some(motion)
+            || self.scoped_capture_target() != Some((kind, costume))
+            || self.game_link.latest_run_id_for_costume(motion, kind, costume) != Some(run)
             || (!self.state.acmd_source.is_empty() && self.state.acmd_source != "Live capture")
         {
             self.pending_capture = None;
             return;
         }
 
-        let ended = self.game_link.capture_run_complete(kind, motion, run);
+        let ended = self.game_link.capture_run_complete(Some(kind), motion, run);
         if ended || last_line.elapsed() >= CAPTURE_QUIET || first_line.elapsed() >= CAPTURE_MAX_WAIT
         {
             self.pending_capture = None;
@@ -21975,9 +22005,7 @@ If you step every basis for a                          type and NONE of them mat
         let captures = if self.rebuilding_project_live {
             self.captures_for_selected_fighter(motion)
         } else {
-            let live = self
-                .game_link
-                .latest_run_for(motion, self.current_fighter_kind());
+            let live = self.selected_scoped_live_captures(motion);
             if live.is_empty() {
                 self.captures_for_selected_fighter(motion)
             } else {
@@ -24472,13 +24500,7 @@ If you step every basis for a                          type and NONE of them mat
         } else {
             self.hitbox_rules_store.insert(mv_key, rules);
         }
-        let all: Vec<crate::game_link::HitboxRuleWire> = self
-            .hitbox_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        self.game_link.send_hitbox_rules(&all);
+        self.send_live_hitbox_rules();
         if missing_donor {
             self.state.status =
                 "Added/retimed hitbox needs live capture args — perform the move in game once."
@@ -24881,13 +24903,7 @@ If you step every basis for a                          type and NONE of them mat
         } else {
             self.hitbox_rules_store.insert(key, rules);
         }
-        let all: Vec<crate::game_link::HitboxRuleWire> = self
-            .hitbox_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        self.game_link.send_hitbox_rules(&all);
+        self.send_live_hitbox_rules();
     }
 
     /// Send this move's `FT_MOTION_RATE` values to the running game.
@@ -24950,13 +24966,7 @@ If you step every basis for a                          type and NONE of them mat
         } else {
             self.hitbox_rules_store.insert(key, rules);
         }
-        let all: Vec<crate::game_link::HitboxRuleWire> = self
-            .hitbox_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        self.game_link.send_hitbox_rules(&all);
+        self.send_live_hitbox_rules();
         // Says whether the game is even listening. "Sent" and "the plugin is not connected" are
         // the two outcomes a user cannot tell apart from the game side, and confusing them is
         // what makes a live feature feel broken when it is merely unplugged.
@@ -25064,13 +25074,7 @@ If you step every basis for a                          type and NONE of them mat
         } else {
             self.hitbox_rules_store.insert(key, rules);
         }
-        let all: Vec<crate::game_link::HitboxRuleWire> = self
-            .hitbox_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        self.game_link.send_hitbox_rules(&all);
+        self.send_live_hitbox_rules();
         if unrepresentable > 0 {
             self.note_live_replay_capture_limit("SET_SPEED");
             self.state.status = format!(
@@ -25184,13 +25188,7 @@ If you step every basis for a                          type and NONE of them mat
         } else {
             self.hitbox_rules_store.insert(key, rules);
         }
-        let all: Vec<crate::game_link::HitboxRuleWire> = self
-            .hitbox_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        self.game_link.send_hitbox_rules(&all);
+        self.send_live_hitbox_rules();
         if unrepresentable > 0 {
             self.note_live_replay_capture_limit("SET_SPEED_EX");
             self.state.status = format!(
@@ -25299,13 +25297,7 @@ If you step every basis for a                          type and NONE of them mat
         } else {
             self.hitbox_rules_store.insert(key, rules);
         }
-        let all: Vec<crate::game_link::HitboxRuleWire> = self
-            .hitbox_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        self.game_link.send_hitbox_rules(&all);
+        self.send_live_hitbox_rules();
         if unrepresentable > 0 {
             self.note_live_replay_capture_limit("ADD_SPEED_NO_LIMIT");
             self.state.status = format!(
@@ -25423,13 +25415,7 @@ If you step every basis for a                          type and NONE of them mat
         } else {
             self.hitbox_rules_store.insert(key, rules);
         }
-        let all: Vec<crate::game_link::HitboxRuleWire> = self
-            .hitbox_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        self.game_link.send_hitbox_rules(&all);
+        self.send_live_hitbox_rules();
         if unrepresentable > 0 {
             self.note_live_replay_capture_limit("CORRECT");
             self.state.status = format!(
@@ -25551,13 +25537,7 @@ If you step every basis for a                          type and NONE of them mat
         } else {
             self.hitbox_rules_store.insert(key, rules);
         }
-        let all: Vec<crate::game_link::HitboxRuleWire> = self
-            .hitbox_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        self.game_link.send_hitbox_rules(&all);
+        self.send_live_hitbox_rules();
         if unrepresentable > 0 {
             self.note_live_replay_capture_limit("FT_CATCH_STOP");
             self.state.status = format!(
@@ -25673,13 +25653,7 @@ If you step every basis for a                          type and NONE of them mat
         } else {
             self.hitbox_rules_store.insert(key, rules);
         }
-        let all: Vec<crate::game_link::HitboxRuleWire> = self
-            .hitbox_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        self.game_link.send_hitbox_rules(&all);
+        self.send_live_hitbox_rules();
         if unrepresentable > 0 {
             self.note_live_replay_capture_limit("FT_START_ADJUST_MOTION_FRAME_arg1");
             self.state.status = format!(
@@ -25802,13 +25776,7 @@ If you step every basis for a                          type and NONE of them mat
         } else {
             self.hitbox_rules_store.insert(key, rules);
         }
-        let all: Vec<crate::game_link::HitboxRuleWire> = self
-            .hitbox_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        self.game_link.send_hitbox_rules(&all);
+        self.send_live_hitbox_rules();
         if unrepresentable > 0 {
             self.note_live_replay_capture_limit("MotionModule::set_rate");
             self.state.status = format!(
@@ -25928,13 +25896,7 @@ If you step every basis for a                          type and NONE of them mat
         } else {
             self.hitbox_rules_store.insert(key, rules);
         }
-        let all: Vec<crate::game_link::HitboxRuleWire> = self
-            .hitbox_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        self.game_link.send_hitbox_rules(&all);
+        self.send_live_hitbox_rules();
         if unrepresentable > 0 {
             self.note_live_replay_capture_limit("MotionModule::set_helper_calculation");
             self.state.status = format!(
@@ -26236,13 +26198,7 @@ If you step every basis for a                          type and NONE of them mat
         } else {
             self.hitbox_rules_store.insert(key, rules);
         }
-        let all: Vec<crate::game_link::HitboxRuleWire> = self
-            .hitbox_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        self.game_link.send_hitbox_rules(&all);
+        self.send_live_hitbox_rules();
         if unrepresentable > 0 {
             self.note_live_replay_capture_limit("MotionModule::set_frame_partial");
             self.state.status = format!(
@@ -26281,13 +26237,7 @@ If you step every basis for a                          type and NONE of them mat
         } else {
             self.hitbox_rules_store.insert(key, rules);
         }
-        let all: Vec<crate::game_link::HitboxRuleWire> = self
-            .hitbox_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        self.game_link.send_hitbox_rules(&all);
+        self.send_live_hitbox_rules();
         if unrepresentable > 0 {
             self.note_live_replay_capture_limit("expression partial frame");
             self.state.status = format!(
@@ -26594,13 +26544,7 @@ If you step every basis for a                          type and NONE of them mat
         } else {
             self.hitbox_rules_store.insert(key, rules);
         }
-        let all: Vec<crate::game_link::HitboxRuleWire> = self
-            .hitbox_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        self.game_link.send_hitbox_rules(&all);
+        self.send_live_hitbox_rules();
         if unrepresentable > 0 {
             self.note_live_replay_capture_limit("MotionModule::set_rate_partial");
             self.state.status = format!(
@@ -26639,13 +26583,7 @@ If you step every basis for a                          type and NONE of them mat
         } else {
             self.hitbox_rules_store.insert(key, rules);
         }
-        let all: Vec<crate::game_link::HitboxRuleWire> = self
-            .hitbox_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        self.game_link.send_hitbox_rules(&all);
+        self.send_live_hitbox_rules();
         if unrepresentable > 0 {
             self.note_live_replay_capture_limit("expression partial rate");
             self.state.status = format!(
@@ -26765,13 +26703,7 @@ If you step every basis for a                          type and NONE of them mat
         } else {
             self.hitbox_rules_store.insert(key, rules);
         }
-        let all: Vec<crate::game_link::HitboxRuleWire> = self
-            .hitbox_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        self.game_link.send_hitbox_rules(&all);
+        self.send_live_hitbox_rules();
         if unrepresentable > 0 {
             self.note_live_replay_capture_limit("CLR_SPEED");
             self.state.status = format!(
@@ -26892,13 +26824,7 @@ If you step every basis for a                          type and NONE of them mat
         } else {
             self.hitbox_rules_store.insert(key, rules);
         }
-        let all: Vec<crate::game_link::HitboxRuleWire> = self
-            .hitbox_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        self.game_link.send_hitbox_rules(&all);
+        self.send_live_hitbox_rules();
         if unrepresentable > 0 {
             self.note_live_replay_capture_limit("change_kinetic");
             self.state.status = format!(
@@ -27035,13 +26961,7 @@ If you step every basis for a                          type and NONE of them mat
         } else {
             self.hitbox_rules_store.insert(key, rules);
         }
-        let all: Vec<crate::game_link::HitboxRuleWire> = self
-            .hitbox_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        self.game_link.send_hitbox_rules(&all);
+        self.send_live_hitbox_rules();
         if unrepresentable > 0 {
             self.note_live_replay_capture_limit("KineticModule energy");
             self.state.status = format!(
@@ -27171,13 +27091,7 @@ If you step every basis for a                          type and NONE of them mat
         } else {
             self.hitbox_rules_store.insert(key, rules);
         }
-        let all: Vec<crate::game_link::HitboxRuleWire> = self
-            .hitbox_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        self.game_link.send_hitbox_rules(&all);
+        self.send_live_hitbox_rules();
         if unrepresentable > 0 {
             self.note_live_replay_capture_limit("KineticModule::add_speed");
             self.state.status = format!(
@@ -27304,13 +27218,7 @@ If you step every basis for a                          type and NONE of them mat
         } else {
             self.hitbox_rules_store.insert(key, rules);
         }
-        let all: Vec<crate::game_link::HitboxRuleWire> = self
-            .hitbox_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        self.game_link.send_hitbox_rules(&all);
+        self.send_live_hitbox_rules();
         if unrepresentable > 0 {
             self.note_live_replay_capture_limit("WorkModule::inc_int");
             self.state.status = format!(
@@ -27436,13 +27344,7 @@ If you step every basis for a                          type and NONE of them mat
         } else {
             self.hitbox_rules_store.insert(key, rules);
         }
-        let all: Vec<crate::game_link::HitboxRuleWire> = self
-            .hitbox_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        self.game_link.send_hitbox_rules(&all);
+        self.send_live_hitbox_rules();
         if unrepresentable > 0 {
             self.note_live_replay_capture_limit("WorkModule flag");
             self.state.status = format!(
@@ -27575,13 +27477,7 @@ If you step every basis for a                          type and NONE of them mat
         } else {
             self.hitbox_rules_store.insert(key, rules);
         }
-        let all: Vec<crate::game_link::HitboxRuleWire> = self
-            .hitbox_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        self.game_link.send_hitbox_rules(&all);
+        self.send_live_hitbox_rules();
         if unrepresentable > 0 {
             self.note_live_replay_capture_limit("WorkModule transition term");
             self.state.status = format!(
@@ -27817,13 +27713,7 @@ If you step every basis for a                          type and NONE of them mat
         } else {
             self.hitbox_rules_store.insert(key, rules);
         }
-        let all: Vec<crate::game_link::HitboxRuleWire> = self
-            .hitbox_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        self.game_link.send_hitbox_rules(&all);
+        self.send_live_hitbox_rules();
         if unrepresentable > 0 {
             self.note_live_replay_capture_limit("WorkModule value");
             self.state.status = format!(
@@ -27927,13 +27817,7 @@ If you step every basis for a                          type and NONE of them mat
         } else {
             self.hitbox_rules_store.insert(key, rules);
         }
-        let all: Vec<crate::game_link::HitboxRuleWire> = self
-            .hitbox_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        self.game_link.send_hitbox_rules(&all);
+        self.send_live_hitbox_rules();
     }
 
     fn kinetic_clear_speed_all_rules_for(
@@ -28031,13 +27915,7 @@ If you step every basis for a                          type and NONE of them mat
         } else {
             self.hitbox_rules_store.insert(key, rules);
         }
-        let all: Vec<crate::game_link::HitboxRuleWire> = self
-            .hitbox_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        self.game_link.send_hitbox_rules(&all);
+        self.send_live_hitbox_rules();
     }
 
     fn kinetic_set_consider_ground_friction_capture_for<'a>(
@@ -28263,13 +28141,7 @@ If you step every basis for a                          type and NONE of them mat
         } else {
             self.hitbox_rules_store.insert(key, rules);
         }
-        let all: Vec<crate::game_link::HitboxRuleWire> = self
-            .hitbox_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        self.game_link.send_hitbox_rules(&all);
+        self.send_live_hitbox_rules();
         if unrepresentable > 0 {
             self.note_live_replay_capture_limit("set_consider_ground_friction");
             self.state.status = format!(
@@ -28335,13 +28207,7 @@ If you step every basis for a                          type and NONE of them mat
         } else {
             self.hitbox_rules_store.insert(key, rules);
         }
-        let all: Vec<crate::game_link::HitboxRuleWire> = self
-            .hitbox_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        self.game_link.send_hitbox_rules(&all);
+        self.send_live_hitbox_rules();
     }
 
     /// Rebuild live hitbox rules for every move in a loaded project, not just the move currently
@@ -28354,6 +28220,8 @@ If you step every basis for a                          type and NONE of them mat
             .edit_log
             .entries
             .iter()
+            .filter(|(fighter, _)| self.active_acmd_binding.as_ref().is_some_and(|binding|
+                binding.scope.fighter.eq_ignore_ascii_case(fighter)))
             .flat_map(|(fighter, moves)| {
                 moves.iter().map(move |(move_name, record)| {
                     (fighter.clone(), move_name.clone(), record.clone())
@@ -28372,21 +28240,13 @@ If you step every basis for a                          type and NONE of them mat
                 .move_source_cache
                 .get(&Self::move_key(&fighter, &move_name))
                 .map(|snapshot| {
-                    snapshot
-                        .captures
-                        .iter()
-                        .filter(|capture| capture.motion == motion)
-                        .cloned()
-                        .collect::<Vec<_>>()
+                    self.verified_acmd_donors(&fighter, motion, &snapshot.captures)
                 })
                 .filter(|captures: &Vec<crate::game_link::CaptureLine>| !captures.is_empty())
                 .unwrap_or_else(|| {
-                    let key = Self::move_key(&fighter, &move_name);
-                    let allow_live = !self.rebuilding_project_live
-                        || self.replay_live_fallback_key.as_deref() == Some(key.as_str());
+                    let allow_live = !self.rebuilding_project_live;
                     if allow_live {
-                        self.game_link
-                            .latest_run_for(motion, fighter_kind_id(&fighter))
+                        self.captures_for_move(&fighter, motion)
                     } else {
                         Vec::new()
                     }
@@ -28565,13 +28425,7 @@ If you step every basis for a                          type and NONE of them mat
                 self.hitbox_rules_store.insert(key, rules);
             }
         }
-        let all: Vec<_> = self
-            .hitbox_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        self.game_link.send_hitbox_rules(&all);
+        self.send_live_hitbox_rules();
         incomplete
     }
 
@@ -30003,20 +29857,8 @@ If you step every basis for a                          type and NONE of them mat
             self.apply_effect_call_edits_to_current();
             self.push_effect_rules();
         } else if !affected_moves.is_empty() {
-            let all: Vec<crate::game_link::SpawnRuleWire> = self
-                .effect_rules_store
-                .values()
-                .flatten()
-                .cloned()
-                .collect();
-            self.game_link.send_spawn_rules(&all);
-            let all_controls: Vec<crate::game_link::EffectControlRuleWire> = self
-                .effect_control_rules_store
-                .values()
-                .flatten()
-                .cloned()
-                .collect();
-            self.game_link.send_effect_control_rules(&all_controls);
+            self.send_live_spawn_rules();
+            self.send_live_effect_control_rules();
         }
     }
 
@@ -30270,6 +30112,12 @@ If you step every basis for a                          type and NONE of them mat
             return;
         }
         let caller = std::mem::take(&mut self.carrier_push_callers).join(",");
+        if !crate::game_link::LEGACY_GLOBAL_EFFECTS_ENABLED {
+            self.game_link.send_effect_aliases(&[]);
+            self.game_link.send_donor_bytes(&[]);
+            self.game_link.send_donor_effs(&[]);
+            return;
+        }
         let mut aliases: Vec<crate::game_link::EffectAliasWire> = Vec::new();
         // The carrier attaches to the fighter the user currently has selected — that is the
         // one whose effects are on screen and being edited. (This was hardcoded to Kirby
@@ -30286,8 +30134,11 @@ If you step every basis for a                          type and NONE of them mat
                     .loaded_rel()
                     .map(|rel| crate::mod_project::fighter_from_source_rel(&rel))
                     .filter(|f| !f.is_empty())
-            });
+            })
+            .filter(|fighter| self.exclusive_fighter_slots(fighter).is_some());
         for (fighter, eff) in &self.eff_mods {
+            let Some(base_slots) = self.exclusive_fighter_slots(fighter) else { continue; };
+            let Some(fighter_kind) = fighter_kind_id(fighter) else { continue; };
             let own_rel = format!("effect/fighter/{fighter}/ef_{fighter}.eff");
             for op in &eff.transplants {
                 // Is the donor's ORIGINAL kind resident in a normal match? Same-file, same-
@@ -30315,11 +30166,16 @@ If you step every basis for a                          type and NONE of them mat
                 if from == to {
                     continue;
                 }
-                let wire = crate::game_link::EffectAliasWire {
-                    from,
-                    to,
-                    slots: op.one_slot_slots.clone(),
+                let mut costume_slots = if op.one_slot_slots.is_empty() {
+                    base_slots.clone()
+                } else if op.one_slot_slots.iter().all(|slot| base_slots.contains(slot)) {
+                    op.one_slot_slots.clone()
+                } else {
+                    continue;
                 };
+                costume_slots.sort_unstable();
+                costume_slots.dedup();
+                let wire = crate::game_link::EffectAliasWire { from, to, fighter_kind, costume_slots };
                 if !aliases.contains(&wire) {
                     aliases.push(wire);
                 }
@@ -30639,10 +30495,13 @@ If you step every basis for a                          type and NONE of them mat
 
         // Redirect spawns of the original kind onto the edited clone.
         for (from_name, to_name) in &authored_aliases {
+            let Some(fighter) = carrier_fighter.as_deref() else { continue; };
+            let Some(fighter_kind) = fighter_kind_id(fighter) else { continue; };
+            let Some(costume_slots) = self.exclusive_fighter_slots(fighter) else { continue; };
             let wire = crate::game_link::EffectAliasWire {
                 from: effect_name_hash(from_name),
                 to: effect_name_hash(to_name),
-                slots: Vec::new(),
+                fighter_kind, costume_slots,
             };
             if wire.from == wire.to {
                 continue;
@@ -30652,7 +30511,9 @@ If you step every basis for a                          type and NONE of them mat
             // leaves the plugin picking arbitrarily. The transplant alias is registered first
             // and wins; the authored edit then has nowhere to live, so say so rather than
             // silently rendering the unedited copy.
-            if let Some(existing) = aliases.iter().find(|a| a.from == wire.from) {
+            if let Some(existing) = aliases.iter().find(|a| a.from == wire.from
+                && a.fighter_kind == wire.fighter_kind
+                && a.costume_slots.iter().any(|slot| wire.costume_slots.contains(slot))) {
                 if existing.to != wire.to {
                     carrier_name_conflicts.push(from_name.clone());
                 }
@@ -30697,6 +30558,7 @@ If you step every basis for a                          type and NONE of them mat
         // build the small stripped eff the plugin injects as resident data.
         let mut donor_wants: HashMap<String, Vec<String>> = HashMap::new();
         for (fighter, eff) in &self.eff_mods {
+            if self.exclusive_fighter_slots(fighter).is_none() { continue; }
             let target = if eff.source_rel.is_empty() {
                 format!("effect/fighter/{fighter}/ef_{fighter}.eff")
             } else {
@@ -31164,6 +31026,14 @@ If you step every basis for a                          type and NONE of them mat
     /// Cross-fighter donor content thereby loads WITH the fighter — no export, no donor
     /// fighter in the match; re-entering the match picks it up. Returns success.
     fn deploy_live_eff(&mut self, fighter: &str) -> bool {
+        if !crate::game_link::LEGACY_GLOBAL_EFFECTS_ENABLED {
+            self.state.status = "Live EFF resources are inactive in scoped editing; saved EFF edits are preserved.".into();
+            return false;
+        }
+        if self.exclusive_fighter_slots(fighter).is_none() {
+            self.state.status = "Live EFF deploy refused: shared or unverified costume ownership.".into();
+            return false;
+        }
         let Some(eff) = self.eff_mods.get(fighter).cloned() else {
             return false;
         };
@@ -31258,7 +31128,17 @@ If you step every basis for a                          type and NONE of them mat
         // Fold the editor's current diff into the project store first: the carrier snapshot
         // is built from `eff_mods`, not from the editor's working copy.
         self.sync_eff_mods_from_editor();
+        if !crate::game_link::LEGACY_GLOBAL_EFFECTS_ENABLED {
+            self.eff_editor.carrier_expected = false;
+            self.push_effect_aliases();
+            return "EFF edits saved locally; live resource loading is disabled in scoped editing.".into();
+        }
         let fighter = crate::mod_project::fighter_from_source_rel(&rel);
+        if self.exclusive_fighter_slots(&fighter).is_none() {
+            self.push_effect_aliases();
+            self.eff_editor.carrier_expected = false;
+            return "EFF edits preserved; live application refused for shared or unverified costume ownership.".into();
+        }
         let entry = self.eff_mods.get(&fighter);
         let known = entry.is_some();
         let (edits, transplants) = entry
@@ -31397,15 +31277,14 @@ If you step every basis for a                          type and NONE of them mat
                 .collect();
             let bone_rev = self.bone_reverse_map();
             let eff_rev = self.effect_reverse_map();
-            let fighter_kind = self.current_fighter_kind();
-            let mut motions: Vec<u64> = self
-                .game_link
-                .all_captures()
-                .into_iter()
+            let captures = self.scoped_capture_target()
+                .filter(|(kind, _)| Some(*kind) == fighter_kind_id(fighter))
+                .map(|(kind, costume)| self.game_link.all_captures_for_costume(kind, costume))
+                .unwrap_or_default();
+            let mut motions: Vec<u64> = captures.into_iter()
                 .filter(|(_, l)| {
-                    fighter_kind.is_none_or(|kind| l.kind == kind)
-                        // Status feedback is not a use of the donor the editor can redirect.
-                        && !l.common
+                    // Status feedback is not a use of the donor the editor can redirect.
+                    !l.common
                         && effect_capture_layout(&l.func).is_some()
                         && l.args.first().and_then(|a| a.as_hash()) == Some(donor_hash)
                 })
@@ -31815,13 +31694,7 @@ If you step every basis for a                          type and NONE of them mat
             }
         }
         // Flush the union of all moves' rules so cross-move redirects apply live at once.
-        let all: Vec<crate::game_link::SpawnRuleWire> = self
-            .effect_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        self.game_link.send_spawn_rules(&all);
+        self.send_live_spawn_rules();
         // Live parity: the copy doesn't exist in the running game yet, but the plugin
         // aliases its hash to the donor's, so redirected spawns show in-game NOW and
         // match the export (a fresh copy is content-identical to its donor).
@@ -32730,20 +32603,8 @@ If you step every basis for a                          type and NONE of them mat
             self.effect_control_rules_store
                 .insert(mv_key, control_rules);
         }
-        let all: Vec<crate::game_link::SpawnRuleWire> = self
-            .effect_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        self.game_link.send_spawn_rules(&all);
-        let all_controls: Vec<crate::game_link::EffectControlRuleWire> = self
-            .effect_control_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        self.game_link.send_effect_control_rules(&all_controls);
+        self.send_live_spawn_rules();
+        self.send_live_effect_control_rules();
         if unsupported_flip_axis {
             self.state.status =
                 "This flip-axis/control token is preserved for source/export, but live preview \
@@ -35886,6 +35747,7 @@ impl eframe::App for VisionaryApp {
         // Which moves each added character has replaced, read from the edit log so the roster
         // panel does not need its own copy of it.
         self.roster.authored_moves = self.roster.replaced_moves(&self.state.edit_log);
+        let cancel_roster_before = self.roster.project.authored.clone();
         self.roster.show(
             &ctx,
             &self.state.fighters,
@@ -35911,6 +35773,17 @@ impl eframe::App for VisionaryApp {
             self.extra_roots = self.roster.enabled_roots();
             save_mod_roots(&self.extra_roots);
             self.reindex_fighters();
+        } else if self.roster.project.authored != cancel_roster_before {
+            // Keep the old identity if the roster changed underneath the active bank.
+            if let Some(index) = self.state.selected_fighter {
+                let slot = self.selected_costume_slot;
+                let fighter = self.state.fighters.get(index).map(|entry| entry.name.clone());
+                if fighter.as_deref().and_then(|name| self.acmd_binding_for_slot(name, slot)) != self.active_acmd_binding {
+                    self.select_fighter_slot(index, slot);
+                }
+            }
+            self.publish_live_rule_union();
+            self.push_effect_aliases();
         }
         self.perf.end("eff_editor", t);
         for removal in self.eff_editor.take_transplant_removals() {
@@ -36159,39 +36032,14 @@ impl eframe::App for VisionaryApp {
         if client != self.pin_sync_client {
             self.pin_sync_client = client;
             self.pin_sync_prompt = None;
-            self.pin_sync_wait = client.map(|_| std::time::Instant::now());
+            self.pin_sync_wait = if crate::game_link::LEGACY_GLOBAL_EFFECTS_ENABLED {
+                client.map(|_| std::time::Instant::now())
+            } else { None };
             if client.is_some() {
                 // Re-push the authoritative live state after every fresh plugin connection.
                 // This also restores state when the game restarted between socket sessions.
-                let spawn: Vec<crate::game_link::SpawnRuleWire> = self
-                    .effect_rules_store
-                    .values()
-                    .flatten()
-                    .cloned()
-                    .collect();
-                if !spawn.is_empty() {
-                    self.game_link.send_spawn_rules(&spawn);
-                }
-                let controls: Vec<crate::game_link::EffectControlRuleWire> = self
-                    .effect_control_rules_store
-                    .values()
-                    .flatten()
-                    .cloned()
-                    .collect();
-                if !controls.is_empty() {
-                    self.game_link.send_effect_control_rules(&controls);
-                }
-                let hit: Vec<crate::game_link::HitboxRuleWire> = self
-                    .hitbox_rules_store
-                    .values()
-                    .flatten()
-                    .cloned()
-                    .collect();
-                if !hit.is_empty() {
-                    self.game_link.send_hitbox_rules(&hit);
-                }
+                self.publish_live_rule_union();
                 self.push_effect_aliases();
-                self.publish_cancel_rules();
                 self.game_link.send_trait_rules(&self.live_trait_rules());
                 self.live_overrides.resend_tweaks(&self.game_link);
             }
@@ -39157,8 +39005,9 @@ struct RedirectPrompt {
 /// until the move has actually finished.
 struct PendingCapture {
     motion: u64,
-    /// Fighter kind the capture is filtered to (None = unknown fighter).
-    kind: Option<i32>,
+    /// Exact engine fighter and costume of the captured playback.
+    kind: i32,
+    costume: u8,
     /// Exact claimed playback. Only its matching end marker can complete this snapshot.
     run: u32,
     /// Lines held for this motion at the last observed growth.
@@ -40374,6 +40223,7 @@ mod live_effect_capture_tests {
             args.extend([A::Bool(true), A::Int(1)]);
         }
         CaptureLine {
+            costume: None,
             kind: 6,
             motion: hash40::hash40("attack_air_n").0,
             frame,
@@ -40410,6 +40260,7 @@ mod live_effect_capture_tests {
             A::Int(0), // attack region
         ];
         let captures = vec![CaptureLine {
+            costume: None,
             kind: 6,
             motion: hash40::hash40("throw_f").0,
             frame: 4.0,
@@ -40487,6 +40338,7 @@ mod live_effect_capture_tests {
             A::Int(12),
         ];
         let captures = vec![CaptureLine {
+            costume: None,
             kind: 6,
             motion: hash40::hash40("attack_air_n").0,
             frame: 4.0,
@@ -40514,6 +40366,7 @@ mod live_effect_capture_tests {
 
     fn expression_capture(func: &str, frame: f32, args: Vec<A>) -> CaptureLine {
         CaptureLine {
+            costume: None,
             kind: 6,
             motion: hash40::hash40("throw_hi").0,
             frame,
@@ -40826,6 +40679,7 @@ mod live_effect_capture_tests {
 
     fn sound_capture(func: &str, frame: f32, args: Vec<A>) -> CaptureLine {
         CaptureLine {
+            costume: None,
             kind: 6,
             motion: hash40::hash40("attack_air_n").0,
             frame,
@@ -41851,6 +41705,7 @@ mod live_effect_capture_tests {
     fn a_captured_hurtbox_line_comes_back_as_an_editable_statement() {
         let bone = hash40::hash40("kneer").0;
         let line = |func: &str, frame: f32, args: Vec<A>| CaptureLine {
+            costume: None,
             kind: 6,
             motion: hash40::hash40("special_air_hi").0,
             frame,
@@ -41900,6 +41755,7 @@ mod live_effect_capture_tests {
     #[test]
     fn a_captured_damage_reaction_line_comes_back_as_an_editable_condition() {
         let line = |frame: f32, mode: i64, value: f32| CaptureLine {
+            costume: None,
             kind: 6,
             motion: hash40::hash40("attack_n").0,
             frame,
@@ -41940,6 +41796,7 @@ mod live_effect_capture_tests {
     fn a_captured_whole_body_status_is_read_from_the_slot_its_own_macro_uses() {
         let bone = hash40::hash40("kneer").0;
         let line = |func: &str, frame: f32, args: Vec<A>| CaptureLine {
+            costume: None,
             kind: 6,
             motion: hash40::hash40("final_start").0,
             frame,
@@ -42097,6 +41954,7 @@ mod live_effect_capture_tests {
     fn a_captured_attack_modifier_keeps_its_id_and_value_apart() {
         let bone = hash40::hash40("kneer").0;
         let line = |func: &str, frame: f32, args: Vec<A>| CaptureLine {
+            costume: None,
             kind: 6,
             motion: hash40::hash40("attack_lw4").0,
             frame,
@@ -42142,6 +42000,7 @@ mod live_effect_capture_tests {
         use crate::game_link::LuaArgWire as A;
         let bone = hash40::hash40("haver").0;
         let line = |func: &str, frame: f32, args: Vec<A>| crate::game_link::CaptureLine {
+            costume: None,
             kind: 0,
             motion: hash40::hash40("special_s").0,
             frame,
@@ -42182,6 +42041,7 @@ mod live_effect_capture_tests {
     fn a_captured_col_normal_that_closes_a_priority_span_is_kept_on_both_sides() {
         use crate::game_link::LuaArgWire as A;
         let line = |func: &str, frame: f32, args: Vec<A>| crate::game_link::CaptureLine {
+            costume: None,
             kind: 0,
             motion: hash40::hash40("special_hi").0,
             frame,
@@ -42220,6 +42080,7 @@ mod live_effect_capture_tests {
     #[test]
     fn a_captured_bone_with_no_known_name_is_preserved_as_a_raw_hash() {
         let captures = vec![CaptureLine {
+            costume: None,
             kind: 6,
             motion: hash40::hash40("special_air_hi").0,
             frame: 9.0,
@@ -42255,6 +42116,7 @@ mod live_effect_capture_tests {
     fn a_captured_motion_rate_lands_as_a_bare_top_level_statement() {
         let captures = vec![
             CaptureLine {
+                costume: None,
                 kind: 6,
                 motion: hash40::hash40("attack_lw4").0,
                 frame: 0.0,
@@ -42264,6 +42126,7 @@ mod live_effect_capture_tests {
                 common: false,
             },
             CaptureLine {
+                costume: None,
                 kind: 6,
                 motion: hash40::hash40("attack_lw4").0,
                 frame: 15.0,
@@ -42298,6 +42161,7 @@ mod live_effect_capture_tests {
     fn a_captured_reverse_lr_becomes_an_editable_script_point_in_the_same_frame_space() {
         let captures = vec![
             CaptureLine {
+                costume: None,
                 kind: 6,
                 motion: hash40::hash40("throw_f").0,
                 frame: 0.0,
@@ -42307,6 +42171,7 @@ mod live_effect_capture_tests {
                 common: false,
             },
             CaptureLine {
+                costume: None,
                 kind: 6,
                 motion: hash40::hash40("throw_f").0,
                 frame: 4.0,
@@ -42335,6 +42200,7 @@ mod live_effect_capture_tests {
     #[test]
     fn a_captured_set_speed_ex_becomes_an_editable_game_statement() {
         let captures = vec![CaptureLine {
+            costume: None,
             kind: 6,
             motion: hash40::hash40("attack_air_lw").0,
             frame: 3.0,
@@ -42357,6 +42223,7 @@ mod live_effect_capture_tests {
     #[test]
     fn a_captured_set_speed_becomes_an_editable_game_statement() {
         let captures = vec![CaptureLine {
+            costume: None,
             kind: 6,
             motion: hash40::hash40("attack_air_lw").0,
             frame: 3.0,
@@ -42380,6 +42247,7 @@ mod live_effect_capture_tests {
         let motion = hash40::hash40("attack_air_lw").0;
         let captures = vec![
             CaptureLine {
+                costume: None,
                 kind: 6,
                 motion,
                 frame: 3.0,
@@ -42389,6 +42257,7 @@ mod live_effect_capture_tests {
                 common: false,
             },
             CaptureLine {
+                costume: None,
                 kind: 6,
                 motion,
                 frame: 3.0,
@@ -42416,6 +42285,7 @@ mod live_effect_capture_tests {
     fn a_captured_ft_catch_stop_becomes_an_editable_game_statement() {
         let motion = hash40::hash40("throw_f").0;
         let captures = vec![CaptureLine {
+            costume: None,
             kind: 6,
             motion,
             frame: 5.0,
@@ -42444,6 +42314,7 @@ mod live_effect_capture_tests {
     fn ft_catch_stop_live_rules_key_the_pristine_numeric_pair() {
         let motion = hash40::hash40("throw_f").0;
         let captures = vec![CaptureLine {
+            costume: None,
             kind: 6,
             motion,
             frame: 5.0,
@@ -42487,6 +42358,7 @@ mod live_effect_capture_tests {
     fn a_captured_ft_start_adjust_motion_frame_becomes_an_editable_bare_statement() {
         let motion = hash40::hash40("attack_air_n").0;
         let captures = vec![CaptureLine {
+            costume: None,
             kind: 6,
             motion,
             frame: 16.0,
@@ -42516,6 +42388,7 @@ mod live_effect_capture_tests {
     fn ft_start_adjust_motion_frame_live_rules_key_the_pristine_numeric_value() {
         let motion = hash40::hash40("attack_air_n").0;
         let captures = vec![CaptureLine {
+            costume: None,
             kind: 6,
             motion,
             frame: 16.0,
@@ -42568,6 +42441,7 @@ mod live_effect_capture_tests {
     fn a_captured_motion_module_set_rate_becomes_an_editable_game_statement() {
         let motion = hash40::hash40("attack_air_n").0;
         let captures = vec![CaptureLine {
+            costume: None,
             kind: 6,
             motion,
             frame: 5.0,
@@ -42593,6 +42467,7 @@ mod live_effect_capture_tests {
     fn motion_module_set_rate_live_rules_key_the_pristine_numeric_rate() {
         let motion = hash40::hash40("attack_air_n").0;
         let captures = vec![CaptureLine {
+            costume: None,
             kind: 6,
             motion,
             frame: 5.0,
@@ -42650,6 +42525,7 @@ mod live_effect_capture_tests {
     fn a_captured_motion_module_set_helper_calculation_becomes_an_editable_game_statement() {
         let motion = hash40::hash40("attack_air_n").0;
         let captures = vec![CaptureLine {
+            costume: None,
             kind: 6,
             motion,
             frame: 5.0,
@@ -42677,6 +42553,7 @@ mod live_effect_capture_tests {
     fn motion_module_set_helper_calculation_live_rules_key_the_pristine_boolean() {
         let motion = hash40::hash40("attack_air_n").0;
         let captures = vec![CaptureLine {
+            costume: None,
             kind: 6,
             motion,
             frame: 5.0,
@@ -42729,6 +42606,7 @@ mod live_effect_capture_tests {
         // A capture from the same hook with the wrong value type must not invent a boolean
         // identity for the live matcher.
         let malformed_capture = vec![CaptureLine {
+            costume: None,
             args: vec![A::Int(0)],
             ..captures[0].clone()
         }];
@@ -42746,6 +42624,7 @@ mod live_effect_capture_tests {
     fn a_captured_motion_module_set_rate_partial_becomes_an_editable_game_statement() {
         let motion = hash40::hash40("attack_air_n").0;
         let captures = vec![CaptureLine {
+            costume: None,
             kind: 6,
             motion,
             frame: 5.0,
@@ -42774,6 +42653,7 @@ mod live_effect_capture_tests {
     fn motion_module_set_rate_partial_live_rules_key_the_pristine_part_and_rate() {
         let motion = hash40::hash40("attack_air_n").0;
         let captures = vec![CaptureLine {
+            costume: None,
             kind: 6,
             motion,
             frame: 5.0,
@@ -42829,6 +42709,7 @@ mod live_effect_capture_tests {
         );
 
         let malformed_capture = vec![CaptureLine {
+            costume: None,
             args: vec![A::Bool(true), A::Num(0.8)],
             ..captures[0].clone()
         }];
@@ -42848,6 +42729,7 @@ mod live_effect_capture_tests {
     fn a_captured_motion_module_set_frame_partial_becomes_an_editable_game_statement() {
         let motion = hash40::hash40("attack_air_n").0;
         let captures = vec![CaptureLine {
+            costume: None,
             kind: 6,
             motion,
             frame: 5.0,
@@ -42878,6 +42760,7 @@ mod live_effect_capture_tests {
     fn motion_module_set_frame_partial_live_rules_key_the_pristine_part_and_seek() {
         let motion = hash40::hash40("appeal_lw_l").0;
         let captures = vec![CaptureLine {
+            costume: None,
             kind: 9,
             motion,
             frame: 7.0,
@@ -42958,6 +42841,7 @@ mod live_effect_capture_tests {
         );
 
         let malformed_capture = vec![CaptureLine {
+            costume: None,
             args: vec![A::Int(5), A::Num(2.0), A::Int(1)],
             ..captures[0].clone()
         }];
@@ -43017,6 +42901,7 @@ mod live_effect_capture_tests {
         let mut expression_shown = expression_pristine.clone();
         expression_shown[0].call.rate = 0.5;
         let capture = CaptureLine {
+            costume: None,
             kind: 9,
             motion,
             frame: 7.0,
@@ -43057,6 +42942,7 @@ mod live_effect_capture_tests {
         let distinct_same_frame = vec![
             capture.clone(),
             CaptureLine {
+                costume: None,
                 args: vec![A::Int(1), A::Num(0.8)],
                 ..capture.clone()
             },
@@ -43127,6 +43013,7 @@ mod live_effect_capture_tests {
         let motion = hash40::hash40("attack_air_n").0;
         let captures = vec![
             CaptureLine {
+                costume: None,
                 kind: 6,
                 motion,
                 frame: 3.0,
@@ -43136,6 +43023,7 @@ mod live_effect_capture_tests {
                 common: false,
             },
             CaptureLine {
+                costume: None,
                 kind: 6,
                 motion,
                 frame: 3.0,
@@ -43172,6 +43060,7 @@ mod live_effect_capture_tests {
     fn clr_speed_live_rules_key_the_pristine_numeric_kinetic_value() {
         let motion = hash40::hash40("attack_air_n").0;
         let captures = vec![CaptureLine {
+            costume: None,
             kind: 6,
             motion,
             frame: 3.0,
@@ -43217,6 +43106,7 @@ mod live_effect_capture_tests {
     fn captured_change_kinetic_becomes_an_editable_game_statement() {
         let motion = hash40::hash40("escape_air").0;
         let captures = vec![CaptureLine {
+            costume: None,
             kind: 6,
             motion,
             frame: 18.0,
@@ -43244,6 +43134,7 @@ mod live_effect_capture_tests {
     fn change_kinetic_live_rules_key_the_pristine_numeric_type() {
         let motion = hash40::hash40("escape_air").0;
         let captures = vec![CaptureLine {
+            costume: None,
             kind: 6,
             motion,
             frame: 18.0,
@@ -43294,6 +43185,7 @@ mod live_effect_capture_tests {
         let motion = hash40::hash40("attack_air_lw").0;
         let captures = vec![
             CaptureLine {
+                costume: None,
                 kind: 6,
                 motion,
                 frame: 0.0,
@@ -43303,6 +43195,7 @@ mod live_effect_capture_tests {
                 common: false,
             },
             CaptureLine {
+                costume: None,
                 kind: 6,
                 motion,
                 frame: 8.0,
@@ -43336,6 +43229,7 @@ mod live_effect_capture_tests {
         let motion = hash40::hash40("special_hi").0;
         let captures = vec![
             CaptureLine {
+                costume: None,
                 kind: 6,
                 motion,
                 frame: 2.0,
@@ -43345,6 +43239,7 @@ mod live_effect_capture_tests {
                 common: false,
             },
             CaptureLine {
+                costume: None,
                 kind: 6,
                 motion,
                 frame: 6.0,
@@ -43378,6 +43273,7 @@ mod live_effect_capture_tests {
     fn kinetic_energy_live_rules_key_the_operation_and_numeric_energy_id() {
         let motion = hash40::hash40("attack_air_lw").0;
         let captures = vec![CaptureLine {
+            costume: None,
             kind: 6,
             motion,
             frame: 0.0,
@@ -43426,6 +43322,7 @@ mod live_effect_capture_tests {
         let motion = hash40::hash40("special_hi").0;
         let captures = vec![
             CaptureLine {
+                costume: None,
                 kind: 6,
                 motion,
                 frame: 2.0,
@@ -43435,6 +43332,7 @@ mod live_effect_capture_tests {
                 common: false,
             },
             CaptureLine {
+                costume: None,
                 kind: 6,
                 motion,
                 frame: 6.0,
@@ -43513,6 +43411,7 @@ mod live_effect_capture_tests {
     fn captured_kinetic_add_speed_becomes_an_editable_zero_z_vector() {
         let motion = hash40::hash40("escape_air").0;
         let captures = vec![CaptureLine {
+            costume: None,
             kind: 6,
             motion,
             frame: 0.0,
@@ -43543,6 +43442,7 @@ mod live_effect_capture_tests {
     fn kinetic_add_speed_live_rules_key_the_pristine_three_component_vector() {
         let motion = hash40::hash40("escape_air").0;
         let captures = vec![CaptureLine {
+            costume: None,
             kind: 6,
             motion,
             frame: 0.0,
@@ -43583,6 +43483,7 @@ mod live_effect_capture_tests {
     fn captured_kinetic_clear_speed_all_becomes_an_editable_structural_point() {
         let motion = hash40::hash40("escape_air").0;
         let captures = vec![CaptureLine {
+            costume: None,
             kind: 6,
             motion,
             frame: 3.0,
@@ -43605,6 +43506,7 @@ mod live_effect_capture_tests {
         let motion = hash40::hash40("attack_air_n").0;
         let captures = vec![
             CaptureLine {
+                costume: None,
                 kind: 6,
                 motion,
                 frame: 0.0,
@@ -43614,6 +43516,7 @@ mod live_effect_capture_tests {
                 common: false,
             },
             CaptureLine {
+                costume: None,
                 kind: 6,
                 motion,
                 frame: 3.0,
@@ -43682,6 +43585,7 @@ mod live_effect_capture_tests {
         let bone = hash40::hash40("kneer").0;
         let captures = vec![
             CaptureLine {
+                costume: None,
                 kind: 6,
                 motion: hash40::hash40("special_air_hi").0,
                 frame: 4.0,
@@ -43691,6 +43595,7 @@ mod live_effect_capture_tests {
                 common: false,
             },
             CaptureLine {
+                costume: None,
                 kind: 6,
                 motion: hash40::hash40("special_air_hi").0,
                 frame: 4.0,
@@ -43727,6 +43632,7 @@ mod live_effect_capture_tests {
         let bone = hash40::hash40("kneer").0;
         let captures = vec![
             CaptureLine {
+                costume: None,
                 kind: 6,
                 motion: hash40::hash40("special_air_hi").0,
                 frame: 4.0,
@@ -43736,6 +43642,7 @@ mod live_effect_capture_tests {
                 common: false,
             },
             CaptureLine {
+                costume: None,
                 kind: 6,
                 motion: hash40::hash40("special_air_hi").0,
                 frame: 4.0,
@@ -43745,6 +43652,7 @@ mod live_effect_capture_tests {
                 common: false,
             },
             CaptureLine {
+                costume: None,
                 kind: 6,
                 motion: hash40::hash40("special_air_hi").0,
                 frame: 4.0,
@@ -43754,6 +43662,7 @@ mod live_effect_capture_tests {
                 common: false,
             },
             CaptureLine {
+                costume: None,
                 kind: 6,
                 motion: hash40::hash40("special_air_hi").0,
                 frame: 4.0,
@@ -43763,6 +43672,7 @@ mod live_effect_capture_tests {
                 common: false,
             },
             CaptureLine {
+                costume: None,
                 kind: 6,
                 motion: hash40::hash40("special_air_hi").0,
                 frame: 4.0,
@@ -43772,6 +43682,7 @@ mod live_effect_capture_tests {
                 common: false,
             },
             CaptureLine {
+                costume: None,
                 kind: 6,
                 motion: hash40::hash40("special_air_hi").0,
                 frame: 4.0,
@@ -43817,6 +43728,7 @@ mod live_effect_capture_tests {
 
     fn color_line(func: &str, frame: f32, common: bool) -> CaptureLine {
         CaptureLine {
+            costume: None,
             kind: 6,
             motion: hash40::hash40("attack_air_n").0,
             frame,
@@ -43840,6 +43752,7 @@ mod live_effect_capture_tests {
         let bones = HashMap::from([(hash40::hash40("top").0, "top".to_string())]);
         let effects = HashMap::from([(effect, "sys_attack_line".to_string())]);
         let rate = CaptureLine {
+            costume: None,
             func: "LAST_EFFECT_SET_RATE".into(),
             args: vec![A::Num(0.5)],
             ..color_line("LAST_EFFECT_SET_RATE", 4.0, false)
@@ -43873,6 +43786,7 @@ mod live_effect_capture_tests {
         let bones = HashMap::from([(hash40::hash40("top").0, "top".to_string())]);
         let effects = HashMap::from([(effect, "sys_attack_line".to_string())]);
         let rate = CaptureLine {
+            costume: None,
             func: "LAST_EFFECT_SET_RATE".into(),
             args: vec![A::Num(0.5)],
             ..color_line("LAST_EFFECT_SET_RATE", 4.0, false)
@@ -43932,6 +43846,7 @@ mod live_effect_capture_tests {
         // Paired positive: the same donor attributed to the fighter's own script IS borrowed,
         // so the assertion above depends on the tag and not on the tail happening to match.
         let fighter_donor = CaptureLine {
+            costume: None,
             common: false,
             ..donor
         };
@@ -44240,6 +44155,7 @@ mod live_effect_capture_tests {
         let captures = vec![
             spawn("EFFECT_FOLLOW", 4.0, effect),
             CaptureLine {
+                costume: None,
                 kind: 6,
                 motion: hash40::hash40("attack_air_n").0,
                 frame: 10.0,
@@ -44265,6 +44181,7 @@ mod live_effect_capture_tests {
     fn work_module_flag_live_rules_key_the_pristine_numeric_flag_and_operation() {
         let motion = hash40::hash40("attack_air_n").0;
         let captures = vec![CaptureLine {
+            costume: None,
             kind: 6,
             motion,
             frame: 0.0,
@@ -44314,6 +44231,7 @@ mod live_effect_capture_tests {
         let motion = hash40::hash40("attack_air_n").0;
         let captures = vec![
             CaptureLine {
+                costume: None,
                 kind: 6,
                 motion,
                 frame: 0.0,
@@ -44323,6 +44241,7 @@ mod live_effect_capture_tests {
                 common: false,
             },
             CaptureLine {
+                costume: None,
                 kind: 6,
                 motion,
                 frame: 3.0,
@@ -44332,6 +44251,7 @@ mod live_effect_capture_tests {
                 common: false,
             },
             CaptureLine {
+                costume: None,
                 kind: 6,
                 motion,
                 frame: 6.0,
@@ -44341,6 +44261,7 @@ mod live_effect_capture_tests {
                 common: false,
             },
             CaptureLine {
+                costume: None,
                 kind: 6,
                 motion,
                 frame: 9.0,
@@ -44401,6 +44322,7 @@ mod live_effect_capture_tests {
     fn work_module_transition_term_live_rules_key_the_pristine_numeric_term_and_operation() {
         let motion = hash40::hash40("attack_air_n").0;
         let captures = vec![CaptureLine {
+            costume: None,
             kind: 6,
             motion,
             frame: 0.0,
@@ -44455,6 +44377,7 @@ mod live_effect_capture_tests {
     fn work_module_transition_term_group_live_rules_keep_exact_operation_identity() {
         let motion = hash40::hash40("attack_air_n").0;
         let captures = vec![CaptureLine {
+            costume: None,
             kind: 6,
             motion,
             frame: 0.0,
@@ -44503,6 +44426,7 @@ mod live_effect_capture_tests {
     fn captured_work_module_inc_int_becomes_an_editable_game_statement_and_live_rule() {
         let motion = hash40::hash40("attack_air_n").0;
         let captures = vec![CaptureLine {
+            costume: None,
             kind: 6,
             motion,
             frame: 0.0,
@@ -44553,6 +44477,7 @@ mod live_effect_capture_tests {
         let motion = hash40::hash40("item_grass_pull").0;
         let captures = vec![
             CaptureLine {
+                costume: None,
                 kind: 6,
                 motion,
                 frame: 4.0,
@@ -44562,6 +44487,7 @@ mod live_effect_capture_tests {
                 common: false,
             },
             CaptureLine {
+                costume: None,
                 kind: 6,
                 motion,
                 frame: 46.0,
@@ -44571,6 +44497,7 @@ mod live_effect_capture_tests {
                 common: false,
             },
             CaptureLine {
+                costume: None,
                 kind: 6,
                 motion,
                 frame: 69.0,
@@ -44708,6 +44635,7 @@ mod live_effect_capture_tests {
     fn captured_ground_friction_becomes_an_editable_point_and_live_override() {
         let motion = hash40::hash40("escape_air").0;
         let captures = vec![CaptureLine {
+            costume: None,
             kind: 6,
             motion,
             frame: 3.0,
@@ -44752,6 +44680,7 @@ mod live_effect_capture_tests {
         let motion = hash40::hash40("attack_air_n").0;
         let captures = vec![
             CaptureLine {
+                costume: None,
                 kind: 6,
                 motion,
                 frame: 3.0,
@@ -44761,6 +44690,7 @@ mod live_effect_capture_tests {
                 common: false,
             },
             CaptureLine {
+                costume: None,
                 kind: 6,
                 motion,
                 frame: 7.0,
@@ -44817,6 +44747,7 @@ mod live_effect_capture_tests {
         let motion = hash40::hash40("attack_air_n").0;
         let captures = vec![
             CaptureLine {
+                costume: None,
                 kind: 6,
                 motion,
                 frame: 3.0,
@@ -44826,6 +44757,7 @@ mod live_effect_capture_tests {
                 common: false,
             },
             CaptureLine {
+                costume: None,
                 kind: 6,
                 motion,
                 frame: 7.0,
@@ -44896,6 +44828,7 @@ mod live_effect_capture_tests {
     #[test]
     fn set_speed_ex_live_rules_key_numeric_kinetic_kind_and_reject_ambiguous_fallback() {
         let captures = vec![CaptureLine {
+            costume: None,
             kind: 6,
             motion: hash40::hash40("attack_air_lw").0,
             frame: 3.0,
@@ -44938,6 +44871,7 @@ mod live_effect_capture_tests {
     fn set_speed_live_rules_use_a_unique_frame_key_and_reject_same_frame_pairs() {
         let motion = hash40::hash40("attack_air_lw").0;
         let captures = vec![CaptureLine {
+            costume: None,
             kind: 6,
             motion,
             frame: 3.0,
@@ -44981,6 +44915,7 @@ mod live_effect_capture_tests {
         let motion = hash40::hash40("attack_air_lw").0;
         let captures = vec![
             CaptureLine {
+                costume: None,
                 kind: 6,
                 motion,
                 frame: 3.0,
@@ -44990,6 +44925,7 @@ mod live_effect_capture_tests {
                 common: false,
             },
             CaptureLine {
+                costume: None,
                 kind: 6,
                 motion,
                 frame: 3.0,
@@ -45060,6 +44996,7 @@ mod live_effect_capture_tests {
         ]);
         args.extend(std::iter::repeat_n(A::Nil, 24));
         CaptureLine {
+            costume: None,
             kind: 6,
             motion: hash40::hash40("attack_air_n").0,
             frame,
@@ -45072,6 +45009,7 @@ mod live_effect_capture_tests {
 
     fn clear_capture(frame: f32) -> CaptureLine {
         CaptureLine {
+            costume: None,
             kind: 6,
             motion: hash40::hash40("attack_air_n").0,
             frame,
@@ -45084,6 +45022,7 @@ mod live_effect_capture_tests {
 
     fn wind_capture(command: &str, frame: f32, args: &[f32]) -> CaptureLine {
         CaptureLine {
+            costume: None,
             kind: 6,
             motion: hash40::hash40("attack_air_n").0,
             frame,
@@ -45096,6 +45035,7 @@ mod live_effect_capture_tests {
 
     fn erase_wind_capture(id: i64, frame: f32) -> CaptureLine {
         CaptureLine {
+            costume: None,
             kind: 6,
             motion: hash40::hash40("attack_air_n").0,
             frame,
@@ -45323,6 +45263,7 @@ mod live_effect_capture_tests {
         let line = hash40::hash40("sys_attack_line").0;
         let null = hash40::hash40("null").0;
         let rate = |frame: f32, value: f32| CaptureLine {
+            costume: None,
             kind: 6,
             motion: hash40::hash40("attack_air_n").0,
             frame,
@@ -45366,6 +45307,7 @@ mod live_effect_capture_tests {
     fn a_captured_work_id_binds_as_a_runtime_value_to_the_spawn_above_it() {
         let smoke = hash40::hash40("sys_atk_smoke").0;
         let work = CaptureLine {
+            costume: None,
             kind: 6,
             motion: hash40::hash40("attack_air_n").0,
             frame: 5.0,
@@ -45388,6 +45330,7 @@ mod live_effect_capture_tests {
         let smoke = hash40::hash40("sys_atk_smoke").0;
         let line = hash40::hash40("sys_attack_line").0;
         let offset = |frame: f32, value: f32| CaptureLine {
+            costume: None,
             kind: 6,
             motion: hash40::hash40("attack_air_n").0,
             frame,
@@ -45421,6 +45364,7 @@ mod live_effect_capture_tests {
     fn a_captured_particle_tint_binds_to_the_spawn_above_it() {
         let smoke = hash40::hash40("sys_atk_smoke").0;
         let particle = CaptureLine {
+            costume: None,
             kind: 6,
             motion: hash40::hash40("attack_air_n").0,
             frame: 5.0,
@@ -45442,6 +45386,7 @@ mod live_effect_capture_tests {
     fn a_captured_dynamic_scale_w_preserves_the_native_arity() {
         let smoke = hash40::hash40("sys_atk_smoke").0;
         let scale_w = CaptureLine {
+            costume: None,
             kind: 6,
             motion: hash40::hash40("attack_air_n").0,
             frame: 5.0,
@@ -45465,6 +45410,7 @@ mod live_effect_capture_tests {
     fn captured_colour_commands_come_back_and_do_not_anchor_a_rate() {
         let dash = hash40::hash40("kirby_dash").0;
         let color = |frame: f32, func: &str, args: Vec<A>| CaptureLine {
+            costume: None,
             kind: 6,
             motion: hash40::hash40("attack_dash").0,
             frame,
@@ -45629,6 +45575,7 @@ mod live_effect_capture_tests {
         let motion = hash40::hash40("special_hi2").0;
         let captures = vec![
             CaptureLine {
+                costume: None,
                 kind: 6,
                 motion,
                 frame: 4.0,
@@ -45638,6 +45585,7 @@ mod live_effect_capture_tests {
                 common: false,
             },
             CaptureLine {
+                costume: None,
                 kind: 6,
                 motion,
                 frame: 7.0,
@@ -45647,6 +45595,7 @@ mod live_effect_capture_tests {
                 common: false,
             },
             CaptureLine {
+                costume: None,
                 kind: 6,
                 motion,
                 frame: 15.0,
@@ -45708,6 +45657,7 @@ mod live_effect_capture_tests {
             spawn("EFFECT_FOLLOW_ALPHA", 5.0, effect),
         ];
         captures.push(CaptureLine {
+            costume: None,
             kind: 6,
             motion: hash40::hash40("attack_air_n").0,
             frame: 20.0,
@@ -46791,6 +46741,7 @@ mod live_effect_capture_tests {
     #[test]
     fn attack_injection_requires_the_complete_argument_vector() {
         let donor = CaptureLine {
+            costume: None,
             kind: 6,
             motion: 1,
             frame: 1.0,
@@ -46805,6 +46756,7 @@ mod live_effect_capture_tests {
     #[test]
     fn attack_fp_injection_keeps_the_donor_tail_and_uses_fp_slots() {
         let donor = CaptureLine {
+            costume: None,
             kind: 6,
             motion: 1,
             frame: 1.0,
@@ -47477,6 +47429,7 @@ mod live_effect_capture_tests {
     #[test]
     fn attack_injection_writes_every_property_over_sentinel_slots() {
         let donor = CaptureLine {
+            costume: None,
             kind: 6,
             motion: 1,
             frame: 1.0,
@@ -47838,6 +47791,7 @@ mod effect_control_rule_tests {
 
     fn capture(func: &str, frame: f32, args: Vec<A>) -> CaptureLine {
         CaptureLine {
+            costume: None,
             kind: 0,
             motion: 0,
             frame,
@@ -48053,6 +48007,7 @@ mod donor_capture_tests {
 
     fn capture(func: &str) -> crate::game_link::CaptureLine {
         crate::game_link::CaptureLine {
+            costume: None,
             kind: 0,
             motion: hash40::hash40("attack_air_n").0,
             frame: 3.0,

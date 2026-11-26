@@ -219,6 +219,9 @@ pub fn enforce_pinned() {
 }
 
 pub fn apply_rpm_edit(edit: &ParsedEdit) -> bool {
+    if !crate::slight::rule_scope::LEGACY_GLOBAL_EFFECTS_ENABLED {
+        return false;
+    }
     let (handle, mod_addr, mut data, boid, fighter_label, synthetic);
     {
         let tracker = super::tracker::EFFECT_TRACKER.lock();
