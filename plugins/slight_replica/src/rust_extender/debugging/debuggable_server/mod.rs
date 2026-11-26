@@ -400,11 +400,14 @@ fn parse_tcp_payload(raw: &str) -> Option<ParsedEdit> {
         return None;
     }
 
-    // Experimental fighter hurtbox geometry. Socket thread stages data only.
-    if let Some(value) = v.get("hurtbox_geometry_rules") {
-        match serde_json::from_value::<Vec<crate::slight::hurtbox_geometry::GeometryRule>>(value.clone()) {
+    // Scoped hurtboxes: legacy snapshots are clear-only, never fighter-wide edits.
+    if let Some(rules_v) = crate::slight::rule_scope::acmd_snapshot(&v, "hurtbox_geometry_rules") {
+        match serde_json::from_value::<Vec<crate::slight::hurtbox_geometry::GeometryRule>>(rules_v) {
             Ok(rules) => crate::slight::hurtbox_geometry::set_rules(rules),
-            Err(error) => crate::slight::diag::note(format!("hurtbox geometry parse error: {error}")),
+            Err(error) => {
+                crate::slight::hurtbox_geometry::set_rules(Vec::new());
+                crate::slight::diag::note(format!("hurtbox geometry parse error: {error}"));
+            }
         }
         return None;
     }
