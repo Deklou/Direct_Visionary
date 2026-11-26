@@ -75,7 +75,7 @@ mod tests {
 
     #[test]
     fn scoped_acmd_receiver_never_accepts_legacy_or_invalid_owners() {
-        for family in ["hitbox_rules", "spawn_rules", "effect_control_rules", "effect_aliases"] {
+        for family in ["hitbox_rules", "spawn_rules", "effect_control_rules", "effect_aliases", "hurtbox_geometry_rules"] {
             let valid = serde_json::json!([{"fighter_kind": 0, "costume_slots": [8, 9]}]);
             let scoped = format!("{family}_scoped");
             assert_eq!(acmd_snapshot(&serde_json::json!({(scoped.clone()): valid.clone()}), family), Some(valid.clone()));
