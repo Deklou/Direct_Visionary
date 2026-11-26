@@ -118,6 +118,7 @@ fn hash_slots(func: &str) -> usize {
 /// build sends. That is the documented wire rule — an old field is ignored and the rest applies
 /// — read in the only direction that is safe here: too broad rather than silently dead.
 fn sound_action(
+    target: super::RuntimeTarget,
     motion: u64,
     hash: u64,
     frame: f32,
@@ -128,7 +129,7 @@ fn sound_action(
         .iter()
         .find(|r| {
             r.inject.is_none()
-                && r.matches(CAT_SOUND, motion, hash, frame)
+                && r.matches(target, CAT_SOUND, motion, hash, frame)
                 && r.func.as_deref().map(|f| f == func).unwrap_or(true)
         })
         .map(|r| (r.suppress, r.overrides.clone()));
@@ -243,9 +244,12 @@ unsafe fn sound_action_for_call(lua_state: u64, func: &'static str, args: &[LuaA
         );
         return false;
     };
+    let Some(target) = super::rule_target(boma) else {
+        return false;
+    };
     let motion = smash::app::lua_bind::MotionModule::motion_kind(boma);
     let frame = smash::app::lua_bind::MotionModule::frame(boma);
-    let Some((suppress, overrides)) = sound_action(motion, key, frame, func) else {
+    let Some((suppress, overrides)) = sound_action(target, motion, key, frame, func) else {
         return false;
     };
     crate::slight::diag::note(format!(

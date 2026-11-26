@@ -293,6 +293,14 @@ impl RosterWindow {
         }
         self.ensure_initialized(&[]);
         self.refresh(fighters, data_root);
+        for (fighter, params) in &self.params {
+            if !super::traits::edits_for(params).is_empty()
+                && (roster.authored.iter().any(|entry| entry.donor.eq_ignore_ascii_case(fighter))
+                    || !super::edit_scope::exclusive_fighter_in_roots(&self.index, fighter, &self.roots, data_root))
+            {
+                anyhow::bail!("{fighter}: fighter-wide trait edits cannot be deployed or exported for a shared or unverified fighter.");
+            }
+        }
         let ui_root = self.ui_root();
         let mut report =
             super::export::export_roster(mod_root, ui_root.as_deref(), &self.index, roster)?;
@@ -346,6 +354,14 @@ impl RosterWindow {
             return Vec::new();
         }
         entry.all_slots()
+    }
+
+    pub fn cancel_edit_target(&self) -> Option<&RosterKey> {
+        self.edit_target.as_ref()
+    }
+
+    pub fn clear_edit_target(&mut self) {
+        self.edit_target = None;
     }
 
     /// The moves each added character has replaced, read out of the edit log.
@@ -601,7 +617,7 @@ impl RosterWindow {
                                 let roots = self.roots.clone();
                                 let labels = std::mem::take(&mut self.labels);
                                 self.traits
-                                    .ui(ui, &roots, &labels, &self.index, &mut self.params);
+                                    .ui(ui, &roots, &labels, &self.index, &mut self.params, data_root);
                                 self.labels = labels;
                             }
                         }
@@ -849,10 +865,9 @@ impl RosterWindow {
             NewCharacterAction::SetEditTarget(target) => {
                 self.status = match &target {
                     Some(key) => format!(
-                        "Moves you edit now belong to {key}. The donor's other costumes keep \
-                         their own version of anything you change."
+                        "ACMD export target: {key}. Live edits are NOT costume-isolated yet."
                     ),
-                    None => "Moves you edit now apply to every costume again.".to_string(),
+                    None => "ACMD edits are unscoped again; check costume ownership before exporting.".to_string(),
                 };
                 self.edit_target = target;
             }

@@ -18,12 +18,14 @@ use crate::data::{EditRecord, EffectCallEdit};
 pub const PROJECT_FILE_NAME: &str = "modproject.json";
 /// 4: effect-call rotations are stored X, Y, Z as the ACMD slots carry them (3 and older stored
 /// them reversed, from reading the slots as zr, yr, xr).
-pub const PROJECT_VERSION: u32 = 4;
+/// 5: saved cancel rules carry explicit character/costume bindings; older editors must not
+/// reopen them and publish those rules for every costume.
+/// 6: independent ACMD workspaces for each verified logical character.
+pub const PROJECT_VERSION: u32 = 6;
 
 /// Versions this build can open. Every field added since v1 carries `#[serde(default)]`, so
-/// an older project loads with the new sections empty — which is exactly what was true when
-/// it was written. The version number is therefore a record of what wrote the file, not a
-/// gate, and [`ModProjectFile::migrate`] is what brings a loaded project up to date.
+/// an older project loads with the new sections empty. [`ModProjectFile::migrate`] brings
+/// it up to date and refuses files from newer editors.
 pub const OLDEST_SUPPORTED_VERSION: u32 = 1;
 
 /// The source and runtime provenance needed to reopen one move without fetching it again.
@@ -82,10 +84,24 @@ pub fn scope_acmd_project(project: &ModProjectFile, scope: AcmdProjectScope<'_>)
         version: project.version,
         name: project.name.clone(),
         fighters: HashMap::new(),
-        // Roster edits are dropped here for the same reason EFF records are: a Smashline
-        // source export cannot carry a character select screen. They ship through the mod
-        // folder path instead.
-        roster: RosterMod::default(),
+        // Keep only authored-character identities as export safety metadata. The
+        // source exporter needs them to prevent an unscoped ACMD replacement from
+        // leaking onto a costume-backed character. No CSS edits are emitted.
+        roster: RosterMod {
+            authored: project
+                .roster
+                .authored
+                .iter()
+                .filter(|entry| match scope {
+                    AcmdProjectScope::All => project.fighters.contains_key(&entry.donor),
+                    AcmdProjectScope::Move { fighter, .. } => {
+                        entry.donor.eq_ignore_ascii_case(fighter)
+                    }
+                })
+                .cloned()
+                .collect(),
+            ..Default::default()
+        },
     };
 
     // A whole-project export may have a tweak stored under one fighter while the corresponding
@@ -136,6 +152,16 @@ pub fn scope_acmd_project(project: &ModProjectFile, scope: AcmdProjectScope<'_>)
         }
     }
 
+    // Global pins can affect an edited scoped script even when saved under another fighter.
+    // Keep them visible to the exporter until it supports a safe combination; never silently
+    // remove them from a source-only or partial export.
+    if scoped.fighters.values().any(|fighter| fighter.scoped_acmd.iter().any(|bank| bank.edits.has_edits())) {
+        for (name, fighter) in &project.fighters {
+            if !fighter.live_tweaks.is_empty() {
+                scoped.fighters.entry(name.clone()).or_default().live_tweaks = fighter.live_tweaks.clone();
+            }
+        }
+    }
     scoped
 }
 
@@ -147,6 +173,12 @@ fn scoped_fighter(
 ) -> FighterMod {
     let mut scoped = fighter.clone();
     scoped.eff = None;
+    if let Some(move_name) = selected_move {
+        for bank in &mut scoped.scoped_acmd {
+            bank.edits.retain_move(move_name);
+        }
+        scoped.scoped_acmd.retain(|bank| !bank.edits.is_empty());
+    }
     scoped.acmd = scope_move_map(&fighter.acmd, selected_move);
     scoped.effect_calls = scope_move_map(&fighter.effect_calls, selected_move);
     scoped.effect_calls_full = scope_move_map(&fighter.effect_calls_full, selected_move);
@@ -199,7 +231,8 @@ impl ModProjectFile {
     /// produces no files.
     pub fn is_empty(&self) -> bool {
         self.fighters.values().all(|f| {
-            f.acmd.is_empty()
+            !f.scoped_acmd.iter().any(|bank| bank.edits.has_edits())
+                && f.acmd.is_empty()
                 && f.effect_calls.values().all(|v| v.is_empty())
                 && f.effect_calls_full.values().all(|v| v.is_empty())
                 // An empty category script is an explicit replacement: it means the user
@@ -453,8 +486,117 @@ pub enum ParamValue {
     Hash(u64),
 }
 
+/// All move-local ACMD data travels together when switching logical characters.
+/// Fighter-wide parameters, EFF resources, cancels and global pins are not part of this bank.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AcmdEdits {
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub acmd: HashMap<String, EditRecord>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub effect_calls: HashMap<String, Vec<EffectCallEdit>>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub effect_calls_full: HashMap<String, Vec<crate::data::EffectCall>>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub effect_dropped_lines: HashMap<String, Vec<String>>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub effect_frame_residue: HashMap<String, std::collections::BTreeMap<u32, Vec<String>>>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub sound_scripts: HashMap<String, crate::data::AcmdScript>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub expression_scripts: HashMap<String, crate::data::AcmdScript>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub capture_branch_warnings: HashMap<String, String>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub move_sources: HashMap<String, MoveSourceSnapshot>,
+}
+
+impl AcmdEdits {
+    pub fn has_edits(&self) -> bool {
+        !self.acmd.is_empty()
+            || self.effect_calls.values().any(|edits| !edits.is_empty())
+            || !self.effect_calls_full.is_empty()
+            || !self.sound_scripts.is_empty()
+            || !self.expression_scripts.is_empty()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.acmd.is_empty()
+            && self.effect_calls.is_empty()
+            && self.effect_calls_full.is_empty()
+            && self.effect_dropped_lines.is_empty()
+            && self.effect_frame_residue.is_empty()
+            && self.sound_scripts.is_empty()
+            && self.expression_scripts.is_empty()
+            && self.capture_branch_warnings.is_empty()
+            && self.move_sources.is_empty()
+    }
+
+    pub fn take_from_fighter(fighter: &mut FighterMod) -> Self {
+        Self {
+            acmd: std::mem::take(&mut fighter.acmd),
+            effect_calls: std::mem::take(&mut fighter.effect_calls),
+            effect_calls_full: std::mem::take(&mut fighter.effect_calls_full),
+            effect_dropped_lines: std::mem::take(&mut fighter.effect_dropped_lines),
+            effect_frame_residue: std::mem::take(&mut fighter.effect_frame_residue),
+            sound_scripts: std::mem::take(&mut fighter.sound_scripts),
+            expression_scripts: std::mem::take(&mut fighter.expression_scripts),
+            capture_branch_warnings: std::mem::take(&mut fighter.capture_branch_warnings),
+            move_sources: std::mem::take(&mut fighter.move_sources),
+        }
+    }
+
+    pub fn put_into_fighter(self, fighter: &mut FighterMod) {
+        fighter.acmd = self.acmd;
+        fighter.effect_calls = self.effect_calls;
+        fighter.effect_calls_full = self.effect_calls_full;
+        fighter.effect_dropped_lines = self.effect_dropped_lines;
+        fighter.effect_frame_residue = self.effect_frame_residue;
+        fighter.sound_scripts = self.sound_scripts;
+        fighter.expression_scripts = self.expression_scripts;
+        fighter.capture_branch_warnings = self.capture_branch_warnings;
+        fighter.move_sources = self.move_sources;
+    }
+
+    fn retain_move(&mut self, selected: &str) {
+        self.acmd.retain(|name, _| name == selected);
+        self.effect_calls.retain(|name, _| name == selected);
+        self.effect_calls_full.retain(|name, _| name == selected);
+        self.effect_dropped_lines.retain(|name, _| name == selected);
+        self.effect_frame_residue.retain(|name, _| name == selected);
+        self.sound_scripts.retain(|name, _| name == selected);
+        self.expression_scripts.retain(|name, _| name == selected);
+        self.capture_branch_warnings.retain(|name, _| name == selected);
+        self.move_sources.retain(|name, _| name == selected);
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScopedAcmdEdits {
+    pub binding: crate::cancel_rules::CancelBinding,
+    pub edits: AcmdEdits,
+}
+
+/// Exact saved bindings, not only RosterKey, distinguish banks. A moved or renamed
+/// character never silently adopts an earlier bank. Duplicate identical owners are
+/// refused rather than choosing the last one and losing the other.
+pub fn take_acmd_bank(
+    banks: &mut Vec<ScopedAcmdEdits>,
+    binding: &crate::cancel_rules::CancelBinding,
+) -> Option<AcmdEdits> {
+    let mut found = banks.iter().enumerate().filter(|(_, bank)| &bank.binding == binding);
+    let first = found.next().map(|(index, _)| index);
+    if found.next().is_some() {
+        return None;
+    }
+    Some(first.map(|index| banks.remove(index).edits).unwrap_or_default())
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct FighterMod {
+    /// Independent ACMD banks; the historical maps below remain unassigned until
+    /// the user explicitly moves them to a verified character.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scoped_acmd: Vec<ScopedAcmdEdits>,
     #[serde(default)]
     pub display: String,
     /// Costume slots this fighter's edits belong to, when they belong to a slot-add mod rather
@@ -1017,6 +1159,7 @@ mod tests {
         let snapshot = MoveSourceSnapshot {
             body: "unsafe extern \"C\" fn game_fixture(...) {}".into(),
             captures: vec![crate::game_link::CaptureLine {
+                costume: None,
                 kind: 7,
                 motion: 0x1234,
                 frame: 3.5,
@@ -1258,6 +1401,43 @@ unsafe extern "C" fn expression_fixture(agent: &mut L2CAgentBase) {
         assert!(fighter.acmd.contains_key("mixed"));
         assert_eq!(fighter.live_tweaks.len(), 1);
         assert_eq!(fighter.live_tweaks[0].effect_name, "SYS_SMASH_FLASH");
+    }
+
+    #[test]
+    fn scoped_acmd_keeps_character_ownership_without_exporting_css_edits() {
+        let mut project = ModProjectFile::default();
+        project.fighters.insert("mario".into(), FighterMod::default());
+        project.fighters.insert("luigi".into(), FighterMod::default());
+        project.roster.names.insert(
+            crate::roster::RosterKey::fighter("mario"), "Mario renamed".into(),
+        );
+        for (donor, slot) in [("mario", 8), ("luigi", 12)] {
+            project.roster.authored.push(AuthoredEntry {
+                key: crate::roster::RosterKey::slot(donor, slot),
+                donor: donor.into(),
+                slot,
+                slots: vec![slot + 1],
+                display_name: format!("{donor} custom"),
+                name_id: format!("custom_{donor}"),
+                moveset_scaffolded: true,
+                files_root: None,
+            });
+        }
+        let scoped = scope_acmd_project(
+            &project,
+            AcmdProjectScope::Move { fighter: "mario", move_name: "attack_11" },
+        );
+        assert_eq!(scoped.roster.authored.len(), 1);
+        assert_eq!(scoped.roster.authored[0].all_slots(), vec![8, 9]);
+        assert_eq!(scoped.roster.authored[0].donor, "mario");
+        assert!(scoped.roster.names.is_empty());
+        assert!(scoped.roster.order.is_empty());
+        assert!(scoped.roster.ui_images.is_empty());
+        let reloaded: ModProjectFile = serde_json::from_str(
+            &serde_json::to_string(&scoped).unwrap(),
+        ).unwrap();
+        assert_eq!(reloaded.roster.authored[0].key, scoped.roster.authored[0].key);
+        assert_eq!(reloaded.roster.authored[0].all_slots(), vec![8, 9]);
     }
 
     /// Version 3 and older stored effect-call rotations reversed; the script text was right, so
@@ -1601,5 +1781,103 @@ mod version_three_tests {
             .hidden
             .insert(crate::roster::RosterKey::fighter("ridley"));
         assert!(!project.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod acmd_bank_tests {
+    use super::*;
+    use crate::cancel_rules::CancelBinding;
+    use crate::roster::{RosterKey, edit_scope::EditScope};
+
+    fn binding(slot: u8) -> CancelBinding {
+        CancelBinding {
+            scope: EditScope {
+                key: if slot == 0 { RosterKey::fighter("mario") } else { RosterKey::slot("mario", slot) },
+                fighter: "mario".into(),
+                slots: (slot..slot + 8).collect(),
+            },
+            authored_name_id: (slot != 0).then(|| format!("mario_{slot}")),
+        }
+    }
+
+    fn bank(slot: u8, source: &str) -> ScopedAcmdEdits {
+        let mut edits = AcmdEdits::default();
+        let name = "attack_hi3".to_string();
+        edits.acmd.insert(name.clone(), EditRecord {
+            fighter: "mario".into(), fighter_display: "Mario".into(), move_name: name.clone(),
+            script: Default::default(), hitboxes_pristine: Vec::new(), hitboxes: Vec::new(),
+            slot_scope: Some(slot), slot_scopes: (slot+1..slot+8).collect(),
+        });
+        edits.sound_scripts.insert(name.clone(), Default::default());
+        edits.expression_scripts.insert(name.clone(), Default::default());
+        edits.effect_calls_full.insert(name.clone(), Vec::new());
+        edits.move_sources.insert(name, MoveSourceSnapshot { body: source.into(), captures: Vec::new() });
+        ScopedAcmdEdits { binding: binding(slot), edits }
+    }
+
+    #[test]
+    fn scoped_acmd_banks_keep_same_move_separate_after_roundtrip() {
+        let mut project = ModProjectFile::default();
+        let fighter = project.fighters.entry("mario".into()).or_default();
+        fighter.scoped_acmd = vec![bank(0, "original"), bank(8, "first mod"), bank(16, "second mod")];
+        fighter.move_sources.insert("attack_hi3".into(), MoveSourceSnapshot { body: "legacy".into(), captures: Vec::new() });
+        let mut loaded: ModProjectFile = serde_json::from_str(&serde_json::to_string(&project).unwrap()).unwrap();
+        assert!(!loaded.is_empty());
+        let fighter = loaded.fighters.get_mut("mario").unwrap();
+        let mut first = take_acmd_bank(&mut fighter.scoped_acmd, &binding(8)).unwrap();
+        assert_eq!(first.move_sources["attack_hi3"].body, "first mod");
+        assert!(first.sound_scripts.contains_key("attack_hi3"));
+        assert!(first.expression_scripts.contains_key("attack_hi3"));
+        assert!(first.effect_calls_full.contains_key("attack_hi3"));
+        first.acmd.remove("attack_hi3");
+        fighter.scoped_acmd.push(ScopedAcmdEdits { binding: binding(8), edits: first });
+        assert_eq!(take_acmd_bank(&mut fighter.scoped_acmd, &binding(0)).unwrap().move_sources["attack_hi3"].body, "original");
+        assert_eq!(take_acmd_bank(&mut fighter.scoped_acmd, &binding(16)).unwrap().move_sources["attack_hi3"].body, "second mod");
+        assert!(take_acmd_bank(&mut fighter.scoped_acmd, &binding(8)).unwrap().acmd.is_empty());
+        assert_eq!(fighter.move_sources["attack_hi3"].body, "legacy");
+    }
+
+    #[test]
+    fn scoped_acmd_banks_never_guess_changed_or_duplicate_identity() {
+        let mut banks = vec![bank(8, "saved")];
+        let mut changed = binding(8);
+        changed.scope.slots = vec![8, 9];
+        assert!(take_acmd_bank(&mut banks, &changed).unwrap().is_empty());
+        changed = binding(8);
+        changed.authored_name_id = Some("new_name".into());
+        assert!(take_acmd_bank(&mut banks, &changed).unwrap().is_empty());
+        assert_eq!(banks.len(), 1);
+        banks.push(bank(8, "duplicate"));
+        assert!(take_acmd_bank(&mut banks, &binding(8)).is_none());
+        assert_eq!(banks.len(), 2);
+    }
+
+    #[test]
+    fn scoped_acmd_bank_partial_export_preserves_or_refuses_data() {
+        let mut project = ModProjectFile::default();
+        project.fighters.entry("mario".into()).or_default().scoped_acmd = vec![bank(8, "source")];
+        let selected = scope_acmd_project(&project, AcmdProjectScope::Move { fighter: "mario", move_name: "attack_hi3" });
+        assert_eq!(selected.fighters["mario"].scoped_acmd.len(), 1);
+        assert!(crate::mod_export::source_project(&selected).is_err());
+        let other = scope_acmd_project(&project, AcmdProjectScope::Move { fighter: "mario", move_name: "attack_11" });
+        assert!(other.fighters["mario"].scoped_acmd.is_empty());
+        assert!(other.is_empty());
+    }
+
+    #[test]
+    fn scoped_acmd_bank_moves_all_fields_without_touching_shared_data() {
+        let mut fighter = FighterMod::default();
+        fighter.scoped_acmd.push(bank(8, "mod"));
+        fighter.display = "Mario".into();
+        bank(0, "legacy").edits.put_into_fighter(&mut fighter);
+        let legacy = AcmdEdits::take_from_fighter(&mut fighter);
+        assert_eq!(legacy.move_sources["attack_hi3"].body, "legacy");
+        assert!(fighter.acmd.is_empty());
+        assert_eq!(fighter.scoped_acmd.len(), 1);
+        assert_eq!(fighter.display, "Mario");
+        legacy.put_into_fighter(&mut fighter);
+        assert!(fighter.acmd.contains_key("attack_hi3"));
+        assert_eq!(fighter.scoped_acmd[0].edits.move_sources["attack_hi3"].body, "mod");
     }
 }

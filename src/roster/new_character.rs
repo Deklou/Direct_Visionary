@@ -636,26 +636,30 @@ impl NewCharacterView {
 
                     ui.add_space(6.0);
 
-                    // One row: tick to scope move edits to this costume, untick
-                    // for fighter-wide. The trailing note names the scope so no
-                    // second explanation line is needed.
                     let targeted = edit_target == Some(&authored.key);
+                    let slots = authored
+                        .all_slots()
+                        .iter()
+                        .map(|slot| format!("c{slot:02}"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
                     ui.horizontal_wrapped(|ui| {
                         let mut on = targeted;
                         if ui
                             .checkbox(&mut on, RichText::new("Edit moves").small().strong())
                             .on_hover_text(format!(
-                                "Scope move edits to c{:02} of {} instead of the whole fighter",
-                                authored.slot, authored.donor,
+                                "Saved ACMD scope: {slots} of {}. Live edits are NOT costume-isolated yet.",
+                                authored.donor,
                             ))
                             .changed()
                         {
                             result = ExistingAction::Target(on.then(|| authored.key.clone()));
                         }
                         if targeted {
-                            ui.colored_label(
-                                Color32::from_rgb(130, 225, 150),
-                                RichText::new(format!("● c{:02} only", authored.slot)).small().strong(),
+                            ui.label(
+                                RichText::new(format!("Export: {slots} · live NOT isolated"))
+                                    .small()
+                                    .weak(),
                             );
                         } else {
                             ui.label(RichText::new("fighter-wide").small().weak());

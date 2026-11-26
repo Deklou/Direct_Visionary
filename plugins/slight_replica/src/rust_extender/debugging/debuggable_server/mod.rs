@@ -262,7 +262,7 @@ pub fn apply_timing_rules_from_network(raw: &str) -> bool {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
         return false;
     };
-    if let Some(rules) = value.get("spawn_rules") {
+    if let Some(rules) = crate::slight::rule_scope::acmd_snapshot(&value, "spawn_rules") {
         let Ok(rules) = serde_json::from_value::<
             Vec<crate::slight::effect_viewer::spawn_rules::SpawnRule>,
         >(rules.clone()) else {
@@ -270,7 +270,7 @@ pub fn apply_timing_rules_from_network(raw: &str) -> bool {
         };
         return crate::slight::effect_viewer::spawn_rules::set_rules(rules);
     }
-    if let Some(rules) = value.get("effect_control_rules") {
+    if let Some(rules) = crate::slight::rule_scope::acmd_snapshot(&value, "effect_control_rules") {
         let Ok(rules) = serde_json::from_value::<
             Vec<crate::slight::effect_viewer::control_rules::ControlRule>,
         >(rules.clone()) else {
@@ -283,6 +283,11 @@ pub fn apply_timing_rules_from_network(raw: &str) -> bool {
 
 fn parse_tcp_payload(raw: &str) -> Option<ParsedEdit> {
     let v: serde_json::Value = serde_json::from_str(raw).ok()?;
+    if !crate::slight::rule_scope::LEGACY_GLOBAL_EFFECTS_ENABLED
+        && (v.get("donor_effs").is_some() || v.get("donor_bytes").is_some())
+    {
+        return None;
+    }
 
     // Editor commands (no effect-edit payload).
     if let Some(cmd) = v.get("command").and_then(|c| c.as_str()) {
@@ -367,6 +372,25 @@ fn parse_tcp_payload(raw: &str) -> Option<ParsedEdit> {
         return None;
     }
 
+    // An explicit scoped command is ignored by older plugins, rather than being
+    // deserialized as legacy fighter-wide cancels and affecting the vanilla donor.
+    if let Some(value) = v.get("cancel_rules_scoped") {
+        match serde_json::from_value::<Vec<crate::slight::jab_cancel::CancelRule>>(value.clone()) {
+            Ok(rules)
+                if rules.iter().all(|rule| {
+                    rule.costume_slots.as_ref().is_some_and(|slots| !slots.is_empty())
+                }) =>
+            {
+                crate::slight::jab_cancel::set_rules(rules)
+            }
+            Ok(_) => crate::slight::diag::note("scoped cancel rules rejected: missing costumes"),
+            Err(error) => {
+                crate::slight::diag::note(format!("scoped cancel rules parse error: {error}"))
+            }
+        }
+        return None;
+    }
+
     // Experimental custom cancels: game-thread full-list replacement.
     if let Some(value) = v.get("cancel_rules") {
         match serde_json::from_value::<Vec<crate::slight::jab_cancel::CancelRule>>(value.clone()) {
@@ -377,7 +401,7 @@ fn parse_tcp_payload(raw: &str) -> Option<ParsedEdit> {
     }
 
     // Hitbox rules: full-list replace (modify/suppress/inject ATTACKs).
-    if let Some(rules_v) = v.get("hitbox_rules") {
+    if let Some(rules_v) = crate::slight::rule_scope::acmd_snapshot(&v, "hitbox_rules") {
         match serde_json::from_value::<Vec<crate::slight::hitbox_viewer::HitboxRule>>(
             rules_v.clone(),
         ) {
@@ -536,18 +560,21 @@ fn parse_tcp_payload(raw: &str) -> Option<ParsedEdit> {
     }
 
     // Live transplant aliases: full-list replace (copy/replaced kind → donor kind).
-    if let Some(aliases_v) = v.get("effect_aliases") {
+    if let Some(aliases_v) = crate::slight::rule_scope::acmd_snapshot(&v, "effect_aliases") {
         match serde_json::from_value::<Vec<crate::slight::effect_viewer::spawn_rules::EffectAlias>>(
             aliases_v.clone(),
         ) {
             Ok(aliases) => crate::slight::effect_viewer::spawn_rules::set_aliases(aliases),
-            Err(e) => crate::slight::diag::note(format!("effect_aliases parse error: {e}")),
+            Err(e) => {
+                crate::slight::effect_viewer::spawn_rules::set_aliases(Vec::new());
+                crate::slight::diag::note(format!("effect_aliases parse error: {e}"));
+            }
         }
         return None;
     }
 
     // Eff-editor spawn rules: full-list replace, handled here (not an effect edit).
-    if let Some(rules_v) = v.get("spawn_rules") {
+    if let Some(rules_v) = crate::slight::rule_scope::acmd_snapshot(&v, "spawn_rules") {
         match serde_json::from_value::<Vec<crate::slight::effect_viewer::spawn_rules::SpawnRule>>(
             rules_v.clone(),
         ) {
@@ -560,7 +587,7 @@ fn parse_tcp_payload(raw: &str) -> Option<ParsedEdit> {
     }
 
     // Effect point controls: full-list replace (detach and area toggles).
-    if let Some(rules_v) = v.get("effect_control_rules") {
+    if let Some(rules_v) = crate::slight::rule_scope::acmd_snapshot(&v, "effect_control_rules") {
         match serde_json::from_value::<Vec<crate::slight::effect_viewer::control_rules::ControlRule>>(
             rules_v.clone(),
         ) {
@@ -569,6 +596,11 @@ fn parse_tcp_payload(raw: &str) -> Option<ParsedEdit> {
             }
             Err(e) => crate::slight::diag::note(format!("effect_control_rules parse error: {e}")),
         }
+        return None;
+    }
+
+    // Legacy effect edits have no verified character owner.
+    if !crate::slight::rule_scope::LEGACY_GLOBAL_EFFECTS_ENABLED {
         return None;
     }
 
@@ -663,6 +695,9 @@ pub fn finish_transaction(path: &std::path::Path, applied: bool) {
 }
 
 pub fn poll_transactions() -> Vec<(ParsedEdit, std::path::PathBuf)> {
+    if !crate::slight::rule_scope::LEGACY_GLOBAL_EFFECTS_ENABLED {
+        return Vec::new();
+    }
     smash_utils::ensure_slight_dirs();
     let Ok(entries) = std::fs::read_dir(smash_utils::DEBUGGABLES_DIR) else {
         return Vec::new();

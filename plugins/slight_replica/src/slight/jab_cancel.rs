@@ -18,6 +18,7 @@ use smash::lib::lua_const::{
     FIGHTER_PAD_CMD_CAT1_FLAG_WALK, FIGHTER_PAD_CMD_CAT1_FLAG_DASH,
     FIGHTER_PAD_CMD_CAT1_FLAG_TURN_DASH, FIGHTER_PAD_CMD_CAT1_FLAG_SQUAT,
     FIGHTER_STATUS_ATTACK_FLAG_ENABLE_COMBO, FIGHTER_STATUS_KIND_ATTACK,
+    FIGHTER_INSTANCE_WORK_ID_INT_COLOR,
     FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_CATCH,
     FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_ATTACK_100,
     FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_ATTACK_S3,
@@ -159,6 +160,9 @@ pub struct CancelRule {
     pub start_frame: u8,
     pub end_frame: u8,
     pub sync_combo: bool,
+    /// None keeps legacy fighter-wide rules; Some restricts a rule to these costumes.
+    /// An empty or unreadable costume scope never matches.
+    pub costume_slots: Option<Vec<u8>>,
 }
 
 impl Default for CancelRule {
@@ -172,11 +176,20 @@ impl Default for CancelRule {
             start_frame: 4,
             end_frame: 10,
             sync_combo: false,
+            costume_slots: None,
         }
     }
 }
 
 impl CancelRule {
+    fn matches_costume(&self, color: i32) -> bool {
+        self.costume_slots.as_ref().is_none_or(|slots| {
+            u8::try_from(color)
+                .ok()
+                .is_some_and(|color| slots.contains(&color))
+        })
+    }
+
     fn valid(&self) -> bool {
         self.enabled
             && !self.fighter.is_empty()
@@ -222,6 +235,7 @@ unsafe fn matching_rule(
         return false;
     };
     let motion = MotionModule::motion_kind(boma);
+    let costume = WorkModule::get_int(boma, *FIGHTER_INSTANCE_WORK_ID_INT_COLOR);
 
     // Avoid native contact / combo queries unless the selected move actually uses them.
     let (needs_combo, needs_contact, needs_guard) = {
@@ -232,7 +246,9 @@ unsafe fn matching_rule(
         let mut combo = false;
         let mut contact = false;
         let mut guard = false;
-        for rule in rules.iter().filter(|r| r.motion == motion && r.fighter == fighter) {
+        for rule in rules.iter().filter(|r| {
+            r.motion == motion && r.fighter == fighter && r.matches_costume(costume)
+        }) {
             if transition_term.map_or(false, |term| !rule.target.matches_transition_term(term)) {
                 continue;
             }
@@ -269,6 +285,7 @@ unsafe fn matching_rule(
     rules.iter().any(|rule| {
         if rule.motion != motion
             || rule.fighter != fighter
+            || !rule.matches_costume(costume)
             || transition_term.map_or(false, |term| !rule.target.matches_transition_term(term))
             || !rule.target.command_active(commands, guard_pressed, transition_term)
         {

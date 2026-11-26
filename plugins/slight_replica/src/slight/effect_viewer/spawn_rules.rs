@@ -21,8 +21,14 @@ pub struct SpawnInject {
     pub args: Vec<LuaArg>,
 }
 
+use crate::slight::rule_scope::RuntimeTarget;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SpawnRule {
+    #[serde(default)]
+    pub fighter_kind: Option<i32>,
+    #[serde(default)]
+    pub costume_slots: Option<Vec<u8>>,
     pub eff_hash: u64,
     #[serde(default)]
     pub suppress: bool,
@@ -103,11 +109,31 @@ pub struct SpawnRule {
 }
 
 impl SpawnRule {
-    fn matches(&self, eff_hash: u64, motion: u64, frame: f32) -> bool {
-        self.eff_hash == eff_hash
+    fn matches(&self, target: RuntimeTarget, eff_hash: u64, motion: u64, frame: f32) -> bool {
+        target.matches(self.fighter_kind, self.costume_slots.as_deref())
+            && self.eff_hash == eff_hash
             && self.motion.map(|m| m == motion).unwrap_or(true)
             && self.frame_start.map(|s| frame >= s).unwrap_or(true)
             && self.frame_end.map(|e| frame <= e).unwrap_or(true)
+    }
+}
+
+#[cfg(test)]
+mod fighter_scope_tests {
+    use super::*;
+
+    #[test]
+    fn same_effect_and_motion_do_not_match_another_fighter() {
+        let rule: SpawnRule = serde_json::from_str(
+            r#"{"fighter_kind":24,"costume_slots":[8,9],"eff_hash":1234,"motion":5678}"#
+        ).unwrap();
+        assert!(rule.matches(RuntimeTarget { fighter_kind: 24, costume: 8 }, 1234, 5678, 3.0));
+        assert!(!rule.matches(RuntimeTarget { fighter_kind: 1, costume: 8 }, 1234, 5678, 3.0));
+        assert!(!rule.matches(RuntimeTarget { fighter_kind: 24, costume: 0 }, 1234, 5678, 3.0));
+        let legacy: SpawnRule = serde_json::from_str(
+            r#"{"eff_hash":1234,"motion":5678}"#
+        ).unwrap();
+        assert!(!legacy.matches(RuntimeTarget { fighter_kind: 24, costume: 8 }, 1234, 5678, 3.0));
     }
 }
 
@@ -248,13 +274,14 @@ pub fn any_inject() -> bool {
 /// Whether this motion has at least one replacement rule.  The ACMD boundary can briefly report
 /// the previous motion while the native motion transition is still starting; callers use this
 /// as a conservative test before honoring a just-requested motion hash.
-pub fn has_inject_for(motion: u64) -> bool {
+pub fn has_inject_for(target: RuntimeTarget, motion: u64) -> bool {
     service_pending();
     RULES
         .try_lock()
         .map(|rules| {
             rules.iter().any(|rule| {
                 (rule.inject.is_some() || rule.color_inject.is_some())
+                    && target.matches(rule.fighter_kind, rule.costume_slots.as_deref())
                     && rule.motion.map(|wanted| wanted == motion).unwrap_or(true)
             })
         })
@@ -262,7 +289,7 @@ pub fn has_inject_for(motion: u64) -> bool {
 }
 
 /// Inject rules scoped to this motion (or any-motion), with their rule index for latching.
-pub fn injections_for(motion: u64) -> Vec<(usize, SpawnInject, u64)> {
+pub fn injections_for(target: RuntimeTarget, motion: u64) -> Vec<(usize, SpawnInject, u64)> {
     service_pending();
     let Some(rules) = RULES.try_lock() else {
         return Vec::new();
@@ -272,6 +299,7 @@ pub fn injections_for(motion: u64) -> Vec<(usize, SpawnInject, u64)> {
         .enumerate()
         .filter(|(_, r)| {
             (r.inject.is_some() || r.color_inject.is_some())
+                && target.matches(r.fighter_kind, r.costume_slots.as_deref())
                 && r.motion.map(|m| m == motion).unwrap_or(true)
         })
         .flat_map(|(i, r)| {
@@ -290,7 +318,7 @@ pub fn injections_for(motion: u64) -> Vec<(usize, SpawnInject, u64)> {
 /// retimes emit the suppression and replacement adjacent to one another, while colour retimes
 /// carry both fields on one rule. Keeping that relationship here lets the runtime distinguish a
 /// deliberately disabled authored call from a replacement that arrived too late.
-pub fn replacement_injections_for_suppression(
+pub fn replacement_injections_for_suppression(target: RuntimeTarget,
     eff_hash: u64,
     motion: u64,
     frame: f32,
@@ -312,7 +340,7 @@ pub fn replacement_injections_for_suppression(
     };
 
     for (index, rule) in rules.iter().enumerate() {
-        if !rule.suppress || !rule.matches(eff_hash, motion, frame) {
+        if !rule.suppress || !rule.matches(target, eff_hash, motion, frame) {
             continue;
         }
 
@@ -331,6 +359,12 @@ pub fn replacement_injections_for_suppression(
             let mut cursor = index as isize + direction;
             while cursor >= 0 && (cursor as usize) < rules.len() {
                 let candidate = &rules[cursor as usize];
+                if !target.matches(candidate.fighter_kind, candidate.costume_slots.as_deref())
+                    || candidate.costume_slots != rule.costume_slots
+                {
+                    cursor += direction;
+                    continue;
+                }
                 if cursor as usize != index
                     && candidate.suppress
                     && candidate
@@ -359,20 +393,20 @@ pub fn replacement_injections_for_suppression(
     replacements
 }
 
-pub fn suppressed(eff_hash: u64, motion: u64, motion_frame: f32) -> bool {
+pub fn suppressed(target: RuntimeTarget, eff_hash: u64, motion: u64, motion_frame: f32) -> bool {
     service_pending();
     let Some(rules) = RULES.try_lock() else {
         return false;
     };
     rules
         .iter()
-        .any(|r| r.stop_func.is_none() && r.suppress && r.matches(eff_hash, motion, motion_frame))
+        .any(|r| r.stop_func.is_none() && r.suppress && r.matches(target, eff_hash, motion, motion_frame))
 }
 
 /// Whether a pristine lifetime command should be suppressed for a retimed replacement. The
 /// command name is part of the identity because `EFFECT_OFF_KIND` is keyed by effect hash while
 /// `AFTER_IMAGE_OFF` is keyed by the command itself (its argument has no trail texture hash).
-pub fn stop_suppressed(func: &str, eff_hash: u64, motion: u64, motion_frame: f32) -> bool {
+pub fn stop_suppressed(target: RuntimeTarget, func: &str, eff_hash: u64, motion: u64, motion_frame: f32) -> bool {
     service_pending();
     let Some(rules) = RULES.try_lock() else {
         return false;
@@ -380,13 +414,13 @@ pub fn stop_suppressed(func: &str, eff_hash: u64, motion: u64, motion_frame: f32
     rules.iter().any(|r| {
         r.suppress
             && r.stop_func.as_deref() == Some(func)
-            && r.matches(eff_hash, motion, motion_frame)
+            && r.matches(target, eff_hash, motion, motion_frame)
     })
 }
 
 /// Per-spawn transform for the FIRST non-suppress rule matching this spawn — (pos, rot, scale),
 /// each optional. None when no transform rule applies (the spawn keeps the global pin / script).
-pub fn transform_for(
+pub fn transform_for(target: RuntimeTarget,
     eff_hash: u64,
     motion: u64,
     motion_frame: f32,
@@ -398,7 +432,7 @@ pub fn transform_for(
         .find(|r| {
             !r.suppress
                 && (r.pos.is_some() || r.rot.is_some() || r.scale.is_some())
-                && r.matches(eff_hash, motion, motion_frame)
+                && r.matches(target, eff_hash, motion, motion_frame)
         })
         .map(|r| (r.pos, r.rot, r.scale))
 }
@@ -407,23 +441,23 @@ pub fn transform_for(
 ///
 /// Looked up separately from [`transform_for`] because the two travel independently: a spawn
 /// can be retuned without being moved, and moved without being retuned.
-pub fn rate_for(eff_hash: u64, motion: u64, motion_frame: f32) -> Option<f32> {
+pub fn rate_for(target: RuntimeTarget, eff_hash: u64, motion: u64, motion_frame: f32) -> Option<f32> {
     service_pending();
     let rules = RULES.try_lock()?;
     rules
         .iter()
-        .find(|r| !r.suppress && r.rate.is_some() && r.matches(eff_hash, motion, motion_frame))
+        .find(|r| !r.suppress && r.rate.is_some() && r.matches(target, eff_hash, motion, motion_frame))
         .and_then(|r| r.rate)
 }
 
 /// Per-spawn camera-flat offset for the FIRST non-suppress rule matching this spawn.
-pub fn camera_offset_for(eff_hash: u64, motion: u64, motion_frame: f32) -> Option<f32> {
+pub fn camera_offset_for(target: RuntimeTarget, eff_hash: u64, motion: u64, motion_frame: f32) -> Option<f32> {
     service_pending();
     let rules = RULES.try_lock()?;
     rules
         .iter()
         .find(|r| {
-            !r.suppress && r.camera_offset.is_some() && r.matches(eff_hash, motion, motion_frame)
+            !r.suppress && r.camera_offset.is_some() && r.matches(target, eff_hash, motion, motion_frame)
         })
         .and_then(|r| r.camera_offset)
 }
@@ -433,7 +467,7 @@ pub fn camera_offset_for(eff_hash: u64, motion: u64, motion_frame: f32) -> Optio
 /// One lookup for both, unlike the rate above, because both are applied at the same moment to
 /// the same handle — but each half stays optional, so recolouring a spawn does not also assert
 /// an opacity the editor never set.
-pub fn tint_for(
+pub fn tint_for(target: RuntimeTarget,
     eff_hash: u64,
     motion: u64,
     motion_frame: f32,
@@ -445,30 +479,30 @@ pub fn tint_for(
         .find(|r| {
             !r.suppress
                 && (r.tint.is_some() || r.alpha.is_some())
-                && r.matches(eff_hash, motion, motion_frame)
+                && r.matches(target, eff_hash, motion, motion_frame)
         })
         .map(|r| (r.tint, r.alpha))
 }
 
 /// Per-spawn particle tint for the FIRST non-suppress rule matching this spawn.
-pub fn particle_tint_for(eff_hash: u64, motion: u64, motion_frame: f32) -> Option<[f32; 3]> {
+pub fn particle_tint_for(target: RuntimeTarget, eff_hash: u64, motion: u64, motion_frame: f32) -> Option<[f32; 3]> {
     service_pending();
     let rules = RULES.try_lock()?;
     rules
         .iter()
         .find(|r| {
-            !r.suppress && r.particle_tint.is_some() && r.matches(eff_hash, motion, motion_frame)
+            !r.suppress && r.particle_tint.is_some() && r.matches(target, eff_hash, motion, motion_frame)
         })
         .and_then(|r| r.particle_tint)
 }
 
 /// Per-spawn dynamic-arity scale-W values for the FIRST non-suppress rule matching this spawn.
-pub fn scale_w_for(eff_hash: u64, motion: u64, motion_frame: f32) -> Option<Vec<f32>> {
+pub fn scale_w_for(target: RuntimeTarget, eff_hash: u64, motion: u64, motion_frame: f32) -> Option<Vec<f32>> {
     service_pending();
     let rules = RULES.try_lock()?;
     rules
         .iter()
-        .find(|r| !r.suppress && r.scale_w.is_some() && r.matches(eff_hash, motion, motion_frame))
+        .find(|r| !r.suppress && r.scale_w.is_some() && r.matches(target, eff_hash, motion, motion_frame))
         .and_then(|r| {
             r.scale_w
                 .as_ref()
@@ -484,7 +518,7 @@ pub fn scale_w_for(eff_hash: u64, motion: u64, motion_frame: f32) -> Option<Vec<
 ///
 /// Returns `None` when no rule applies, so the script's own arguments are left alone; the two
 /// halves are separately optional so retiming a ramp does not have to restate its colour.
-pub fn color_for(
+pub fn color_for(target: RuntimeTarget,
     cmd_hash: u64,
     motion: u64,
     motion_frame: f32,
@@ -496,7 +530,7 @@ pub fn color_for(
         .find(|r| {
             !r.suppress
                 && (r.color.is_some() || r.transition.is_some())
-                && r.matches(cmd_hash, motion, motion_frame)
+                && r.matches(target, cmd_hash, motion, motion_frame)
         })
         .map(|r| (r.color, r.transition))
 }
@@ -510,48 +544,30 @@ pub fn color_for(
 // hook, while every rule/pin/override still keys on the REQUESTED (copy) hash. The
 // live game then matches what the export will produce.
 
-/// requested kind (`from`) → kind that exists live (`to`), optionally costume-gated.
-#[derive(Clone, Debug, Deserialize)]
-pub struct EffectAlias {
-    pub from: u64,
-    pub to: u64,
-    /// Costume slots the alias is active on; empty = all costumes. NOT limited to the
-    /// vanilla c00–c07: slot-add mods use higher indices, and `u8` spans the whole colour
-    /// index range the runtime can report.
-    #[serde(default)]
-    pub slots: Vec<u8>,
-}
+pub use crate::slight::rule_scope::EffectAlias;
 
 static ALIASES: parking_lot::Mutex<Vec<EffectAlias>> = parking_lot::Mutex::new(Vec::new());
 
-/// Full-list replace (idempotent, like rules). Empty clears all aliases.
-pub fn set_aliases(aliases: Vec<EffectAlias>) {
-    let n = aliases.len();
-    if let Some(mut a) = ALIASES.try_lock() {
-        *a = aliases;
-        crate::slight::diag::note(format!("effect aliases replaced: {n} alias(es)"));
-    } else {
-        crate::slight::diag::note("effect aliases: lock contended, push dropped");
+/// A clear must not be dropped on contention. Readers never park and the lock is
+/// held only for a short lookup or a Vec swap, never during native calls.
+pub fn set_aliases(mut aliases: Vec<EffectAlias>) {
+    if !aliases.iter().all(EffectAlias::valid) {
+        aliases.clear();
     }
+    let old = loop {
+        if let Some(mut current) = ALIASES.try_lock() {
+            break std::mem::replace(&mut *current, aliases);
+        }
+        core::hint::spin_loop();
+    };
+    drop(old);
 }
 
-/// Cheap gate so the hooks skip the costume lookup when no aliases exist.
 pub fn any_alias() -> bool {
     ALIASES.try_lock().map(|a| !a.is_empty()).unwrap_or(false)
 }
 
-/// The live substitute for a requested kind (`costume` = fighter color index, -1 when
-/// unknown — slot-gated aliases then do NOT match).
-pub fn alias_for(from: u64, costume: i32) -> Option<u64> {
+pub fn alias_for(from: u64, target: RuntimeTarget) -> Option<u64> {
     let aliases = ALIASES.try_lock()?;
-    // `try_from`, not `as`: a costume index outside u8 would WRAP and could then falsely
-    // match a low-numbered slot (colour 264 aliasing onto a c08-scoped entry). Out of range
-    // means "no slot-gated alias applies", same as the unknown-costume (-1) case.
-    let slot = u8::try_from(costume).ok();
-    aliases
-        .iter()
-        .find(|a| {
-            a.from == from && (a.slots.is_empty() || slot.is_some_and(|s| a.slots.contains(&s)))
-        })
-        .map(|a| a.to)
+    crate::slight::rule_scope::effect_alias_for(&aliases, from, target)
 }
