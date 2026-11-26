@@ -98,7 +98,9 @@ unsafe fn read_at<T: Copy>(base: *const u8, offset: usize) -> T {
 }
 
 /// The vtable guard deliberately rejects unfamiliar HitModule implementations.
-unsafe fn native_capsule(boma: *mut BattleObjectModuleAccessor, index: u32) -> Option<NativeCapsule> {
+unsafe fn native_record(boma: *mut BattleObjectModuleAccessor, index: u32)
+    -> Option<(*const u8, *const u8, *const u8)>
+{
     if boma.is_null() || index >= 128 || !crate::slight::ver::is_13_0_5() {
         return None;
     }
@@ -124,6 +126,11 @@ unsafe fn native_capsule(boma: *mut BattleObjectModuleAccessor, index: u32) -> O
         return None;
     }
     let record = records.add((first as usize + index as usize) * 0x50);
+    Some((module, group, record))
+}
+
+unsafe fn native_capsule(boma: *mut BattleObjectModuleAccessor, index: u32) -> Option<NativeCapsule> {
+    let (_, _, record) = native_record(boma, index)?;
     let capsule = NativeCapsule {
         bone: read_at(record, 0x28),
         geometry: (read_at(record, 0x08), read_at(record, 0x14), read_at(record, 0x20)),
@@ -135,6 +142,52 @@ unsafe fn native_capsule(boma: *mut BattleObjectModuleAccessor, index: u32) -> O
     // COLLISION_SHAPE_TYPE_CAPSULE = 2 in the 13.0.5 constant registration.
     (capsule.shape == 2 && capsule.bone > 0 && capsule.bone <= 0xffffffffff
         && valid_capsule_geometry(capsule.geometry)).then_some(capsule)
+}
+
+// Read the actual pooled collision object (not the PRC-derived overlay).
+// main+0x468220 consumes record+8/+0x14/+0x20 and record+0x40.
+// main+0x3e87a0 writes the capsule radius at shape+0xa0 and recomputes bounds.
+unsafe fn probe_active(boma: *mut BattleObjectModuleAccessor, index: u32, bone: u64, phase: &str) {
+    let Some((module, group, record)) = native_record(boma, index) else { return; };
+    if read_at::<u64>(record, 0x28) != bone || read_at::<i32>(record, 0x3c) != 2 {
+        return;
+    }
+    let boid = (*boma).battle_object_id;
+    let definition_radius = read_at::<f32>(record, 0x20);
+    let status = read_at::<i32>(record, 0);
+    let group_status = (read_at::<i32>(group, 0x1c), read_at::<i32>(group, 0x20));
+    let sleep = read_at::<u8>(module, 0xa7);
+    let updated = read_at::<u8>(record, 0x49);
+    let group_id = read_at::<i32>(group, 0);
+    let pool: *const u8 = read_at(module, 0x28);
+    let shape: *const u8 = read_at(record, 0x40);
+    // Cross-check the pointer against the live group's shape array before
+    // dereferencing it. For this diagnostic, only group zero is supported.
+    let verified = group_id == 0 && read_at::<i32>(module, 0x20) > 0
+        && !pool.is_null() && !shape.is_null() && index < 64
+        && {
+            let first = read_at::<i32>(pool, 8);
+            let count = read_at::<i32>(pool, 0xc);
+            first >= 0 && first < 64 && count > 0 && count <= 64
+                && (index as i32) >= first && (index as i32) - first < count
+                && read_at::<*const u8>(pool, 0x30 + index as usize * 8) == shape
+        };
+    let active = if verified && read_at::<i32>(shape, 0x80) == 2 {
+        Some((
+            read_at::<f32>(shape, 0xa0),
+            read_at::<u8>(shape, 0x84),
+            read_at::<u32>(shape, 8),
+            read_at::<u32>(shape, 0xc),
+            read_at::<[f32; 3]>(shape, 0x90),
+            read_at::<[f32; 3]>(shape, 0xb0),
+            read_at::<[f32; 3]>(shape, 0x100),
+            read_at::<[f32; 2]>(shape, 0x40),
+            read_at::<[f32; 2]>(shape, 0x50),
+        ))
+    } else { None };
+    crate::slight::diag::note(format!(
+        "HURTBOX active {phase} boid={boid} index={index} bone={bone:#x} definition_radius={definition_radius} status={status} group_status={group_status:?} sleep={sleep} updated={updated} verified={verified} active(radius,enabled,flags,owner_flags,origin,delta,scale,min_xy,max_xy)={active:?}"
+    ));
 }
 
 #[repr(C, align(16))]
@@ -154,6 +207,7 @@ impl PaddedVector {
 unsafe fn write_geometry(boma: *mut BattleObjectModuleAccessor, index: u32,
                          current: NativeCapsule, geometry: CapsuleGeometry,
                          action: &str) -> Option<NativeCapsule> {
+    probe_active(boma, index, current.bone, "before_write");
     let start = PaddedVector::new(geometry.0);
     let end = PaddedVector::new(geometry.1);
     app::FighterUtil::set_hit_data(
@@ -170,6 +224,7 @@ unsafe fn write_geometry(boma: *mut BattleObjectModuleAccessor, index: u32,
         "HURTBOX native {action} boid={} index={index} bone={:#x} ok={ok} before={:?} requested={geometry:?} readback={after:?}",
         (*boma).battle_object_id, current.bone, current.geometry,
     ));
+    probe_active(boma, index, current.bone, "after_write");
     after.filter(|v| v.bone == current.bone)
 }
 
@@ -243,6 +298,7 @@ struct AppliedState {
     disabled_joints: Vec<(u64, i32)>,
     accessor: usize,
     geometry: Vec<AppliedGeometry>,
+    probe_ticks: u32,
 }
 
 static RULES: LazyLock<RwLock<Vec<GeometryRule>>> = LazyLock::new(|| RwLock::new(Vec::new()));
@@ -294,6 +350,18 @@ pub unsafe fn tick(boma: *mut BattleObjectModuleAccessor) {
             for (bone, _) in &state.disabled_joints {
                 HitModule::set_status_joint(boma, Hash40::new_raw(*bone), app::HitStatus(3), 0);
             }
+            if !state.geometry.is_empty() && state.probe_ticks < 300 {
+                let elapsed = state.probe_ticks + 1;
+                if let Some(tracked) = APPLIED.lock().get_mut(&boid) {
+                    tracked.probe_ticks = elapsed;
+                }
+                if matches!(elapsed, 1 | 60 | 300) {
+                    let phase = format!("tick_{elapsed}");
+                    for edit in &state.geometry {
+                        probe_active(boma, edit.index, edit.bone, &phase);
+                    }
+                }
+            }
             return;
         }
     }
@@ -342,8 +410,12 @@ pub unsafe fn tick(boma: *mut BattleObjectModuleAccessor) {
         APPLIED.lock().remove(&boid);
     } else {
         APPLIED.lock().insert(boid, AppliedState {
-            target, revision, disabled_joints, accessor: boma as usize, geometry,
+            target, revision, disabled_joints, accessor: boma as usize, geometry, probe_ticks: 0,
         });
+        crate::slight::diag::note(format!(
+            "HURTBOX rules boid={boid} revision={revision} entries(index,bone,disabled,apply_geometry,radius)={:?}",
+            rules.iter().map(|r| (r.index, r.bone, r.disabled, r.apply_geometry, r.radius)).collect::<Vec<_>>(),
+        ));
         crate::slight::diag::note(format!(
             "hurtbox geometry applied: fighter {} costume {} {} rule(s), revision {}",
             target.fighter_kind, target.costume, rules.len(), revision,
