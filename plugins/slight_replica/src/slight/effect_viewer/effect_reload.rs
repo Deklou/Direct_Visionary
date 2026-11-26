@@ -4839,7 +4839,7 @@ pub fn install_hooks() {
         skyline::install_hook!(hook_readiness);
         skyline::install_hook!(hook_drain_queue);
     }
-    if prepare_private_live() {
+    if crate::slight::rule_scope::EXPERIMENTAL_EFF_LIVE_ENABLED && prepare_private_live() {
         let native_routes = crate::slight::smash_utils::subsystem_disabled("acmd");
         if !native_routes || prepare_private_native_routes() {
             skyline::install_hook!(hook_private_clone_pointer);
@@ -4855,7 +4855,8 @@ pub fn install_hooks() {
             skyline::println!("[SLight] PRIVATE_LIVE disabled: native route signatures or remap");
         }
     }
-    let private_probe = prepare_private_buffer_probe();
+    let private_probe = crate::slight::rule_scope::EXPERIMENTAL_EFF_LIVE_ENABLED
+        && prepare_private_buffer_probe();
     if trace || private_probe {
         skyline::install_hook!(hook_build_effect_set);
     }

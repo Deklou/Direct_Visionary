@@ -33,7 +33,7 @@ const MANIFEST: &str = "sd:/effect_viewer/live_eff/manifest.json";
 const DIR: &str = "sd:/effect_viewer/live_eff/";
 /// Written into every diag file so on-device logs are attributable to a specific build.
 /// Keep this in step with plugin changes so captured diagnostics identify the running binary.
-pub const BUILD_TAG: &str = "2026-09-10-render-overrides-v23";
+pub const BUILD_TAG: &str = "2026-11-26-scoped-eff-deferred";
 
 /// Times [`disk_cb`] served bytes. Split by initiator so we can DECISIVELY answer the
 /// one open question of the whole cross-fighter-live effort: does the game's own resource
@@ -298,6 +298,10 @@ fn reload_inner(apply_live: bool) {
 /// Serve only the new, explicitly staged fighter path. Never read the old manifest,
 /// co-load a donor, replace a resident buffer, or reparse a loaded fighter.
 pub fn replace_scoped_preview(preview: Option<crate::slight::rule_scope::ScopedEffPreview>) {
+    if !crate::slight::rule_scope::EXPERIMENTAL_EFF_LIVE_ENABLED {
+        *SERVED.lock() = Some(HashMap::new());
+        return;
+    }
     let Some(preview) = preview.filter(|p| p.valid()) else {
         *SERVED.lock() = Some(HashMap::new());
         return;

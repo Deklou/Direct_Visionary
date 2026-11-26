@@ -4,6 +4,8 @@
 // per-character resource identity. Keep their saved data, but do not activate
 // them in the scoped editing build. ACMD rules and ordinary exported files are separate.
 pub const LEGACY_GLOBAL_EFFECTS_ENABLED: bool = false;
+// EFF live is deferred until its runtime isolation and rendering are validated.
+pub const EXPERIMENTAL_EFF_LIVE_ENABLED: bool = false;
 /// Explicit next-match EFF preview. The path is derived, never supplied by the wire.
 /// The editor must verify that the whole fighter resource has one logical owner.
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
