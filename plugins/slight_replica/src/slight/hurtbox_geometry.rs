@@ -269,16 +269,10 @@ pub fn set_rules(rules: Vec<GeometryRule>) {
     }
 }
 
-/// Training can emit fight-start repeatedly without destroying the fighter or
-/// resetting its native hit_data. Retain the original geometry and OFF ownership
-/// for living instances; forget only objects that really disappeared.
-pub fn prune_inactive() {
-    APPLIED.lock().retain(|boid, state| unsafe {
-        !app::sv_battle_object::is_null(*boid)
-            && app::sv_battle_object::is_active(*boid)
-            && app::sv_battle_object::module_accessor(*boid) as usize == state.accessor
-    });
-}
+// A fight-start notification is not a lifetime boundary. A fighter can be
+// temporarily inactive while its HitModule still owns the edited geometry.
+// Only a verified fighter callback can replace its saved identity; teardown
+// clears all remaining records.
 
 /// Actual match teardown, not the repeatable fight-start notification.
 pub fn forget_match() {
@@ -292,12 +286,25 @@ pub unsafe fn tick(boma: *mut BattleObjectModuleAccessor) {
     if boma.is_null() || !crate::slight::ver::is_13_0_5() {
         return;
     }
+    // During reset, skip incomplete identity rather than losing the original.
+    let Some(boid) = crate::slight::agents::boid_from_module(boma) else {
+        return;
+    };
     let Some(target) = crate::slight::hitbox_viewer::rule_target(boma) else {
         return;
     };
-    let boid = (*boma).battle_object_id;
+    if !(0..=127).contains(&target.fighter_kind) || u8::try_from(target.costume).is_err() {
+        return;
+    }
     let revision = REVISION.load(Ordering::Acquire);
-    let previous = APPLIED.lock().get(&boid).cloned();
+    let previous = {
+        let mut applied = APPLIED.lock();
+        // Full IDs include a generation; an observed live replacement of the
+        // same engine slot retires the old record without writing to it.
+        applied.retain(|id, _| *id == boid
+            || (*id & crate::slight::agents::BOID_MASK) != (boid & crate::slight::agents::BOID_MASK));
+        applied.get(&boid).cloned()
+    };
 
     if let Some(state) = previous.as_ref() {
         let ready = state.geometry_pending && app::smashball::is_training_mode()
@@ -319,15 +326,31 @@ pub unsafe fn tick(boma: *mut BattleObjectModuleAccessor) {
         }
     }
 
+    // Do not discard the saved original if HitModule is temporarily unavailable.
+    // Wait until it can be read before processing a replacement snapshot.
+    if let Some(state) = previous.as_ref() {
+        if state.target == target && state.accessor == boma as usize
+            && state.geometry.iter().any(|edit| native_capsule(boma, edit.index).is_none())
+        {
+            return;
+        }
+    }
+
     // Undo the preceding snapshot before applying the replacement. Do not write
     // old-fighter bones into a new fighter when battle_object_id is recycled.
     if let Some(state) = previous {
+        if state.target != target || state.accessor != boma as usize {
+            crate::slight::diag::note(format!(
+                "HURTBOX identity replaced boid={boid} previous={:?}/0x{:x} current={target:?}/0x{:x}",
+                state.target, state.accessor, boma as usize,
+            ));
+        }
         if state.target == target && state.accessor == boma as usize {
             for edit in state.geometry.iter().copied() {
                 restore_geometry(boma, edit);
             }
         }
-        if state.target.fighter_kind == target.fighter_kind {
+        if state.target == target && state.accessor == boma as usize {
             for (bone, status) in state.disabled_joints {
                 if !disabled_joints.iter().any(|(new_bone, _)| *new_bone == bone) {
                     HitModule::set_status_joint(boma, Hash40::new_raw(bone), app::HitStatus(status), 0);

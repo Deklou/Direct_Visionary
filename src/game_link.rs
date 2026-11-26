@@ -3006,6 +3006,22 @@ mod tests {
     }
 
     #[test]
+    fn scoped_acmd_hurtbox_tracking_survives_fight_start() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("plugins/slight_replica/src/slight");
+        let dispatch = std::fs::read_to_string(root.join("agent_extender/mod.rs")).unwrap();
+        let geometry = std::fs::read_to_string(root.join("hurtbox_geometry.rs")).unwrap();
+        let fight_start = dispatch.split("if !after_win && !FIGHT_STARTED.swap")
+            .nth(1).unwrap().split("crate::slight::main_smash::on_fighter_frame()")
+            .next().unwrap();
+        assert!(!fight_start.contains("hurtbox_geometry::"));
+        assert!(!geometry.contains("fn prune_inactive"));
+        assert!(geometry.contains("agents::boid_from_module(boma)"));
+        assert!(geometry.contains("native_capsule(boma, edit.index).is_none()"));
+        assert!(dispatch.contains("hurtbox_geometry::forget_match()"));
+    }
+
+    #[test]
     fn scoped_cancels_require_a_current_capability_handshake() {
         let link = GameLink::default();
         {
