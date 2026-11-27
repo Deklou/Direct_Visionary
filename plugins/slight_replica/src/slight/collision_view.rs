@@ -2,7 +2,7 @@
 use parking_lot::Mutex;
 use serde::Deserialize;
 use smash::app::{
-    self, lua_bind::{AttackModule, EffectModule, HitModule}, BattleObjectModuleAccessor,
+    self, lua_bind::{AttackModule, EffectModule, HitModule, MotionModule}, BattleObjectModuleAccessor,
 };
 use smash::lib::lua_const::*;
 use smash::phx::{Hash40, Vector3f};
@@ -62,6 +62,9 @@ static MARKERS: LazyLock<Mutex<HashMap<u32, ObjectMarkers>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static SPAWNING: AtomicUsize = AtomicUsize::new(0);
 static HIT_VTABLE_REPORTED: AtomicBool = AtomicBool::new(false);
+// Diagnostic only: one sample per distinct motion frame and Mario instance.
+static RANGE_TRACE: LazyLock<Mutex<HashMap<u32, (usize, u32)>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Sphere {
@@ -351,6 +354,45 @@ unsafe fn kill(boma: *mut BattleObjectModuleAccessor, marker: Marker) {
     }
 }
 
+/// Temporary A/B probe of Mario's Up Smash, including the unedited move.
+unsafe fn range_trace_sample(boma: *mut BattleObjectModuleAccessor, config: &Config)
+    -> Option<(f32, u64, String)>
+{
+    if app::utility::get_kind(&mut *boma) != 0
+        || MotionModule::motion_kind(boma) != Hash40::new("attack_hi4").hash
+    {
+        return None;
+    }
+    let frame = MotionModule::frame(boma);
+    if !frame.is_finite() || !(0.0..=24.0).contains(&frame) {
+        return None;
+    }
+    let boid = (*boma).battle_object_id;
+    let key = (boma as usize, frame.to_bits());
+    let mut trace = RANGE_TRACE.lock();
+    if trace.get(&boid) == Some(&key) {
+        return None;
+    }
+    trace.insert(boid, key);
+    drop(trace);
+    let bone = Hash40::new("head").hash;
+    let head = config.roster.get(&0).and_then(|v| v.iter().find(|v| v.bone == bone));
+    let parts = HitModule::get_part_size(boma, 0) as i32;
+    let whole = HitModule::get_whole(boma, 0);
+    let data = head.filter(|v| (v.index as i32) < parts).map(|v| {
+        let local = HitModule::get_status(boma, v.index as i32, 0);
+        let effective = effective_status(local, whole, *HIT_STATUS_OFF,
+            *HIT_STATUS_XLU, *HIT_STATUS_INVINCIBLE);
+        let native = crate::slight::hurtbox_geometry::trace_range_status(boma, v.index);
+        (v.index, local, effective, native)
+    });
+    let detail = format!(
+        "boid={boid} whole={whole} parts={parts} index/local/effective/native(bone,record,g1c,g20)={data:?} xlu={} off={} flags={}/{}/{}",
+        *HIT_STATUS_XLU, *HIT_STATUS_OFF, config.hurtboxes, config.intangible, config.invincible,
+    );
+    Some((frame, bone, detail))
+}
+
 /// Called only from the existing fighter Main callback, never from the network thread.
 pub unsafe fn tick(boma: *mut BattleObjectModuleAccessor) {
     if boma.is_null() || !crate::slight::ver::is_13_0_5()
@@ -377,7 +419,10 @@ pub unsafe fn tick(boma: *mut BattleObjectModuleAccessor) {
     if active.is_none() && !objects.contains_key(&id) {
         return;
     }
+    let trace = active.as_ref().and_then(|c| range_trace_sample(boma, c));
     let want = active.map(|c| desired(boma, c)).unwrap_or_default();
+    let wanted = trace.as_ref().map(|(_, bone, _)|
+        want.iter().filter(|s| s.bone == *bone && s.color == BLUE).count());
     drop(config);
     let previous = objects.remove(&id);
     let mut old = previous.filter(|o| o.accessor == boma as usize)
@@ -399,6 +444,16 @@ pub unsafe fn tick(boma: *mut BattleObjectModuleAccessor) {
     for marker in old {
         kill(boma, marker);
     }
+    if let Some((frame, bone, detail)) = trace {
+        let handles: Vec<_> = next.iter()
+            .filter(|m| m.sphere.bone == bone && m.sphere.color == BLUE)
+            .map(|m| (m.handle, EffectModule::is_exist_effect(boma, m.handle)))
+            .collect();
+        crate::slight::diag::note(format!(
+            "HURT_TRACE frame={frame:.2} {detail} wanted_blue={} handles={handles:?}",
+            wanted.unwrap_or(0),
+        ));
+    }
     if !next.is_empty() {
         objects.retain(|boid, _| app::sv_battle_object::is_active(*boid));
         objects.insert(id, ObjectMarkers { accessor: boma as usize, markers: next });
@@ -406,6 +461,7 @@ pub unsafe fn tick(boma: *mut BattleObjectModuleAccessor) {
 }
 
 pub fn forget_match() {
+    RANGE_TRACE.lock().clear();
     if let Some(mut markers) = MARKERS.try_lock() {
         markers.clear();
     }
