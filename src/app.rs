@@ -854,13 +854,30 @@ struct TimelineRow {
     color: Color32,
 }
 
-/// Stable ordering for timeline hitbox rows: dragging Start Frame must not
-/// move the bar into a different row while the mouse is held down.
+/// Keep editable collision rows in a stable order even after changing their start.
 fn timeline_row_sort_key(row: &TimelineRow) -> (u8, u32, u8) {
     match &row.selection {
         TimelineSelection::Hitbox(index) => (0, *index as u32, 0),
-        _ => (1, row.start, row.category as u8),
+        TimelineSelection::Hurtbox(index, _) => (1, *index as u32, 0),
+        _ => (2, row.start, row.category as u8),
     }
+}
+
+#[test]
+fn hurtbox_timeline_row_order_survives_start_edit() {
+    let mut row = TimelineRow {
+        category: TimelineCategory::Hurtboxes,
+        selection: TimelineSelection::Hurtbox(1, crate::data::HurtboxStatus::Xlu),
+        label: "Head".into(),
+        start: 9, end: 12, seek_frame: 9,
+        color: Color32::WHITE,
+    };
+    let key = timeline_row_sort_key(&row);
+    row.start = 3;
+    row.seek_frame = 3;
+    assert_eq!(timeline_row_sort_key(&row), key);
+    row.start = 11;
+    assert_eq!(timeline_row_sort_key(&row), key);
 }
 
 impl TimelineSelection {

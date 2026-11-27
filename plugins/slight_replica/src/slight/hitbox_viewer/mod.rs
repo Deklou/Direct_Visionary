@@ -1587,13 +1587,21 @@ mod fighter_scope_tests {
 
 static RULES: LazyLock<Mutex<Vec<HitboxRule>>> = LazyLock::new(|| Mutex::new(Vec::new()));
 static HAVE_RULES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static HAVE_NATIVE_HURT_RANGES: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// Full-list replace (same semantics as effect spawn rules).
 pub fn set_rules(rules: Vec<HitboxRule>) {
     let n = rules.len();
+    let have_native_ranges = rules.iter().any(|rule| rule.category == CAT_HURT
+        && rule.inject.as_ref().is_some_and(is_native_hurtbox_endpoint));
     {
         let mut guard = RULES.lock();
         *guard = rules;
+    }
+    HAVE_NATIVE_HURT_RANGES.store(have_native_ranges, std::sync::atomic::Ordering::Release);
+    if !have_native_ranges {
+        NATIVE_HURT_PLAYBACK.lock().clear();
     }
     HAVE_RULES.store(n != 0, std::sync::atomic::Ordering::Release);
     // Categories, not just a count. "2 rule(s)" is true whether they are two hitbox rules or a
@@ -3551,6 +3559,11 @@ unsafe fn hurt_action(
         return false;
     };
     if suppress {
+        if matches!(func, "HIT_NODE" | "HIT_NO") {
+            crate::slight::diag::note(format!(
+                "HURT_RANGE suppressed vanilla {func} target={target_key:#x} motion={motion:#x} frame={frame:.1}"
+            ));
+        }
         return true;
     }
     let Some(ov) = overrides else {
@@ -3598,6 +3611,11 @@ unsafe fn hurt_action(
         }
     }
     if vals != args {
+        if matches!(func, "HIT_NODE" | "HIT_NO") {
+            crate::slight::diag::note(format!(
+                "HURT_RANGE override vanilla {func} target={target_key:#x} motion={motion:#x} frame={frame:.1} {args:?} -> {vals:?}"
+            ));
+        }
         rewrite_args(lua_state, &vals);
     }
     false
@@ -3869,6 +3887,87 @@ unsafe fn reapply_native_hurtbox_endpoints(boma: *mut smash::app::BattleObjectMo
 static FIRED: LazyLock<Mutex<HashMap<(u32, u64), (u64, f32)>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// Native ranges must follow motion *visits*, not just the last frame where an
+/// injection fired. A smash can enter its hold motion and resume past the start.
+#[derive(Default)]
+struct NativeHurtPlayback {
+    motion: Option<u64>,
+    frame: f32,
+    fired: HashSet<u64>,
+}
+
+impl NativeHurtPlayback {
+    fn observe(&mut self, motion: u64, frame: f32) {
+        if self.motion != Some(motion) || frame < self.frame {
+            self.fired.clear();
+        }
+        self.motion = Some(motion);
+        self.frame = frame;
+    }
+}
+
+static NATIVE_HURT_PLAYBACK: LazyLock<Mutex<HashMap<u32, NativeHurtPlayback>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+unsafe fn tick_native_hurtbox_endpoints(
+    boma: *mut smash::app::BattleObjectModuleAccessor,
+    target: RuntimeTarget,
+    motion: u64,
+    frame: f32,
+    injections: &[(u64, u8, InjectRule)],
+) {
+    let boid = (*boma).battle_object_id;
+    let mut endpoints: Vec<_> = injections.iter().filter(|(_, category, inj)|
+        *category == CAT_HURT && is_native_hurtbox_endpoint(inj)).collect();
+    // When resuming past several endpoints, execute them in chronological order.
+    endpoints.sort_by(|left, right| left.2.frame.total_cmp(&right.2.frame));
+    let live: HashSet<_> = endpoints.iter().map(|entry| entry.0).collect();
+    {
+        let mut playbacks = NATIVE_HURT_PLAYBACK.lock();
+        let playback = playbacks.entry(boid).or_default();
+        playback.observe(motion, frame);
+        playback.fired.retain(|key| live.contains(key));
+    }
+    for (fingerprint, _, inj) in endpoints {
+        if frame < inj.frame || NATIVE_HURT_PLAYBACK.lock().get(&boid)
+            .is_some_and(|playback| playback.fired.contains(fingerprint))
+        {
+            continue;
+        }
+        if apply_native_hurtbox_endpoint(boma, target, inj) {
+            if let Some(playback) = NATIVE_HURT_PLAYBACK.lock().get_mut(&boid) {
+                playback.fired.insert(*fingerprint);
+            }
+            crate::slight::diag::note(format!(
+                "HURT_RANGE native endpoint motion={motion:#x} frame={frame:.1} scheduled={:.1} {:?}",
+                inj.frame, inj.args,
+            ));
+        }
+    }
+}
+
+#[cfg(test)]
+mod native_hurt_playback_tests {
+    use super::NativeHurtPlayback;
+
+    #[test]
+    fn native_hurtbox_start_replays_after_smash_hold() {
+        let mut playback = NativeHurtPlayback::default();
+        playback.observe(1, 5.0);
+        playback.fired.insert(42);
+        playback.observe(1, 6.0);
+        assert!(playback.fired.contains(&42));
+        playback.observe(2, 1.0); // hold has no endpoints
+        playback.observe(1, 7.0); // resume beyond the original injection
+        assert!(!playback.fired.contains(&42));
+        playback.fired.insert(42);
+        playback.observe(1, 7.0); // hitlag / same frame
+        assert!(playback.fired.contains(&42));
+        playback.observe(1, 0.0);
+        assert!(playback.fired.is_empty());
+    }
+}
+
 /// Called every frame per agent (agent_extender line callback) with the AGENT'S lua state.
 pub unsafe fn inject_tick(lua_state: u64) {
     if !any_rules() {
@@ -3890,6 +3989,10 @@ pub unsafe fn inject_tick(lua_state: u64) {
     let frame = smash::app::lua_bind::MotionModule::frame(boma);
     let Some(target) = rule_target(boma) else { return; };
     let injections = injections_for(target, motion, frame);
+    // Observe the hold motion even when it has no rules of its own.
+    if HAVE_NATIVE_HURT_RANGES.load(std::sync::atomic::Ordering::Acquire) {
+        tick_native_hurtbox_endpoints(boma, target, motion, frame, &injections);
+    }
     if injections.is_empty() {
         return;
     }
@@ -3907,6 +4010,9 @@ pub unsafe fn inject_tick(lua_state: u64) {
         });
 
     for (fingerprint, category, inj) in injections {
+        if category == CAT_HURT && is_native_hurtbox_endpoint(&inj) {
+            continue; // native endpoints use their own motion-visit latch
+        }
         let key = (boid, fingerprint);
         let due = frame >= inj.frame;
         let already = {
@@ -3917,15 +4023,6 @@ pub unsafe fn inject_tick(lua_state: u64) {
                 .unwrap_or(false)
         };
         if due && !already {
-            if category == CAT_HURT && is_native_hurtbox_endpoint(&inj) {
-                if apply_native_hurtbox_endpoint(boma, target, &inj) {
-                    FIRED.lock().insert(key, (motion, frame));
-                    crate::slight::diag::note(format!(
-                        "HURT_RANGE native endpoint motion={motion:#x} frame={frame:.1}"
-                    ));
-                }
-                continue;
-            }
             let lifecycle_command = match (category, inj.command.as_deref()) {
                 (CAT_ATTACK_LIFETIME, Some("ATTACK_CLEAR_ID")) => {
                     let Some(LuaArg::Int(id)) = inj.args.first() else {
