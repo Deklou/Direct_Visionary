@@ -3052,6 +3052,7 @@ pub struct VisionaryApp {
     selected_hurtbox: Option<usize>,
     /// Controls for the next per-volume hurtbox range edit.
     hurtbox_editor_selection: Option<usize>,
+    hurtbox_editor_seed: Option<(crate::data::HurtboxStatus, u32, u32)>,
     hurtbox_edit_start: u32,
     hurtbox_edit_end: u32,
     hurtbox_edit_status: crate::data::HurtboxStatus,
@@ -3607,6 +3608,7 @@ impl VisionaryApp {
             selected_hitbox: None,
             selected_hurtbox: None,
             hurtbox_editor_selection: None,
+            hurtbox_editor_seed: None,
             hurtbox_edit_start: FIRST_GAME_FRAME,
             hurtbox_edit_end: FIRST_GAME_FRAME,
             hurtbox_edit_status: crate::data::HurtboxStatus::Normal,
@@ -14989,29 +14991,6 @@ impl VisionaryApp {
             return;
         }
 
-        if self.hurtbox_editor_selection != self.selected_hurtbox {
-            self.hurtbox_editor_selection = self.selected_hurtbox;
-            if let Some(index) = self.selected_hurtbox {
-                if let Some(volume) = self.hurtbox_volumes.get(index) {
-                    let frame = self.state.current_frame.max(FIRST_GAME_FRAME);
-                    let events = self.state.script.to_hurtbox_events();
-                    self.hurtbox_edit_status =
-                        crate::data::effective_hurtbox_status(volume, &events, frame);
-                    if let Some((start, end)) =
-                        crate::data::effective_hurtbox_range(volume, &events, frame)
-                    {
-                        self.hurtbox_edit_start = start;
-                        self.hurtbox_edit_end = end.unwrap_or_else(|| {
-                            self.state.total_frames.max(frame).min(9999)
-                        });
-                    } else {
-                        self.hurtbox_edit_start = frame;
-                        self.hurtbox_edit_end = frame.saturating_add(5);
-                    }
-                }
-            }
-        }
-
         ui.separator();
         editor_section_heading_with_badge(
             ui,
@@ -15069,6 +15048,28 @@ impl VisionaryApp {
             self.selected_hurtbox = None;
             return;
         };
+
+        let frame = current_frame.max(FIRST_GAME_FRAME);
+        let status = crate::data::effective_hurtbox_status(&volume, &events, frame);
+        let range = crate::data::effective_hurtbox_range(&volume, &events, frame);
+        let (start, end) = range.map_or_else(
+            || (frame, frame.saturating_add(5).min(9999)),
+            |(start, end)| (start, end.unwrap_or_else(|| self.state.total_frames.max(frame).min(9999))),
+        );
+        let seed = (status, start, end);
+        let draft = (self.hurtbox_edit_status, self.hurtbox_edit_start, self.hurtbox_edit_end);
+        if should_refresh_hurtbox_range_draft(
+            self.hurtbox_editor_selection != Some(index),
+            self.hurtbox_editor_seed,
+            draft,
+            seed,
+        ) {
+            self.hurtbox_edit_status = status;
+            self.hurtbox_edit_start = start;
+            self.hurtbox_edit_end = end;
+            self.hurtbox_editor_seed = Some(seed);
+        }
+        self.hurtbox_editor_selection = Some(index);
 
         // Geometry rules are saved with the project, separately from PRC and HIT_NO ranges.
         let binding = self.state.selected_fighter
@@ -15192,8 +15193,8 @@ impl VisionaryApp {
                 volume.bone_name,
                 volume.default_status.label()
             ));
-            let actual_status = crate::data::effective_hurtbox_status(&volume, &events, current_frame);
-            let actual_range = crate::data::effective_hurtbox_range(&volume, &events, current_frame)
+            let actual_status = status;
+            let actual_range = range
                 .map(|(start, end)| match end {
                     Some(end) => format!(" · frames {start}–{end}"),
                     None => format!(" · from frame {start}, no authored end"),
@@ -15256,6 +15257,9 @@ impl VisionaryApp {
                         default_token.to_string(),
                     );
                     self.state.total_frames = self.state.total_frames.max(end);
+                    self.hurtbox_editor_seed = Some((
+                        self.hurtbox_edit_status, self.hurtbox_edit_start, self.hurtbox_edit_end,
+                    ));
                     self.push_hurtbox_rules();
                     self.state.status = format!(
                         "HIT_NO #{} set to {} on frames {}–{}; previous editor range replaced and restored to {} on frame {}.",
@@ -37198,6 +37202,31 @@ impl Hitbox {
     fn active_frames_empty(&self) -> bool {
         self.active_end == 9999
     }
+}
+
+/// Follow the current ACMD range until the user actually edits a field.
+fn should_refresh_hurtbox_range_draft(
+    selection_changed: bool,
+    previous_seed: Option<(crate::data::HurtboxStatus, u32, u32)>,
+    draft: (crate::data::HurtboxStatus, u32, u32),
+    next_seed: (crate::data::HurtboxStatus, u32, u32),
+) -> bool {
+    selection_changed
+        || previous_seed.is_none()
+        || (previous_seed == Some(draft) && draft != next_seed)
+}
+
+#[test]
+fn hurtbox_range_draft_follows_acmd_until_manually_edited() {
+    use crate::data::HurtboxStatus::{Normal, Xlu};
+    let initial = (Normal, 3, 8);
+    let native = (Xlu, 9, 12);
+    let edited = (Xlu, 5, 18);
+    assert!(should_refresh_hurtbox_range_draft(false, Some(initial), initial, native));
+    assert!(!should_refresh_hurtbox_range_draft(false, Some(native), native, native));
+    assert!(!should_refresh_hurtbox_range_draft(false, Some(native), edited, (Normal, 13, 18)));
+    assert!(should_refresh_hurtbox_range_draft(true, Some(native), edited, native));
+    assert!(should_refresh_hurtbox_range_draft(false, Some(native), native, (Normal, 13, 18)));
 }
 
 fn hurtbox_palette(status: crate::data::HurtboxStatus) -> (Color32, Color32) {
