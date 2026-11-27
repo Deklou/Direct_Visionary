@@ -839,6 +839,7 @@ mod picker_state_tests {
 enum TimelineSelection {
     Hitbox(usize),
     Effect(usize),
+    Hurtbox(usize, crate::data::HurtboxStatus),
     Command { family: String, site: usize },
 }
 
@@ -853,20 +854,40 @@ struct TimelineRow {
     color: Color32,
 }
 
-/// Stable ordering for timeline hitbox rows: dragging Start Frame must not
-/// move the bar into a different row while the mouse is held down.
+/// Keep editable collision rows in a stable order even after changing their start.
 fn timeline_row_sort_key(row: &TimelineRow) -> (u8, u32, u8) {
     match &row.selection {
         TimelineSelection::Hitbox(index) => (0, *index as u32, 0),
-        _ => (1, row.start, row.category as u8),
+        TimelineSelection::Hurtbox(index, _) => (1, *index as u32, 0),
+        _ => (2, row.start, row.category as u8),
     }
 }
 
+#[test]
+fn hurtbox_timeline_row_order_survives_start_edit() {
+    let mut row = TimelineRow {
+        category: TimelineCategory::Hurtboxes,
+        selection: TimelineSelection::Hurtbox(1, crate::data::HurtboxStatus::Xlu),
+        label: "Head".into(),
+        start: 9, end: 12, seek_frame: 9,
+        color: Color32::WHITE,
+    };
+    let key = timeline_row_sort_key(&row);
+    row.start = 3;
+    row.seek_frame = 3;
+    assert_eq!(timeline_row_sort_key(&row), key);
+    row.start = 11;
+    assert_eq!(timeline_row_sort_key(&row), key);
+}
+
 impl TimelineSelection {
-    /// Collision boxes and effect events own their frames directly; script commands are
-    /// re-derived from the parsed source and can't be dragged.
+    /// Multi-selection, clipboard and deletion remain limited to hitboxes and effects.
     fn is_editable(&self) -> bool {
         matches!(self, Self::Hitbox(_) | Self::Effect(_))
+    }
+
+    fn is_draggable(&self) -> bool {
+        self.is_editable() || matches!(self, Self::Hurtbox(..))
     }
 }
 
@@ -895,6 +916,9 @@ struct TimelineDrag {
     mode: TimelineDragMode,
     anchor_frame: u32,
     items: Vec<TimelineDragItem>,
+    hurtbox_preview: Option<(u32, u32)>,
+    move_key: Option<String>,
+    binding: Option<crate::cancel_rules::CancelBinding>,
 }
 
 /// A copied timeline item, kept independent of the move it came from so it pastes anywhere.
@@ -3052,6 +3076,7 @@ pub struct VisionaryApp {
     selected_hurtbox: Option<usize>,
     /// Controls for the next per-volume hurtbox range edit.
     hurtbox_editor_selection: Option<usize>,
+    hurtbox_editor_seed: Option<(crate::data::HurtboxStatus, u32, u32)>,
     hurtbox_edit_start: u32,
     hurtbox_edit_end: u32,
     hurtbox_edit_status: crate::data::HurtboxStatus,
@@ -3607,6 +3632,7 @@ impl VisionaryApp {
             selected_hitbox: None,
             selected_hurtbox: None,
             hurtbox_editor_selection: None,
+            hurtbox_editor_seed: None,
             hurtbox_edit_start: FIRST_GAME_FRAME,
             hurtbox_edit_end: FIRST_GAME_FRAME,
             hurtbox_edit_status: crate::data::HurtboxStatus::Normal,
@@ -14974,6 +15000,123 @@ impl VisionaryApp {
     /// Inspect the selected fighter's real parameter capsules and author a per-volume status
     /// range. The range is written as ordinary HIT_NO calls in `state.script`, which keeps the
     /// sidebar, timeline, export, source write-back, and live preview on one schedule.
+    // Shared by the parameter panel and the timeline. Some native ranges can be
+    // displayed but not safely rewritten.
+    fn hurtbox_range_edit_context(&self, index: usize, range_count: usize) -> Option<bool> {
+        let volume = self.hurtbox_volumes.get(index)?;
+        let fighter = self.state.fighters.get(self.state.selected_fighter?)?;
+        let binding = self.acmd_binding_for_slot(&fighter.name, self.selected_costume_slot)?;
+        if self.active_acmd_binding.as_ref() != Some(&binding)
+            || !self.verified_acmd_binding(&binding)
+            || self.state.selected_move.is_none()
+            || self.state.acmd_source.is_empty()
+            || !matches!(volume.shape, crate::data::HurtboxShape::Capsule)
+            || volume.default_status.source_token().is_none()
+            || range_count > 1
+            || self.hurtbox_geometry_rules.iter().any(|(owner, rule)|
+                owner == &binding && rule.index == volume.index as u32 && rule.disabled)
+        {
+            return None;
+        }
+        let mut native = self.state.hurtboxes_pristine.0.iter().filter(|state|
+            crate::data::hurt_target_matches_volume(&state.target, volume)
+                && crate::data::HurtboxStatus::from_acmd_value(&state.status) != volume.default_status);
+        if let Some(original) = native.next() {
+            if native.next().is_some()
+                || original.target == crate::data::HurtTarget::Whole
+                || original.active_end >= 9999
+                || (matches!(&original.target, crate::data::HurtTarget::Bone(_))
+                    && (fighter_kind_id(&binding.scope.fighter) == Some(6)
+                        || self.hurtbox_volumes.iter().filter(|v|
+                            crate::data::hurt_target_matches_volume(&original.target, v)
+                        ).count() != 1))
+                || (self.game_link.status() == crate::game_link::LinkStatus::Connected
+                    && !self.game_link.supports_native_hurtbox_ranges())
+            {
+                return None;
+            }
+            return Some(true);
+        }
+        Some(false)
+    }
+
+    fn apply_hurtbox_range_edit(
+        &mut self,
+        index: usize,
+        start: u32,
+        end: u32,
+        status: crate::data::HurtboxStatus,
+    ) -> bool {
+        let Some(volume) = self.hurtbox_volumes.get(index).cloned() else { return false; };
+        let events = self.state.script.to_hurtbox_events();
+        let ranges = crate::data::effective_hurtbox_ranges(&volume, &events);
+        let Some(native) = self.hurtbox_range_edit_context(index, ranges.len()) else {
+            self.state.status = "This hurtbox range is not editable safely.".into();
+            return false;
+        };
+        let start = start.max(FIRST_GAME_FRAME);
+        let end = end.max(start);
+        let (Some(status_token), Some(default_token)) =
+            (status.source_token(), volume.default_status.source_token())
+        else {
+            self.state.status = "Unknown hurtbox statuses cannot be authored safely.".into();
+            return false;
+        };
+        if native {
+            if end > self.state.total_frames {
+                self.state.status = "Native range must end within the move.".into();
+                return false;
+            }
+            if let Err(reason) = self.state.script.replace_native_hurtbox_range(
+                &self.state.hurtboxes_pristine.0, &volume, start, end, status,
+            ) {
+                self.state.status = reason.into();
+                return false;
+            }
+        } else {
+            self.state.script.replace_hurtbox_range(
+                &self.state.hurtboxes_pristine.0,
+                crate::data::HurtTarget::Group(volume.index as i64),
+                start, end, status_token.to_string(), default_token.to_string(),
+            );
+        }
+        self.state.total_frames = self.state.total_frames.max(end);
+        self.hurtbox_edit_start = start;
+        self.hurtbox_edit_end = end;
+        self.hurtbox_edit_status = status;
+        self.hurtbox_editor_selection = Some(index);
+        self.hurtbox_editor_seed = Some((status, start, end));
+        self.push_hurtbox_rules();
+        self.state.status = format!(
+            "Hurtbox {}: {} on frames {}–{}; verify live collisions in game.",
+            volume.bone_name, status.label(), start, end,
+        );
+        true
+    }
+
+    fn timeline_hurtbox_range(
+        &self,
+        index: usize,
+        events: &[crate::data::HurtboxEvent],
+    ) -> Option<(crate::data::HurtboxStatus, u32, u32)> {
+        let volume = self.hurtbox_volumes.get(index)?;
+        let ranges = crate::data::effective_hurtbox_ranges(volume, events);
+        let [(status, start, Some(end))] = ranges.as_slice() else { return None; };
+        let native = self.hurtbox_range_edit_context(index, ranges.len())?;
+        // Added ranges use HIT_NO. Do not treat a different command shape as
+        // an editor-authored range that replace_hurtbox_range can remove.
+        if !native && self.state.script.to_hurtboxes().0.iter().any(|state|
+            crate::data::hurt_target_matches_volume(&state.target, volume)
+                && crate::data::HurtboxStatus::from_acmd_value(&state.status) != volume.default_status
+                && state.target != crate::data::HurtTarget::Group(volume.index as i64))
+        {
+            return None;
+        }
+        status.source_token()?;
+        (*start >= FIRST_GAME_FRAME && *end >= *start
+            && *end <= self.state.total_frames.min(9998)).then_some((*status, *start, *end))
+    }
+
     fn draw_hurtbox_volume_editor(&mut self, ui: &mut Ui) {
         let Some(_move) = self.state.selected_move.as_ref() else {
             return;
@@ -14989,43 +15132,6 @@ impl VisionaryApp {
             return;
         }
 
-        if self.hurtbox_editor_selection != self.selected_hurtbox {
-            self.hurtbox_editor_selection = self.selected_hurtbox;
-            if let Some(index) = self.selected_hurtbox {
-                if let Some(volume) = self.hurtbox_volumes.get(index) {
-                    let frame = self.state.current_frame.max(FIRST_GAME_FRAME);
-                    let events = self.state.script.to_hurtbox_events();
-                    self.hurtbox_edit_status =
-                        crate::data::effective_hurtbox_status(volume, &events, frame);
-                    let target = crate::data::HurtTarget::Group(volume.index as i64);
-                    if let Some(state) =
-                        self.state
-                            .script
-                            .to_hurtboxes()
-                            .0
-                            .into_iter()
-                            .find(|state| {
-                                state.target == target
-                                    && state.active_start <= frame
-                                    && frame <= state.active_end
-                            })
-                    {
-                        self.hurtbox_edit_start = state.active_start;
-                        self.hurtbox_edit_end = if state.active_end < 9999 {
-                            state.active_end
-                        } else {
-                            frame.saturating_add(5)
-                        };
-                        self.hurtbox_edit_status =
-                            crate::data::HurtboxStatus::from_acmd_value(&state.status);
-                    } else {
-                        self.hurtbox_edit_start = frame;
-                        self.hurtbox_edit_end = frame.saturating_add(5);
-                    }
-                }
-            }
-        }
-
         ui.separator();
         editor_section_heading_with_badge(
             ui,
@@ -15035,11 +15141,14 @@ impl VisionaryApp {
             "select · edit · apply range",
         );
         ui.small(
-            "Workflow: select a capsule, choose its status, enter Start and End frames, then click Apply / replace range. The capsule's parameter default is restored on the following frame.",
+            "Select a capsule to load its ACMD range independently of the playhead. If there is no authored range, the fields suggest a new one. Current ACMD shows the state at the playhead.",
         );
 
         let events = self.state.script.to_hurtbox_events();
         let current_frame = self.state.current_frame;
+        let ranges_by_volume: Vec<_> = self.hurtbox_volumes.iter()
+            .map(|volume| crate::data::effective_hurtbox_ranges(volume, &events))
+            .collect();
         egui::ScrollArea::vertical()
             .id_salt("parameter_hurtbox_list")
             .max_height(150.0)
@@ -15053,16 +15162,26 @@ impl VisionaryApp {
                         current_frame,
                     );
                     let selected = self.selected_hurtbox == Some(*index);
+                    let ranges = &ranges_by_volume[*index];
+                    let range_label = if ranges.is_empty() {
+                        volume.default_status.label()
+                    } else {
+                        ranges.iter().map(|(status, start, end)| match end {
+                            Some(end) => format!("{} [{start}–{end}]", status.label()),
+                            None => format!("{} [{start}–end]", status.label()),
+                        }).collect::<Vec<_>>().join(" / ")
+                    };
                     let label = format!(
                         "HIT_NO #{} · {} · {} · default {}",
                         volume.index,
                         volume.bone_name,
-                        status.label(),
+                        range_label,
                         volume.default_status.label()
                     );
                     let response = ui.selectable_label(selected, label);
                     if response.clicked() {
                         self.selected_hurtbox = Some(*index);
+                        self.hurtbox_editor_selection = None;
                     }
                     response.on_hover_text(format!(
                         "Parameter list index {} on bone {}. Current status: {}. Default: {}. Click to author a frame range.",
@@ -15082,6 +15201,39 @@ impl VisionaryApp {
             self.selected_hurtbox = None;
             return;
         };
+
+        let frame = current_frame.max(FIRST_GAME_FRAME);
+        let actual_status = crate::data::effective_hurtbox_status(&volume, &events, frame);
+        let actual_range = crate::data::effective_hurtbox_range(&volume, &events, frame);
+        let ranges = &ranges_by_volume[index];
+        let native_ranges: Vec<_> = self.state.hurtboxes_pristine.0.iter()
+            .filter(|state| crate::data::hurt_target_matches_volume(&state.target, &volume)
+                && crate::data::HurtboxStatus::from_acmd_value(&state.status) != volume.default_status)
+            .cloned().collect();
+        let native = native_ranges.first();
+        let seed = match ranges.first().copied() {
+            Some((status, start, end)) => (status, start,
+                end.unwrap_or_else(|| self.state.total_frames.max(start).min(9999))),
+            None => match native {
+                Some(original) => (volume.default_status, original.active_start,
+                    original.active_end.min(self.state.total_frames.max(original.active_start))),
+                None => (volume.default_status, frame, frame.saturating_add(5).min(9999)),
+            },
+        };
+        let (status, start, end) = seed;
+        let draft = (self.hurtbox_edit_status, self.hurtbox_edit_start, self.hurtbox_edit_end);
+        if should_refresh_hurtbox_range_draft(
+            self.hurtbox_editor_selection != Some(index),
+            self.hurtbox_editor_seed,
+            draft,
+            seed,
+        ) {
+            self.hurtbox_edit_status = status;
+            self.hurtbox_edit_start = start;
+            self.hurtbox_edit_end = end;
+            self.hurtbox_editor_seed = Some(seed);
+        }
+        self.hurtbox_editor_selection = Some(index);
 
         // Geometry rules are saved with the project, separately from PRC and HIT_NO ranges.
         let binding = self.state.selected_fighter
@@ -15138,7 +15290,7 @@ impl VisionaryApp {
             }
         });
         if let Some(action) = geometry_action {
-            if let (Some(kind), Some(binding)) = (kind, binding) {
+            if let (Some(kind), Some(binding)) = (kind, binding.clone()) {
                 if action == 1 {
                     if let Some(original) = self.hurtbox_original_volumes.iter()
                         .find(|v| v.index == volume.index).cloned()
@@ -15205,8 +15357,15 @@ impl VisionaryApp {
                 volume.bone_name,
                 volume.default_status.label()
             ));
+            let actual_range = actual_range
+                .map(|(start, end)| match end {
+                    Some(end) => format!(" · frames {start}–{end}"),
+                    None => format!(" · from frame {start}, no authored end"),
+                })
+                .unwrap_or_default();
+            ui.small(format!("Current ACMD: {} at frame {}{}", actual_status.label(), current_frame, actual_range));
             ui.horizontal_wrapped(|ui| {
-                ui.label("Status");
+                ui.label("Range status");
                 egui::ComboBox::from_id_salt("parameter_hurtbox_status")
                     .selected_text(self.hurtbox_edit_status.label())
                     .width(150.0)
@@ -15234,42 +15393,22 @@ impl VisionaryApp {
                     egui::DragValue::new(&mut self.hurtbox_edit_end)
                         .range(FIRST_GAME_FRAME..=9999),
                 );
+                let compatible = native.is_none()
+                    || self.game_link.status() != crate::game_link::LinkStatus::Connected
+                    || self.game_link.supports_native_hurtbox_ranges();
+                let can_apply = self.hurtbox_range_edit_context(index, ranges.len()).is_some();
+                if !compatible {
+                    ui.weak("Native ranges require the matching Skyline plugin.");
+                }
                 if ui
-                    .button("Apply / replace range")
+                    .add_enabled(can_apply, egui::Button::new("Apply / replace range"))
                     .on_hover_text(
-                        "Set this capsule's status from Start through End. Applying again replaces the previous range for this capsule. The parameter default is restored on the next frame.",
+                        "Replace a supported native range or author a new capsule range. Multiple, whole-body, open-ended, shared-bone and unverified ranges are not edited here.",
                     )
                     .clicked()
                 {
-                    let start = self.hurtbox_edit_start.max(FIRST_GAME_FRAME);
-                    let end = self.hurtbox_edit_end.max(start);
-                    let Some(status_token) = self.hurtbox_edit_status.source_token() else {
-                        self.state.status = "Unknown hurtbox statuses cannot be authored safely.".into();
-                        return;
-                    };
-                    let Some(default_token) = volume.default_status.source_token() else {
-                        self.state.status = "This parameter capsule has an unknown default status; its range was not authored.".into();
-                        return;
-                    };
-                    let target = crate::data::HurtTarget::Group(volume.index as i64);
-                    self.state.script.replace_hurtbox_range(
-                        &self.state.hurtboxes_pristine.0,
-                        target,
-                        start,
-                        end,
-                        status_token.to_string(),
-                        default_token.to_string(),
-                    );
-                    self.state.total_frames = self.state.total_frames.max(end);
-                    self.push_hurtbox_rules();
-                    self.state.status = format!(
-                        "HIT_NO #{} set to {} on frames {}–{}; previous editor range replaced and restored to {} on frame {}.",
-                        volume.index,
-                        self.hurtbox_edit_status.label(),
-                        start,
-                        end,
-                        volume.default_status.label(),
-                        end.saturating_add(1)
+                    self.apply_hurtbox_range_edit(
+                        index, self.hurtbox_edit_start, self.hurtbox_edit_end, self.hurtbox_edit_status,
                     );
                 }
             });
@@ -24713,6 +24852,73 @@ If you step every basis for a                          type and NONE of them mat
         ])
     }
 
+    // Range edits retain the original command's frame as an anchor. Build a complete
+    // target schedule before the generic site matcher can pair an added endpoint with
+    // a different vanilla command. A failed plan leaves the original game calls alone.
+    fn native_hurtbox_range_rule(
+        motion: u64,
+        original: &[&crate::data::HurtboxState],
+        edited: &[&crate::data::HurtboxState],
+    ) -> Result<crate::game_link::HitboxRuleWire, ()> {
+        use crate::data::{HurtTarget, HurtboxStatus};
+        use crate::game_link::LuaArgWire as A;
+        let native: Vec<_> = original.iter().filter(|s|
+            HurtboxStatus::from_acmd_value(&s.status) != HurtboxStatus::Normal).collect();
+        let [before] = native.as_slice() else { return Err(()); };
+        if before.active_start == 0 || before.active_end < before.active_start
+            || HurtboxStatus::from_acmd_value(&before.status).source_token().is_none()
+            || before.active_end >= 9999 || original.len() > 2
+            || edited.iter().any(|s| s.target != before.target
+                || s.active_start == 0 || s.active_start >= 9999
+                || HurtboxStatus::from_acmd_value(&s.status).source_token().is_none())
+        {
+            return Err(());
+        }
+        let mut spans: Vec<_> = edited.iter().filter(|s|
+            HurtboxStatus::from_acmd_value(&s.status) != HurtboxStatus::Normal).collect();
+        spans.sort_by_key(|s| s.active_start);
+        let (start, end, status) = if let Some(first) = spans.first() {
+            let status = HurtboxStatus::from_acmd_value(&first.status);
+            let mut end = first.active_end;
+            for next in spans.iter().skip(1) {
+                if next.active_start != end.saturating_add(1)
+                    || HurtboxStatus::from_acmd_value(&next.status) != status
+                {
+                    return Err(());
+                }
+                end = next.active_end;
+            }
+            (first.active_start, end, status)
+        } else {
+            (before.active_start, before.active_end, HurtboxStatus::Normal)
+        };
+        if end < start || end >= 9999 || spans.iter().any(|s| s.active_end < s.active_start) {
+            return Err(());
+        }
+        let status = crate::param_labels::encode_const(
+            crate::param_labels::HIT_STATUS, status.source_token().ok_or(())?,
+        ).ok_or(())?;
+        let target = match &before.target {
+            HurtTarget::Bone(bone) => A::Hash(effect_name_hash(bone)),
+            HurtTarget::Group(index) if (0..128).contains(index) => A::Int(*index),
+            _ => return Err(()),
+        };
+        let first = Self::script_to_motion_frame(start.min(before.active_start));
+        let last = Self::script_to_motion_frame(end.max(before.active_end) + 1);
+        Ok(crate::game_link::HitboxRuleWire {
+            motion, category: crate::game_link::CAT_HURT,
+            hitbox_id: Some(Self::hurtbox_target_key(&before.target)),
+            suppress: false, frame_start: None, frame_end: None, overrides: None,
+            func: Some(before.target.macro_name().into()),
+            inject: Some(crate::game_link::InjectRuleWire {
+                frame: Self::script_to_motion_frame(start),
+                args: vec![target, A::Int(status), A::Num(Self::script_to_motion_frame(end + 1)),
+                    A::Num(first), A::Num(last)],
+                command: Some("HURT_RANGE_NATIVE".into()),
+            }),
+        })
+    }
+
     fn push_hurtbox_rules(&mut self) {
         let Some(mv_key) = self.current_move_key() else {
             return;
@@ -24720,8 +24926,8 @@ If you step every basis for a                          type and NONE of them mat
         let Some(motion) = self.current_motion_hash() else {
             return;
         };
-        let (was_states, was_pris) = self.state.hurtboxes_pristine.clone();
-        let (states, pris) = self.state.script.to_hurtboxes();
+        let (mut was_states, was_pris) = self.state.hurtboxes_pristine.clone();
+        let (mut states, pris) = self.state.script.to_hurtboxes();
         let was_conditions = self.state.hurtbox_conditions_pristine.clone();
         let conditions = self.state.script.to_hurtbox_conditions();
         let mut rules: Vec<crate::game_link::HitboxRuleWire> = Vec::new();
@@ -24801,12 +25007,64 @@ If you step every basis for a                          type and NONE of them mat
             })
         };
 
+        // A range authored by the capsule editor keeps the vanilla frame as an
+        // anchor even when its status changes. Handle that entire target atomically.
+        let mut planned_targets = std::collections::HashSet::new();
+        for before in &was_states {
+            use crate::data::{HurtTarget, HurtboxStatus};
+            if before.target == HurtTarget::Whole
+                || HurtboxStatus::from_acmd_value(&before.status) == HurtboxStatus::Normal
+                || planned_targets.contains(&before.target)
+            {
+                continue;
+            }
+            let original: Vec<_> = was_states.iter().filter(|s| s.target == before.target).collect();
+            let edited: Vec<_> = states.iter().filter(|s| s.target == before.target).collect();
+            // The existing endpoint path is already verified for end-only edits.
+            // Replace it only when the actual non-normal startup moved.
+            let new_start = edited.iter().filter(|s|
+                HurtboxStatus::from_acmd_value(&s.status) != HurtboxStatus::Normal)
+                .map(|s| s.active_start).min();
+            if new_start.is_none() || new_start == Some(before.active_start) {
+                continue;
+            }
+            if original.len() > 2 || original.iter().filter(|s|
+                HurtboxStatus::from_acmd_value(&s.status) != HurtboxStatus::Normal).count() != 1
+                || before.active_end >= 9999
+                || edited.len() <= original.len()
+                || !edited.iter().any(|s| s.active_start == before.active_start)
+            {
+                continue;
+            }
+            planned_targets.insert(before.target.clone());
+            match Self::native_hurtbox_range_rule(motion, &original, &edited) {
+                Ok(plan) => rules.push(plan),
+                Err(()) => self.state.status = "Ambiguous native hurtbox range: vanilla kept live.".into(),
+            }
+        }
+        was_states.retain(|s| !planned_targets.contains(&s.target));
+        states.retain(|s| !planned_targets.contains(&s.target));
+
         let state_matches = crate::data::match_hurtbox_states(&was_states, &states);
         for (state_index, now) in states.iter().enumerate() {
             let Some(source_index) = state_matches[state_index] else {
                 // A per-volume range adds a pair of HIT_NO calls. The plugin can inject those
                 // same calls at their one-based frames, so a new schedule is live immediately.
-                if let Some(rule) = Self::hurtbox_injection_rule(motion, now) {
+                if let Some(mut rule) = Self::hurtbox_injection_rule(motion, now) {
+                    // Added endpoints of a native targeted range are direct module calls.
+                    // A global native reset can reapply these exact, scoped endpoints after
+                    // the original reset has run, without suppressing it for other joints.
+                    if was_states.iter().any(|was| was.target == now.target
+                        && crate::data::HurtboxStatus::from_acmd_value(&was.status) != crate::data::HurtboxStatus::Normal)
+                    {
+                        if let Some(inject) = rule.inject.as_mut() {
+                            match &now.target {
+                                crate::data::HurtTarget::Bone(_) => inject.command = Some("HIT_NODE_NATIVE".into()),
+                                crate::data::HurtTarget::Group(_) => inject.command = Some("HIT_NO_NATIVE".into()),
+                                crate::data::HurtTarget::Whole => {}
+                            }
+                        }
+                    }
                     rules.push(rule);
                 } else {
                     self.state.status =
@@ -31912,7 +32170,7 @@ If you step every basis for a                          type and NONE of them mat
         self.timeline_multi.retain(|sel| match sel {
             TimelineSelection::Hitbox(i) => *i < hitboxes,
             TimelineSelection::Effect(i) => *i < effects,
-            TimelineSelection::Command { .. } => false,
+            TimelineSelection::Hurtbox(..) | TimelineSelection::Command { .. } => false,
         });
         self.timeline_multi.clone()
     }
@@ -31967,6 +32225,14 @@ If you step every basis for a                          type and NONE of them mat
                     open_ended,
                 }
             }),
+            TimelineSelection::Hurtbox(index, status) => {
+                let (current, start, end) = self.timeline_hurtbox_range(
+                    *index, &self.state.script.to_hurtbox_events(),
+                )?;
+                (current == *status).then_some(TimelineDragItem {
+                    selection: sel.clone(), start, end, open_ended: false,
+                })
+            }
             TimelineSelection::Command { .. } => None,
         }
     }
@@ -31987,6 +32253,9 @@ If you step every basis for a                          type and NONE of them mat
                 mode,
                 anchor_frame,
                 items,
+                hurtbox_preview: None,
+                move_key: self.current_move_key(),
+                binding: self.active_acmd_binding.clone(),
             });
         }
     }
@@ -32047,6 +32316,16 @@ If you step every basis for a                          type and NONE of them mat
                     }
                     ec.normalize_timing();
                 }
+                TimelineSelection::Hurtbox(..) => {
+                    let preview = hurtbox_drag_bounds(
+                        drag.mode, item.start, item.end,
+                        frame as i64 - drag.anchor_frame as i64,
+                        self.state.total_frames.min(9998),
+                    );
+                    if let Some(active) = self.timeline_drag.as_mut() {
+                        active.hurtbox_preview = Some(preview);
+                    }
+                }
                 TimelineSelection::Command { .. } => {}
             }
         }
@@ -32056,6 +32335,21 @@ If you step every basis for a                          type and NONE of them mat
         let Some(drag) = self.timeline_drag.take() else {
             return;
         };
+        if let [item] = drag.items.as_slice() {
+            if let TimelineSelection::Hurtbox(index, status) = &item.selection {
+                if let Some((start, end)) = drag.hurtbox_preview {
+                    if drag.move_key == self.current_move_key()
+                        && drag.binding == self.active_acmd_binding
+                        && (start, end) != (item.start, item.end)
+                        && self.timeline_hurtbox_range(*index, &self.state.script.to_hurtbox_events())
+                            == Some((*status, item.start, item.end))
+                    {
+                        self.apply_hurtbox_range_edit(*index, start, end, *status);
+                    }
+                }
+                return;
+            }
+        }
         let mut effects_changed = false;
         for item in &drag.items {
             if let TimelineSelection::Effect(i) = item.selection {
@@ -32090,7 +32384,7 @@ If you step every basis for a                          type and NONE of them mat
                     .effects
                     .get(*i)
                     .map(|ec| (ec.active_start, TimelineClip::Effect(ec.clone()))),
-                TimelineSelection::Command { .. } => None,
+                TimelineSelection::Hurtbox(..) | TimelineSelection::Command { .. } => None,
             })
             .collect();
         if clips.is_empty() {
@@ -32150,7 +32444,7 @@ If you step every basis for a                          type and NONE of them mat
             match sel {
                 TimelineSelection::Hitbox(i) => hitboxes.push(*i),
                 TimelineSelection::Effect(i) => effects.push(*i),
-                TimelineSelection::Command { .. } => {}
+                TimelineSelection::Hurtbox(..) | TimelineSelection::Command { .. } => {}
             }
         }
         hitboxes.sort_unstable_by(|a, b| b.cmp(a));
@@ -33372,11 +33666,38 @@ If you step every basis for a                          type and NONE of them mat
             });
         }
         let (hurtboxes, priorities) = self.state.script.to_hurtboxes();
+        let events = self.state.script.to_hurtbox_events();
+        let mut editable_volumes = Vec::new();
         for state in hurtboxes
             .into_iter()
             .filter(|state| state.status != "HIT_STATUS_NORMAL")
         {
             let status_kind = crate::data::HurtboxStatus::from_acmd_value(&state.status);
+            let mut matching = self.hurtbox_volumes.iter().enumerate().filter(|(_, volume)|
+                crate::data::hurt_target_matches_volume(&state.target, volume));
+            if state.target != crate::data::HurtTarget::Whole {
+                if let Some((index, volume)) = matching.next() {
+                    if matching.next().is_none() {
+                        if let Some((status, start, end)) = self.timeline_hurtbox_range(index, &events) {
+                            if status == status_kind && (start..=end).contains(&state.active_start) {
+                                // A native reset may split one continuous range into several
+                                // ACMD calls; show just one effective range for the capsule.
+                                if !editable_volumes.contains(&index) {
+                                    editable_volumes.push(index);
+                                    rows.push(TimelineRow {
+                                        category: TimelineCategory::Hurtboxes,
+                                        selection: TimelineSelection::Hurtbox(index, status),
+                                        label: format!("Hurtbox {} · {}", volume.bone_name, status.label()),
+                                        start, end: end.min(total), seek_frame: start,
+                                        color: hurtbox_timeline_color(status),
+                                    });
+                                }
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
             Self::command_row(
                 &mut rows,
                 "hurtbox",
@@ -33652,6 +33973,16 @@ If you step every basis for a                          type and NONE of them mat
             );
         }
         rows.sort_by_key(timeline_row_sort_key);
+        if let Some(drag) = &self.timeline_drag {
+            if let (Some((start, end)), [item]) = (drag.hurtbox_preview, drag.items.as_slice()) {
+                if drag.move_key == self.current_move_key() && drag.binding == self.active_acmd_binding {
+                    if let Some(row) = rows.iter_mut().find(|row| row.selection == item.selection) {
+                        row.start = start;
+                        row.end = end;
+                    }
+                }
+            }
+        }
         rows
     }
 
@@ -33666,9 +33997,18 @@ If you step every basis for a                          type and NONE of them mat
                 self.state.selected_effect_call = Some(*index);
                 self.primary_tab = PrimaryEditorTab::Effects;
             }
+            TimelineSelection::Hurtbox(index, _) => {
+                self.selected_hitbox = None;
+                self.state.selected_effect_call = None;
+                self.selected_command = None;
+                self.selected_hurtbox = Some(*index);
+                self.hurtbox_editor_selection = None;
+                self.primary_tab = PrimaryEditorTab::Hurtboxes;
+            }
             TimelineSelection::Command { family, site } => {
                 self.selected_command = Some((family.clone(), *site));
                 if family == "hurtbox" {
+                    self.hurtbox_editor_selection = None;
                     if let Some(state) = self
                         .state
                         .script
@@ -33886,6 +34226,7 @@ If you step every basis for a                          type and NONE of them mat
                             hitbox_is_selected(self.selected_hitbox, *i)
                         }
                         TimelineSelection::Effect(i) => self.state.selected_effect_call == Some(*i),
+                        TimelineSelection::Hurtbox(i, _) => self.selected_hurtbox == Some(*i),
                         TimelineSelection::Command { family, site } => self
                             .selected_command
                             .as_ref()
@@ -33937,7 +34278,7 @@ If you step every basis for a                          type and NONE of them mat
                     }
                     let index = ((pos.y - rect.top() - 22.0) / row_height) as usize;
                     let row = rows.get(index)?;
-                    if !row.selection.is_editable() {
+                    if !row.selection.is_draggable() {
                         return None;
                     }
                     let bar = bars.get(index)?.expand2(egui::vec2(3.0, 0.0));
@@ -33945,11 +34286,14 @@ If you step every basis for a                          type and NONE of them mat
                         return None;
                     }
                     const EDGE: f32 = 5.0;
-                    let mode = if bar.width() < 3.0 * EDGE {
-                        TimelineDragMode::Move
-                    } else if pos.x <= bar.left() + EDGE {
+                    let edge = if matches!(&row.selection, TimelineSelection::Hurtbox(..)) {
+                        EDGE.min(bar.width() / 3.0)
+                    } else if bar.width() < 3.0 * EDGE {
+                        return Some((index, TimelineDragMode::Move));
+                    } else { EDGE };
+                    let mode = if pos.x <= bar.left() + edge {
                         TimelineDragMode::Start
-                    } else if pos.x >= bar.right() - EDGE {
+                    } else if pos.x >= bar.right() - edge {
                         TimelineDragMode::End
                     } else {
                         TimelineDragMode::Move
@@ -37157,6 +37501,7 @@ impl eframe::App for VisionaryApp {
                             self.state.selected_effect_call = None;
                             self.primary_tab = PrimaryEditorTab::Collisions;
                         } else if let Some((i, _)) = best_hurtbox_pick {
+                            self.hurtbox_editor_selection = None;
                             self.selected_hurtbox = Some(i);
                             self.selected_hitbox = None;
                             self.state.selected_effect_call = None;
@@ -37201,6 +37546,62 @@ impl Hitbox {
     fn active_frames_empty(&self) -> bool {
         self.active_end == 9999
     }
+}
+
+/// Bound a capsule drag to the move while keeping both endpoints inclusive.
+fn hurtbox_drag_bounds(
+    mode: TimelineDragMode, start: u32, end: u32, delta: i64, last: u32,
+) -> (u32, u32) {
+    let first = FIRST_GAME_FRAME as i64;
+    let last = last.max(end) as i64;
+    let (start, end) = (start as i64, end as i64);
+    let bounds = match mode {
+        TimelineDragMode::Move => {
+            let shift = delta.clamp(first - start, last - end);
+            (start + shift, end + shift)
+        }
+        TimelineDragMode::Start => ((start + delta).clamp(first, end), end),
+        TimelineDragMode::End => (start, (end + delta).clamp(start, last)),
+    };
+    (bounds.0 as u32, bounds.1 as u32)
+}
+
+#[test]
+fn hurtbox_timeline_drag_bounds() {
+    use TimelineDragMode::{End, Move, Start};
+    assert_eq!(hurtbox_drag_bounds(Start, 9, 12, -4, 30), (5, 12));
+    assert_eq!(hurtbox_drag_bounds(End, 5, 12, 6, 30), (5, 18));
+    assert_eq!(hurtbox_drag_bounds(Move, 9, 12, 6, 30), (15, 18));
+    assert_eq!(hurtbox_drag_bounds(Move, 9, 12, -99, 30), (1, 4));
+    assert_eq!(hurtbox_drag_bounds(Move, 9, 12, 99, 30), (27, 30));
+    assert_eq!(hurtbox_drag_bounds(Start, 9, 12, 99, 30), (12, 12));
+    assert_eq!(hurtbox_drag_bounds(End, 9, 12, -99, 30), (9, 9));
+    assert_eq!(hurtbox_drag_bounds(End, 9, 12, 99, 30), (9, 30));
+}
+
+/// Follow the current ACMD range until the user actually edits a field.
+fn should_refresh_hurtbox_range_draft(
+    selection_changed: bool,
+    previous_seed: Option<(crate::data::HurtboxStatus, u32, u32)>,
+    draft: (crate::data::HurtboxStatus, u32, u32),
+    next_seed: (crate::data::HurtboxStatus, u32, u32),
+) -> bool {
+    selection_changed
+        || previous_seed.is_none()
+        || (previous_seed == Some(draft) && draft != next_seed)
+}
+
+#[test]
+fn hurtbox_range_draft_follows_acmd_until_manually_edited() {
+    use crate::data::HurtboxStatus::{Normal, Xlu};
+    let initial = (Normal, 3, 8);
+    let native = (Xlu, 9, 12);
+    let edited = (Xlu, 5, 18);
+    assert!(should_refresh_hurtbox_range_draft(false, Some(initial), initial, native));
+    assert!(!should_refresh_hurtbox_range_draft(false, Some(native), native, native));
+    assert!(!should_refresh_hurtbox_range_draft(false, Some(native), edited, (Normal, 13, 18)));
+    assert!(should_refresh_hurtbox_range_draft(true, Some(native), edited, native));
+    assert!(should_refresh_hurtbox_range_draft(false, Some(native), native, (Normal, 13, 18)));
 }
 
 fn hurtbox_palette(status: crate::data::HurtboxStatus) -> (Color32, Color32) {
@@ -44137,6 +44538,79 @@ mod live_effect_capture_tests {
             A::Hash(hash40::hash40("haver").0),
             "the edited bone must reach the game, not the captured one"
         );
+    }
+
+    #[test]
+    fn native_hurtbox_range_plan_from_real_range_editor() {
+        use crate::data::{HurtboxVolume, HurtboxStatus, HurtboxShape};
+        let source = r#"
+unsafe extern "C" fn game_attackhi4(agent: &mut L2CAgentBase) {
+    frame(agent.lua_state_agent, 9.0);
+    if macros::is_excute(agent) {
+        macros::HIT_NODE(agent, Hash40::new("head"), *HIT_STATUS_XLU);
+    }
+    wait(agent.lua_state_agent, 4.0);
+    if macros::is_excute(agent) {
+        HitModule::set_status_all(agent.module_accessor, HitStatus(*HIT_STATUS_NORMAL), 0);
+    }
+}
+"#;
+        let script = crate::acmd::parse_acmd_script(source);
+        let baseline = script.to_hurtboxes().0;
+        assert_eq!(baseline.len(), 1);
+        assert_eq!((baseline[0].active_start, baseline[0].active_end), (9, 12));
+        let volume = HurtboxVolume {
+            index: 1, bone_name: "Head".into(), bone_hash: hash40::hash40("head").0,
+            endpoint1: [0.0; 3], endpoint2: [1.0, 0.0, 0.0],
+            radius: 1.0, default_status: HurtboxStatus::Normal, shape: HurtboxShape::Capsule,
+        };
+        let original: Vec<_> = baseline.iter().collect();
+        let mut edited = script.clone();
+        for (start, end) in [(5, 12), (11, 12), (9, 20), (3, 5), (15, 18), (3, 20)] {
+            edited.replace_native_hurtbox_range(&baseline, &volume, start, end, HurtboxStatus::Xlu).unwrap();
+            let states = edited.to_hurtboxes().0;
+            assert!(states.len() > baseline.len());
+            assert!(states.iter().any(|s| s.active_start == baseline[0].active_start));
+            let refs: Vec<_> = states.iter().collect();
+            let rule = VisionaryApp::native_hurtbox_range_rule(7, &original, &refs).unwrap();
+            let inj = rule.inject.unwrap();
+            assert_eq!(inj.frame, (start - 1) as f32);
+            assert_eq!(inj.args, vec![A::Hash(hash40::hash40("head").0), A::Int(2),
+                A::Num(end as f32), A::Num((start.min(9) - 1) as f32), A::Num(end.max(12) as f32)]);
+        }
+        edited.replace_native_hurtbox_range(&baseline, &volume, 9, 12, HurtboxStatus::Xlu).unwrap();
+        assert_eq!(edited.to_hurtboxes().0, baseline);
+    }
+
+    #[test]
+    fn native_hurtbox_range_plan_keeps_vanilla_anchor_and_both_bounds() {
+        use crate::data::{HurtTarget, HurtboxState};
+        let before = HurtboxState {
+            target: HurtTarget::Bone("head".into()), status: "HIT_STATUS_XLU".into(),
+            active_start: 9, active_end: 12, site: 0,
+        };
+        let state = |start, end, status: &str| HurtboxState {
+            active_start: start, active_end: end, status: status.into(), ..before.clone()
+        };
+        for (start, end, edited) in [
+            (5, 12, vec![state(5, 8, "HIT_STATUS_XLU"), state(9, 12, "HIT_STATUS_XLU")]),
+            (11, 12, vec![state(9, 10, "HIT_STATUS_NORMAL"), state(11, 12, "HIT_STATUS_XLU")]),
+            (5, 18, vec![state(5, 8, "HIT_STATUS_XLU"), state(9, 12, "HIT_STATUS_XLU"),
+                state(13, 18, "HIT_STATUS_XLU"), state(19, 9999, "HIT_STATUS_NORMAL")]),
+            (15, 18, vec![state(9, 12, "HIT_STATUS_NORMAL"), state(15, 18, "HIT_STATUS_XLU"),
+                state(19, 9999, "HIT_STATUS_NORMAL")]),
+        ] {
+            let refs: Vec<_> = edited.iter().collect();
+            let rule = VisionaryApp::native_hurtbox_range_rule(7, &[&before], &refs).unwrap();
+            assert!(!rule.suppress && rule.overrides.is_none());
+            let inj = rule.inject.unwrap();
+            assert_eq!(inj.command.as_deref(), Some("HURT_RANGE_NATIVE"));
+            assert_eq!(inj.frame, (start - 1) as f32);
+            assert_eq!(inj.args, vec![A::Hash(hash40::hash40("head").0), A::Int(2),
+                A::Num(end as f32), A::Num((start.min(9) - 1) as f32), A::Num(end.max(12) as f32)]);
+        }
+        let invalid = state(11, 9999, "HIT_STATUS_XLU");
+        assert!(VisionaryApp::native_hurtbox_range_rule(7, &[&before], &[&invalid]).is_err());
     }
 
     #[test]

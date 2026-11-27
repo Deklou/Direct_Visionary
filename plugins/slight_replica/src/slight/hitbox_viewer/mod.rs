@@ -1587,13 +1587,21 @@ mod fighter_scope_tests {
 
 static RULES: LazyLock<Mutex<Vec<HitboxRule>>> = LazyLock::new(|| Mutex::new(Vec::new()));
 static HAVE_RULES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static HAVE_NATIVE_HURT_RANGES: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// Full-list replace (same semantics as effect spawn rules).
 pub fn set_rules(rules: Vec<HitboxRule>) {
     let n = rules.len();
+    let have_native_ranges = rules.iter().any(|rule| rule.category == CAT_HURT
+        && rule.inject.as_ref().is_some_and(is_native_hurtbox_rule));
     {
         let mut guard = RULES.lock();
         *guard = rules;
+    }
+    HAVE_NATIVE_HURT_RANGES.store(have_native_ranges, std::sync::atomic::Ordering::Release);
+    if !have_native_ranges {
+        NATIVE_HURT_PLAYBACK.lock().clear();
     }
     HAVE_RULES.store(n != 0, std::sync::atomic::Ordering::Release);
     // Categories, not just a count. "2 rule(s)" is true whether they are two hitbox rules or a
@@ -3616,6 +3624,9 @@ unsafe fn hook_hit_node(lua_state: u64) {
         if hurt_action(lua_state, "HIT_NODE", &args, bone, HurtShape::Targeted) {
             return;
         }
+        original!()(lua_state);
+        enforce_native_range_after_call(lua_state, "HIT_NODE", bone);
+        return;
     }
     original!()(lua_state)
 }
@@ -3632,6 +3643,9 @@ unsafe fn hook_hit_no(lua_state: u64) {
         if hurt_action(lua_state, "HIT_NO", &args, group, HurtShape::Targeted) {
             return;
         }
+        original!()(lua_state);
+        enforce_native_range_after_call(lua_state, "HIT_NO", group);
+        return;
     }
     original!()(lua_state)
 }
@@ -3785,7 +3799,168 @@ unsafe fn hook_atk_set_shield_setoff_mul(lua_state: u64) {
 #[skyline::hook(replace = smash::app::sv_animcmd::HIT_RESET_ALL)]
 unsafe fn hook_hit_reset_all(lua_state: u64) {
     record(lua_state, "HIT_RESET_ALL", &[]);
-    original!()(lua_state)
+    original!()(lua_state);
+    if any_rules() && !is_injecting() {
+        let boma = smash::app::sv_system::battle_object_module_accessor(lua_state)
+            as *mut smash::app::BattleObjectModuleAccessor;
+        reapply_native_hurtbox_endpoints(boma);
+    }
+}
+
+// The dumped Mario up smash calls this binding, not HIT_RESET_ALL.
+// Preserve the global reset and only reapply endpoints explicitly scheduled on this frame.
+#[skyline::hook(replace = smash::app::lua_bind::HitModule::set_status_all)]
+unsafe fn hook_native_hit_status_all(
+    boma: *mut smash::app::BattleObjectModuleAccessor,
+    status: smash::app::HitStatus,
+    arg: i32,
+) {
+    original!()(boma, status, arg);
+    if status.0 == 0 && arg == 0 && any_rules() && !is_injecting() {
+        reapply_native_hurtbox_endpoints(boma);
+    }
+}
+
+fn is_native_hurtbox_endpoint(inj: &InjectRule) -> bool {
+    matches!(inj.command.as_deref(), Some("HIT_NODE_NATIVE" | "HIT_NO_NATIVE"))
+}
+
+fn is_native_hurtbox_rule(inj: &InjectRule) -> bool {
+    is_native_hurtbox_endpoint(inj) || inj.command.as_deref() == Some("HURT_RANGE_NATIVE")
+}
+
+#[derive(Clone, Copy)]
+struct NativeHurtRange {
+    bone: Option<u64>,
+    index: Option<u32>,
+    status: i32,
+    start: f32,
+    end: f32,
+    first: f32,
+    last: f32,
+}
+
+impl NativeHurtRange {
+    fn from_injection(inj: &InjectRule) -> Option<Self> {
+        if inj.command.as_deref() != Some("HURT_RANGE_NATIVE") {
+            return None;
+        }
+        let [target, LuaArg::Int(status), LuaArg::Num(end), LuaArg::Num(first), LuaArg::Num(last)] =
+            inj.args.as_slice() else { return None; };
+        let (bone, index) = match target {
+            LuaArg::Hash(bone) if (1..=0xffffffffff).contains(bone) => (Some(*bone), None),
+            LuaArg::Int(index) if (0..128).contains(index) => (None, Some(*index as u32)),
+            _ => return None,
+        };
+        let start = inj.frame;
+        if !(0..=3).contains(status)
+            || [start, *end, *first, *last].iter().any(|f|
+                !f.is_finite() || *f < 0.0 || *f > 9998.0 || f.fract() != 0.0)
+            || *first > start || start >= *end || *end > *last
+        {
+            return None;
+        }
+        Some(Self { bone, index, status: *status as i32, start, end: *end,
+            first: *first, last: *last })
+    }
+
+    fn desired(self, frame: f32) -> Option<i32> {
+        if frame < self.first || frame >= self.last || !frame.is_finite() {
+            None
+        } else if frame >= self.start && frame < self.end {
+            Some(self.status)
+        } else {
+            Some(0)
+        }
+    }
+
+    unsafe fn apply(self, boma: *mut smash::app::BattleObjectModuleAccessor,
+        target: RuntimeTarget, desired: i32) -> Option<(i32, i32, i32)> {
+        if self.bone.is_some() && target.fighter_kind == 6 {
+            return None;
+        }
+        use smash::app::{lua_bind::HitModule, HitStatus};
+        let index = crate::slight::hurtbox_geometry::native_range_index(boma, self.bone, self.index)?;
+        let before = HitModule::get_status(boma, index, 0);
+        if before != desired {
+            let _guard = InjectGuard::new();
+            HitModule::set_status(boma, index, HitStatus(desired), 0);
+        }
+        Some((index, before, HitModule::get_status(boma, index, 0)))
+    }
+}
+
+/// Keep vanilla calls intact; after a targeted command, reconcile only its
+/// own edited capsule against the same explicit schedule as the frame callback.
+unsafe fn enforce_native_range_after_call(lua_state: u64, func: &str, key: u64) {
+    if !HAVE_NATIVE_HURT_RANGES.load(std::sync::atomic::Ordering::Acquire) || is_injecting() {
+        return;
+    }
+    let boma = smash::app::sv_system::battle_object_module_accessor(lua_state)
+        as *mut smash::app::BattleObjectModuleAccessor;
+    let Some(target) = rule_target(boma) else { return; };
+    let motion = smash::app::lua_bind::MotionModule::motion_kind(boma);
+    let frame = smash::app::lua_bind::MotionModule::frame(boma);
+    let plans: Vec<_> = RULES.lock().iter()
+        .filter(|rule| rule.category == CAT_HURT && rule.motion == motion
+            && rule.hitbox_id == Some(key) && rule.func.as_deref() == Some(func)
+            && target.matches(rule.fighter_kind, rule.costume_slots.as_deref()))
+        .filter_map(|rule| NativeHurtRange::from_injection(rule.inject.as_ref()?))
+        .collect();
+    for plan in plans {
+        if let Some(status) = plan.desired(frame) {
+            plan.apply(boma, target, status);
+        }
+    }
+}
+
+unsafe fn apply_native_hurtbox_endpoint(
+    boma: *mut smash::app::BattleObjectModuleAccessor,
+    target: RuntimeTarget,
+    inj: &InjectRule,
+) -> bool {
+    if !crate::slight::ver::is_13_0_5() {
+        return false;
+    }
+    use smash::app::{lua_bind::HitModule, HitStatus};
+    let _guard = InjectGuard::new();
+    match (inj.command.as_deref(), inj.args.as_slice()) {
+        (Some("HIT_NODE_NATIVE"), [LuaArg::Hash(bone), LuaArg::Int(status)])
+            if target.fighter_kind != 6 && (0..=3).contains(status) => {
+            HitModule::set_status_joint(boma, smash::phx::Hash40::new_raw(*bone), HitStatus(*status as i32), 0);
+            true
+        }
+        (Some("HIT_NO_NATIVE"), [LuaArg::Int(group), LuaArg::Int(status)])
+            if (0..=255).contains(group) && (0..=3).contains(status) => {
+            HitModule::set_status(boma, *group as i32, HitStatus(*status as i32), 0);
+            true
+        }
+        _ => false,
+    }
+}
+
+unsafe fn reapply_native_hurtbox_endpoints(boma: *mut smash::app::BattleObjectModuleAccessor) {
+    if !crate::slight::ver::is_13_0_5() {
+        return;
+    }
+    let Some(target) = rule_target(boma) else { return; };
+    let motion = smash::app::lua_bind::MotionModule::motion_kind(boma);
+    let frame = smash::app::lua_bind::MotionModule::frame(boma);
+    let endpoints: Vec<_> = RULES.lock().iter()
+        .filter(|rule| rule.category == CAT_HURT && rule.motion == motion
+            && target.matches(rule.fighter_kind, rule.costume_slots.as_deref()))
+        .filter_map(|rule| rule.inject.as_ref())
+        .filter(|inj| is_native_hurtbox_rule(inj))
+        .cloned().collect();
+    for inj in &endpoints {
+        if let Some(plan) = NativeHurtRange::from_injection(inj) {
+            if let Some(status) = plan.desired(frame) {
+                plan.apply(boma, target, status);
+            }
+        } else if is_native_hurtbox_endpoint(inj) && (frame - inj.frame).abs() <= 0.5 {
+            apply_native_hurtbox_endpoint(boma, target, inj);
+        }
+    }
 }
 
 // `COL_NORMAL` was hooked here, next to `COL_PRI`, back when both read as body collision. It is
@@ -3800,6 +3975,149 @@ unsafe fn hook_hit_reset_all(lua_state: u64) {
 /// it a new fingerprint and applies it immediately; unchanged injections remain one-shot.
 static FIRED: LazyLock<Mutex<HashMap<(u32, u64), (u64, f32)>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Native ranges must follow motion *visits*, not just the last frame where an
+/// injection fired. A smash can enter its hold motion and resume past the start.
+#[derive(Default)]
+struct NativeHurtPlayback {
+    motion: Option<u64>,
+    frame: f32,
+    identity: Option<(RuntimeTarget, usize)>,
+    fired: HashSet<u64>,
+    // Last requested state and whether the native readback agreed, per plan.
+    range_state: HashMap<u64, (i32, bool)>,
+}
+
+impl NativeHurtPlayback {
+    fn observe(&mut self, motion: u64, frame: f32) {
+        if self.motion != Some(motion) || frame < self.frame {
+            self.fired.clear();
+            self.range_state.clear();
+        }
+        self.motion = Some(motion);
+        self.frame = frame;
+    }
+}
+
+static NATIVE_HURT_PLAYBACK: LazyLock<Mutex<HashMap<u32, NativeHurtPlayback>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+unsafe fn tick_native_hurtbox_endpoints(
+    boma: *mut smash::app::BattleObjectModuleAccessor,
+    target: RuntimeTarget,
+    motion: u64,
+    frame: f32,
+    injections: &[(u64, u8, InjectRule)],
+) {
+    let boid = (*boma).battle_object_id;
+    let mut endpoints: Vec<_> = injections.iter().filter(|(_, category, inj)|
+        *category == CAT_HURT && is_native_hurtbox_rule(inj)).collect();
+    // When resuming past several endpoints, execute them in chronological order.
+    endpoints.sort_by(|left, right| left.2.frame.total_cmp(&right.2.frame));
+    let live: HashSet<_> = endpoints.iter().map(|entry| entry.0).collect();
+    {
+        let mut playbacks = NATIVE_HURT_PLAYBACK.lock();
+        let playback = playbacks.entry(boid).or_default();
+        let identity = Some((target, boma as usize));
+        if playback.identity != identity {
+            *playback = NativeHurtPlayback::default();
+            playback.identity = identity;
+        }
+        playback.observe(motion, frame);
+        playback.fired.retain(|key| live.contains(key));
+        playback.range_state.retain(|key, _| live.contains(key));
+    }
+    for (fingerprint, _, inj) in endpoints {
+        if let Some(plan) = NativeHurtRange::from_injection(inj) {
+            let (previous, finalized) = {
+                let playbacks = NATIVE_HURT_PLAYBACK.lock();
+                let Some(playback) = playbacks.get(&boid) else { continue; };
+                (playback.range_state.get(fingerprint).copied(), playback.fired.contains(fingerprint))
+            };
+            // Restore once at the end, even when motion rate skips over that frame.
+            let (status, finishing) = match plan.desired(frame) {
+                Some(status) => (status, false),
+                None if frame >= plan.last && previous.is_some() && !finalized => (0, true),
+                _ => continue,
+            };
+            let readback = plan.apply(boma, target, status);
+            let ok = readback.is_some_and(|(_, _, after)| after == status);
+            let result = (status, ok);
+            if !ok && (previous != Some(result) || finishing) {
+                crate::slight::diag::note(format!(
+                    "HURT_RANGE failed motion={motion:#x} frame={frame:.1} requested={status} index/before/after={readback:?}",
+                ));
+            }
+            if let Some(playback) = NATIVE_HURT_PLAYBACK.lock().get_mut(&boid) {
+                playback.range_state.insert(*fingerprint, result);
+                if finishing {
+                    // Do not write after the bounded range on subsequent ticks.
+                    playback.fired.insert(*fingerprint);
+                }
+            }
+            continue;
+        }
+        if !is_native_hurtbox_endpoint(inj) {
+            continue;
+        }
+        if frame < inj.frame || NATIVE_HURT_PLAYBACK.lock().get(&boid)
+            .is_some_and(|playback| playback.fired.contains(fingerprint))
+        {
+            continue;
+        }
+        if apply_native_hurtbox_endpoint(boma, target, inj) {
+            if let Some(playback) = NATIVE_HURT_PLAYBACK.lock().get_mut(&boid) {
+                playback.fired.insert(*fingerprint);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod native_hurt_playback_tests {
+    use super::{NativeHurtPlayback, NativeHurtRange, InjectRule, LuaArg};
+
+    #[test]
+    fn native_range_enforces_only_the_union_and_restores_after_end() {
+        let inj = InjectRule {
+            frame: 10.0, command: Some("HURT_RANGE_NATIVE".into()),
+            args: vec![LuaArg::Int(1), LuaArg::Int(2), LuaArg::Num(12.0),
+                LuaArg::Num(8.0), LuaArg::Num(12.0)],
+        };
+        let plan = NativeHurtRange::from_injection(&inj).unwrap();
+        assert_eq!(plan.desired(7.0), None);
+        assert_eq!(plan.desired(8.0), Some(0));
+        assert_eq!(plan.desired(9.9), Some(0));
+        assert_eq!(plan.desired(10.0), Some(2));
+        assert_eq!(plan.desired(11.9), Some(2));
+        assert_eq!(plan.desired(12.0), None);
+        let mut advanced = inj.clone();
+        advanced.frame = 2.0;
+        advanced.args[3] = LuaArg::Num(2.0);
+        let plan = NativeHurtRange::from_injection(&advanced).unwrap();
+        assert_eq!(plan.desired(2.0), Some(2));
+        assert_eq!(plan.desired(8.0), Some(2));
+        advanced.args[2] = LuaArg::Num(1.0);
+        assert!(NativeHurtRange::from_injection(&advanced).is_none());
+    }
+
+    #[test]
+    fn native_hurtbox_start_replays_after_smash_hold() {
+        let mut playback = NativeHurtPlayback::default();
+        playback.observe(1, 5.0);
+        playback.fired.insert(42);
+        playback.observe(1, 6.0);
+        assert!(playback.fired.contains(&42));
+        playback.observe(2, 1.0); // hold has no endpoints
+        playback.observe(1, 7.0); // resume beyond the original injection
+        assert!(!playback.fired.contains(&42));
+        playback.fired.insert(42);
+        playback.observe(1, 7.0); // hitlag / same frame
+        assert!(playback.fired.contains(&42));
+        playback.observe(1, 0.0);
+        assert!(playback.fired.is_empty());
+    }
+}
 
 /// Called every frame per agent (agent_extender line callback) with the AGENT'S lua state.
 pub unsafe fn inject_tick(lua_state: u64) {
@@ -3822,6 +4140,10 @@ pub unsafe fn inject_tick(lua_state: u64) {
     let frame = smash::app::lua_bind::MotionModule::frame(boma);
     let Some(target) = rule_target(boma) else { return; };
     let injections = injections_for(target, motion, frame);
+    // Observe the hold motion even when it has no rules of its own.
+    if HAVE_NATIVE_HURT_RANGES.load(std::sync::atomic::Ordering::Acquire) {
+        tick_native_hurtbox_endpoints(boma, target, motion, frame, &injections);
+    }
     if injections.is_empty() {
         return;
     }
@@ -3839,6 +4161,9 @@ pub unsafe fn inject_tick(lua_state: u64) {
         });
 
     for (fingerprint, category, inj) in injections {
+        if category == CAT_HURT && is_native_hurtbox_rule(&inj) {
+            continue; // native ranges and endpoints have their own frame path
+        }
         let key = (boid, fingerprint);
         let due = frame >= inj.frame;
         let already = {
@@ -4277,6 +4602,7 @@ pub fn install() {
         hook_damage_no_reaction,
         hook_col_pri,
         hook_hit_reset_all,
+        hook_native_hit_status_all,
         hook_atk_power,
         hook_atk_set_shield_setoff_mul,
         hook_rumble_hit,

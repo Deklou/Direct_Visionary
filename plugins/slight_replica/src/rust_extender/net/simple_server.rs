@@ -291,10 +291,11 @@ unsafe fn configure_client(client: i32) -> i32 {
 
 unsafe fn handshake(client: i32, flags: i32) -> Option<u64> {
     let cid = CLIENT_ID.fetch_add(1, Ordering::SeqCst) + 1;
+    let native_ranges = crate::slight::ver::is_13_0_5();
     let frames = vec![
         r#"{"header":"RemoveAll","body":"{}"}"#.to_owned(),
         format!(
-            r#"{{"header":"GiveClientId","body":"{{\"GiveClientId\":{{\"client_id\":{cid},\"scoped_cancels\":true,\"scoped_acmd\":true,\"scoped_aliases\":true}}}}"}}"#
+            r#"{{"header":"GiveClientId","body":"{{\"GiveClientId\":{{\"client_id\":{cid},\"scoped_cancels\":true,\"scoped_acmd\":true,\"scoped_aliases\":true,\"scoped_hurtbox_ranges\":{native_ranges},\"scoped_hurtbox_ranges_v2\":{native_ranges}}}}}"}}"#
         ),
     ];
     let mut batch = TxBatch::new(frames);
