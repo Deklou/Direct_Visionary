@@ -58,7 +58,7 @@ Push-Location $repo
 try {
     $branch = (& git branch --show-current).Trim()
     Test-LastExit 'git branch'
-    if ($branch -notin @('dev', 'test/tcp-communication', 'test/visualisation-collisions', 'test/cibles-edition', 'test/retiming-hurtboxes')) {
+    if ($branch -notin @('dev', 'test/tcp-communication', 'test/visualisation-collisions', 'test/cibles-edition', 'test/retiming-hurtboxes', 'test/self-damage-diag')) {
         throw "Branche '$branch' : compilation de test non autorisee."
     }
     if (Get-Process -Name visionary -ErrorAction SilentlyContinue) {

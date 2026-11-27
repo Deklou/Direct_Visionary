@@ -88,6 +88,7 @@ unsafe extern "C" fn fighter_line_main(agent: &mut L2CFighterBase) {
     if let Some(boma) = boma_from_lua(lua_state) {
         crate::slight::hurtbox_geometry::tick(boma);
         crate::slight::collision_view::tick(boma);
+        crate::slight::self_damage_trace::tick(boma);
     }
     // End-of-motion watch: tells the editor when a captured move's script has finished, so
     // its auto "live fetch" adopts the WHOLE script instead of the first few frames.

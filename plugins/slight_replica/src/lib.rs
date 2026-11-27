@@ -27,6 +27,7 @@ pub fn smashline_install() {
     );
 
     slight::effect_viewer::install_hooks();
+    slight::self_damage_trace::install();
     if !slight::smash_utils::subsystem_disabled("agent") {
         slight::agent_extender::install();
     }

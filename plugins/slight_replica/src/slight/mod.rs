@@ -16,6 +16,7 @@ pub mod pending;
 pub mod roster_heap;
 pub mod roster_pin;
 pub mod rule_scope;
+pub mod self_damage_trace;
 pub mod sd_poll;
 pub mod slight_consts;
 pub mod smash_utils;
