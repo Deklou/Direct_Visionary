@@ -144,6 +144,40 @@ unsafe fn native_capsule(boma: *mut BattleObjectModuleAccessor, index: u32) -> O
         && valid_capsule_geometry(capsule.geometry)).then_some(capsule)
 }
 
+/// Resolve a range target against the same verified group-zero records used by
+/// the geometry editor and overlay. A joint must identify exactly one capsule.
+pub(super) unsafe fn native_range_index(
+    boma: *mut BattleObjectModuleAccessor,
+    bone: Option<u64>,
+    index: Option<u32>,
+) -> Option<i32> {
+    if boma.is_null() || !crate::slight::ver::is_13_0_5() {
+        return None;
+    }
+    if let Some(index) = index {
+        return native_capsule(boma, index).filter(|capsule| capsule.status == 0)
+            .map(|_| index as i32);
+    }
+    let bone = bone?;
+    let count = HitModule::get_part_size(boma, 0) as i32;
+    if !(1..=128).contains(&count) {
+        return None;
+    }
+    let mut matched = None;
+    for index in 0..count as u32 {
+        let (_, _, record) = native_record(boma, index)?;
+        if read_at::<u64>(record, 0x28) == bone {
+            if matched.is_some() {
+                return None;
+            }
+            matched = Some(index);
+        }
+    }
+    let index = matched?;
+    native_capsule(boma, index).filter(|capsule| capsule.status == 0)
+        .map(|_| index as i32)
+}
+
 #[repr(C, align(16))]
 struct PaddedVector {
     vector: Vector3f,

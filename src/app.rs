@@ -24852,6 +24852,73 @@ If you step every basis for a                          type and NONE of them mat
         ])
     }
 
+    // Range edits retain the original command's frame as an anchor. Build a complete
+    // target schedule before the generic site matcher can pair an added endpoint with
+    // a different vanilla command. A failed plan leaves the original game calls alone.
+    fn native_hurtbox_range_rule(
+        motion: u64,
+        original: &[&crate::data::HurtboxState],
+        edited: &[&crate::data::HurtboxState],
+    ) -> Result<crate::game_link::HitboxRuleWire, ()> {
+        use crate::data::{HurtTarget, HurtboxStatus};
+        use crate::game_link::LuaArgWire as A;
+        let native: Vec<_> = original.iter().filter(|s|
+            HurtboxStatus::from_acmd_value(&s.status) != HurtboxStatus::Normal).collect();
+        let [before] = native.as_slice() else { return Err(()); };
+        if before.active_start == 0 || before.active_end < before.active_start
+            || HurtboxStatus::from_acmd_value(&before.status).source_token().is_none()
+            || before.active_end >= 9999 || original.len() > 2
+            || edited.iter().any(|s| s.target != before.target
+                || s.active_start == 0 || s.active_start >= 9999
+                || HurtboxStatus::from_acmd_value(&s.status).source_token().is_none())
+        {
+            return Err(());
+        }
+        let mut spans: Vec<_> = edited.iter().filter(|s|
+            HurtboxStatus::from_acmd_value(&s.status) != HurtboxStatus::Normal).collect();
+        spans.sort_by_key(|s| s.active_start);
+        let (start, end, status) = if let Some(first) = spans.first() {
+            let status = HurtboxStatus::from_acmd_value(&first.status);
+            let mut end = first.active_end;
+            for next in spans.iter().skip(1) {
+                if next.active_start != end.saturating_add(1)
+                    || HurtboxStatus::from_acmd_value(&next.status) != status
+                {
+                    return Err(());
+                }
+                end = next.active_end;
+            }
+            (first.active_start, end, status)
+        } else {
+            (before.active_start, before.active_end, HurtboxStatus::Normal)
+        };
+        if end < start || end >= 9999 || spans.iter().any(|s| s.active_end < s.active_start) {
+            return Err(());
+        }
+        let status = crate::param_labels::encode_const(
+            crate::param_labels::HIT_STATUS, status.source_token().ok_or(())?,
+        ).ok_or(())?;
+        let target = match &before.target {
+            HurtTarget::Bone(bone) => A::Hash(effect_name_hash(bone)),
+            HurtTarget::Group(index) if (0..128).contains(index) => A::Int(*index),
+            _ => return Err(()),
+        };
+        let first = Self::script_to_motion_frame(start.min(before.active_start));
+        let last = Self::script_to_motion_frame(end.max(before.active_end) + 1);
+        Ok(crate::game_link::HitboxRuleWire {
+            motion, category: crate::game_link::CAT_HURT,
+            hitbox_id: Some(Self::hurtbox_target_key(&before.target)),
+            suppress: false, frame_start: None, frame_end: None, overrides: None,
+            func: Some(before.target.macro_name().into()),
+            inject: Some(crate::game_link::InjectRuleWire {
+                frame: Self::script_to_motion_frame(start),
+                args: vec![target, A::Int(status), A::Num(Self::script_to_motion_frame(end + 1)),
+                    A::Num(first), A::Num(last)],
+                command: Some("HURT_RANGE_NATIVE".into()),
+            }),
+        })
+    }
+
     fn push_hurtbox_rules(&mut self) {
         let Some(mv_key) = self.current_move_key() else {
             return;
@@ -24859,8 +24926,8 @@ If you step every basis for a                          type and NONE of them mat
         let Some(motion) = self.current_motion_hash() else {
             return;
         };
-        let (was_states, was_pris) = self.state.hurtboxes_pristine.clone();
-        let (states, pris) = self.state.script.to_hurtboxes();
+        let (mut was_states, was_pris) = self.state.hurtboxes_pristine.clone();
+        let (mut states, pris) = self.state.script.to_hurtboxes();
         let was_conditions = self.state.hurtbox_conditions_pristine.clone();
         let conditions = self.state.script.to_hurtbox_conditions();
         let mut rules: Vec<crate::game_link::HitboxRuleWire> = Vec::new();
@@ -24939,6 +25006,44 @@ If you step every basis for a                          type and NONE of them mat
                 func: Some("DAMAGE_NO_REACTION".into()),
             })
         };
+
+        // A range authored by the capsule editor keeps the vanilla frame as an
+        // anchor even when its status changes. Handle that entire target atomically.
+        let mut planned_targets = std::collections::HashSet::new();
+        for before in &was_states {
+            use crate::data::{HurtTarget, HurtboxStatus};
+            if before.target == HurtTarget::Whole
+                || HurtboxStatus::from_acmd_value(&before.status) == HurtboxStatus::Normal
+                || planned_targets.contains(&before.target)
+            {
+                continue;
+            }
+            let original: Vec<_> = was_states.iter().filter(|s| s.target == before.target).collect();
+            let edited: Vec<_> = states.iter().filter(|s| s.target == before.target).collect();
+            // The existing endpoint path is already verified for end-only edits.
+            // Replace it only when the actual non-normal startup moved.
+            let new_start = edited.iter().filter(|s|
+                HurtboxStatus::from_acmd_value(&s.status) != HurtboxStatus::Normal)
+                .map(|s| s.active_start).min();
+            if new_start.is_none() || new_start == Some(before.active_start) {
+                continue;
+            }
+            if original.len() > 2 || original.iter().filter(|s|
+                HurtboxStatus::from_acmd_value(&s.status) != HurtboxStatus::Normal).count() != 1
+                || before.active_end >= 9999
+                || edited.len() <= original.len()
+                || !edited.iter().any(|s| s.active_start == before.active_start)
+            {
+                continue;
+            }
+            planned_targets.insert(before.target.clone());
+            match Self::native_hurtbox_range_rule(motion, &original, &edited) {
+                Ok(plan) => rules.push(plan),
+                Err(()) => self.state.status = "Ambiguous native hurtbox range: vanilla kept live.".into(),
+            }
+        }
+        was_states.retain(|s| !planned_targets.contains(&s.target));
+        states.retain(|s| !planned_targets.contains(&s.target));
 
         let state_matches = crate::data::match_hurtbox_states(&was_states, &states);
         for (state_index, now) in states.iter().enumerate() {
@@ -44433,6 +44538,79 @@ mod live_effect_capture_tests {
             A::Hash(hash40::hash40("haver").0),
             "the edited bone must reach the game, not the captured one"
         );
+    }
+
+    #[test]
+    fn native_hurtbox_range_plan_from_real_range_editor() {
+        use crate::data::{HurtboxVolume, HurtboxStatus, HurtboxShape};
+        let source = r#"
+unsafe extern "C" fn game_attackhi4(agent: &mut L2CAgentBase) {
+    frame(agent.lua_state_agent, 9.0);
+    if macros::is_excute(agent) {
+        macros::HIT_NODE(agent, Hash40::new("head"), *HIT_STATUS_XLU);
+    }
+    wait(agent.lua_state_agent, 4.0);
+    if macros::is_excute(agent) {
+        HitModule::set_status_all(agent.module_accessor, HitStatus(*HIT_STATUS_NORMAL), 0);
+    }
+}
+"#;
+        let script = crate::acmd::parse_acmd_script(source);
+        let baseline = script.to_hurtboxes().0;
+        assert_eq!(baseline.len(), 1);
+        assert_eq!((baseline[0].active_start, baseline[0].active_end), (9, 12));
+        let volume = HurtboxVolume {
+            index: 1, bone_name: "Head".into(), bone_hash: hash40::hash40("head").0,
+            endpoint1: [0.0; 3], endpoint2: [1.0, 0.0, 0.0],
+            radius: 1.0, default_status: HurtboxStatus::Normal, shape: HurtboxShape::Capsule,
+        };
+        let original: Vec<_> = baseline.iter().collect();
+        let mut edited = script.clone();
+        for (start, end) in [(5, 12), (11, 12), (9, 20), (3, 5), (15, 18), (3, 20)] {
+            edited.replace_native_hurtbox_range(&baseline, &volume, start, end, HurtboxStatus::Xlu).unwrap();
+            let states = edited.to_hurtboxes().0;
+            assert!(states.len() > baseline.len());
+            assert!(states.iter().any(|s| s.active_start == baseline[0].active_start));
+            let refs: Vec<_> = states.iter().collect();
+            let rule = VisionaryApp::native_hurtbox_range_rule(7, &original, &refs).unwrap();
+            let inj = rule.inject.unwrap();
+            assert_eq!(inj.frame, (start - 1) as f32);
+            assert_eq!(inj.args, vec![A::Hash(hash40::hash40("head").0), A::Int(2),
+                A::Num(end as f32), A::Num((start.min(9) - 1) as f32), A::Num(end.max(12) as f32)]);
+        }
+        edited.replace_native_hurtbox_range(&baseline, &volume, 9, 12, HurtboxStatus::Xlu).unwrap();
+        assert_eq!(edited.to_hurtboxes().0, baseline);
+    }
+
+    #[test]
+    fn native_hurtbox_range_plan_keeps_vanilla_anchor_and_both_bounds() {
+        use crate::data::{HurtTarget, HurtboxState};
+        let before = HurtboxState {
+            target: HurtTarget::Bone("head".into()), status: "HIT_STATUS_XLU".into(),
+            active_start: 9, active_end: 12, site: 0,
+        };
+        let state = |start, end, status: &str| HurtboxState {
+            active_start: start, active_end: end, status: status.into(), ..before.clone()
+        };
+        for (start, end, edited) in [
+            (5, 12, vec![state(5, 8, "HIT_STATUS_XLU"), state(9, 12, "HIT_STATUS_XLU")]),
+            (11, 12, vec![state(9, 10, "HIT_STATUS_NORMAL"), state(11, 12, "HIT_STATUS_XLU")]),
+            (5, 18, vec![state(5, 8, "HIT_STATUS_XLU"), state(9, 12, "HIT_STATUS_XLU"),
+                state(13, 18, "HIT_STATUS_XLU"), state(19, 9999, "HIT_STATUS_NORMAL")]),
+            (15, 18, vec![state(9, 12, "HIT_STATUS_NORMAL"), state(15, 18, "HIT_STATUS_XLU"),
+                state(19, 9999, "HIT_STATUS_NORMAL")]),
+        ] {
+            let refs: Vec<_> = edited.iter().collect();
+            let rule = VisionaryApp::native_hurtbox_range_rule(7, &[&before], &refs).unwrap();
+            assert!(!rule.suppress && rule.overrides.is_none());
+            let inj = rule.inject.unwrap();
+            assert_eq!(inj.command.as_deref(), Some("HURT_RANGE_NATIVE"));
+            assert_eq!(inj.frame, (start - 1) as f32);
+            assert_eq!(inj.args, vec![A::Hash(hash40::hash40("head").0), A::Int(2),
+                A::Num(end as f32), A::Num((start.min(9) - 1) as f32), A::Num(end.max(12) as f32)]);
+        }
+        let invalid = state(11, 9999, "HIT_STATUS_XLU");
+        assert!(VisionaryApp::native_hurtbox_range_rule(7, &[&before], &[&invalid]).is_err());
     }
 
     #[test]

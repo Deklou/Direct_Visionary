@@ -2332,7 +2332,7 @@ impl GameLink {
         let valid = scoped.iter().all(|rule| rule.fighter_kind >= 0 && !rule.costume_slots.is_empty());
         let native_moves: Vec<_> = rules.iter().filter(|(_, _, rule)| {
             rule.category == CAT_HURT && rule.inject.as_ref().is_some_and(|inject|
-                matches!(inject.command.as_deref(), Some("HIT_NODE_NATIVE" | "HIT_NO_NATIVE")))
+                matches!(inject.command.as_deref(), Some("HIT_NODE_NATIVE" | "HIT_NO_NATIVE" | "HURT_RANGE_NATIVE")))
         }).map(|(kind, slots, rule)| (*kind, *slots, rule.motion)).collect();
         // An older plugin must not receive only the original-call overrides.
         // Keep unrelated moves, owners and rule families in the full replacement.
@@ -2964,7 +2964,7 @@ fn handle_frame(shared: &Arc<Mutex<Shared>>, payload: &str) {
                     == Some(true);
             s.scoped_hurtbox_ranges_supported = s.scoped_acmd_supported
                 && body.get("GiveClientId")
-                    .and_then(|data| data.get("scoped_hurtbox_ranges"))
+                    .and_then(|data| data.get("scoped_hurtbox_ranges_v2"))
                     .and_then(|value| value.as_bool()) == Some(true);
             s.scoped_aliases_supported = client_id.is_some()
                 && body.get("GiveClientId")
@@ -3710,6 +3710,11 @@ mod tests {
         assert_eq!(link.shared.lock().unwrap().outbox[0], r#"<TCP_MESSAGE>{"hitbox_rules_scoped":[]}</TCP_MESSAGE>"#);
         feed(&link, &[plugin_frame("GiveClientId", &serde_json::json!({
             "GiveClientId": {"client_id": 8, "scoped_acmd": true, "scoped_hurtbox_ranges": true}
+        }))]);
+        assert!(!link.supports_native_hurtbox_ranges());
+        assert!(!link.send_scoped_hitbox_rules(&[(0, &[0], &rule)]));
+        feed(&link, &[plugin_frame("GiveClientId", &serde_json::json!({
+            "GiveClientId": {"client_id": 9, "scoped_acmd": true, "scoped_hurtbox_ranges_v2": true}
         }))]);
         assert!(link.supports_native_hurtbox_ranges());
         assert!(link.send_scoped_hitbox_rules(&[(0, &[0], &rule)]));
