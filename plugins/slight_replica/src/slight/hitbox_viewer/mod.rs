@@ -3559,11 +3559,6 @@ unsafe fn hurt_action(
         return false;
     };
     if suppress {
-        if matches!(func, "HIT_NODE" | "HIT_NO") {
-            crate::slight::diag::note(format!(
-                "HURT_RANGE suppressed vanilla {func} target={target_key:#x} motion={motion:#x} frame={frame:.1}"
-            ));
-        }
         return true;
     }
     let Some(ov) = overrides else {
@@ -3611,11 +3606,6 @@ unsafe fn hurt_action(
         }
     }
     if vals != args {
-        if matches!(func, "HIT_NODE" | "HIT_NO") {
-            crate::slight::diag::note(format!(
-                "HURT_RANGE override vanilla {func} target={target_key:#x} motion={motion:#x} frame={frame:.1} {args:?} -> {vals:?}"
-            ));
-        }
         rewrite_args(lua_state, &vals);
     }
     false
@@ -3967,10 +3957,8 @@ unsafe fn reapply_native_hurtbox_endpoints(boma: *mut smash::app::BattleObjectMo
             if let Some(status) = plan.desired(frame) {
                 plan.apply(boma, target, status);
             }
-        } else if is_native_hurtbox_endpoint(inj) && (frame - inj.frame).abs() <= 0.5
-            && apply_native_hurtbox_endpoint(boma, target, inj)
-        {
-            crate::slight::diag::note(format!("HURT_RANGE reapplied after reset motion={motion:#x} frame={frame:.1}"));
+        } else if is_native_hurtbox_endpoint(inj) && (frame - inj.frame).abs() <= 0.5 {
+            apply_native_hurtbox_endpoint(boma, target, inj);
         }
     }
 }
@@ -4055,9 +4043,9 @@ unsafe fn tick_native_hurtbox_endpoints(
             let readback = plan.apply(boma, target, status);
             let ok = readback.is_some_and(|(_, _, after)| after == status);
             let result = (status, ok);
-            if previous != Some(result) || (finishing && !finalized) {
+            if !ok && (previous != Some(result) || finishing) {
                 crate::slight::diag::note(format!(
-                    "HURT_RANGE native readback motion={motion:#x} frame={frame:.1} requested={status} index/before/after={readback:?} ok={ok} final={finishing}",
+                    "HURT_RANGE failed motion={motion:#x} frame={frame:.1} requested={status} index/before/after={readback:?}",
                 ));
             }
             if let Some(playback) = NATIVE_HURT_PLAYBACK.lock().get_mut(&boid) {
@@ -4081,10 +4069,6 @@ unsafe fn tick_native_hurtbox_endpoints(
             if let Some(playback) = NATIVE_HURT_PLAYBACK.lock().get_mut(&boid) {
                 playback.fired.insert(*fingerprint);
             }
-            crate::slight::diag::note(format!(
-                "HURT_RANGE native endpoint motion={motion:#x} frame={frame:.1} scheduled={:.1} {:?}",
-                inj.frame, inj.args,
-            ));
         }
     }
 }
