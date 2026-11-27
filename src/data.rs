@@ -1572,28 +1572,17 @@ pub(crate) fn effective_hurtbox_status(
     status
 }
 
-/// Find the continuous non-default status range containing the requested frame.
-/// Use the same ordered events as the viewport; None as an end means no authored restoration.
-pub(crate) fn effective_hurtbox_range(
+/// All continuous non-default ranges of a capsule, independently of the playhead.
+pub(crate) fn effective_hurtbox_ranges(
     volume: &HurtboxVolume,
     events: &[HurtboxEvent],
-    requested_frame: u32,
-) -> Option<(u32, Option<u32>)> {
-    let requested = requested_frame.max(1);
-    let status = effective_hurtbox_status(volume, events, requested);
-    if status == volume.default_status {
-        return None;
-    }
-
-    let mut frames: Vec<u32> = events
-        .iter()
-        .map(|event| match event {
-            HurtboxEvent::Set { frame, .. } | HurtboxEvent::ResetAll { frame, .. } => *frame,
-        })
-        .collect();
+) -> Vec<(HurtboxStatus, u32, Option<u32>)> {
+    let mut frames: Vec<u32> = events.iter().map(|event| match event {
+        HurtboxEvent::Set { frame, .. } | HurtboxEvent::ResetAll { frame, .. } => *frame,
+    }).collect();
     frames.sort_unstable();
     frames.dedup();
-
+    let mut ranges = Vec::new();
     let mut previous = volume.default_status;
     let mut start = 1;
     for frame in frames {
@@ -1601,13 +1590,28 @@ pub(crate) fn effective_hurtbox_range(
         if next == previous {
             continue;
         }
-        if frame > requested {
-            return Some((start, Some(frame - 1)));
+        if previous != volume.default_status {
+            ranges.push((previous, start, Some(frame.saturating_sub(1))));
         }
-        start = frame;
         previous = next;
+        start = frame;
     }
-    Some((start, None))
+    if previous != volume.default_status {
+        ranges.push((previous, start, None));
+    }
+    ranges
+}
+
+/// Find the continuous non-default status range containing the requested frame.
+pub(crate) fn effective_hurtbox_range(
+    volume: &HurtboxVolume,
+    events: &[HurtboxEvent],
+    requested_frame: u32,
+) -> Option<(u32, Option<u32>)> {
+    let requested = requested_frame.max(1);
+    effective_hurtbox_ranges(volume, events).into_iter()
+        .find(|(_, start, end)| *start <= requested && end.is_none_or(|end| requested <= end))
+        .map(|(_, start, end)| (start, end))
 }
 
 /// Resolve the fighter-wide damage-reaction condition at a one-based game frame.
@@ -1627,7 +1631,7 @@ pub(crate) fn effective_hurtbox_condition(
     condition
 }
 
-fn hurt_target_matches_volume(target: &HurtTarget, volume: &HurtboxVolume) -> bool {
+pub(crate) fn hurt_target_matches_volume(target: &HurtTarget, volume: &HurtboxVolume) -> bool {
     match target {
         HurtTarget::Bone(bone) => volume.bone_name.eq_ignore_ascii_case(bone),
         HurtTarget::Group(group) => *group == volume.index as i64,
@@ -5022,6 +5026,142 @@ impl AcmdScript {
         self.stmts
             .insert(insert_at + 1, AcmdStmt::Excute(vec![statement]));
         true
+    }
+
+    /// Edit one finite native range without moving any other command or global reset.
+    /// Keep the native targeted calls at their original frames, changing their status if
+    /// necessary. Extra targeted calls then implement the requested interval.
+    pub(crate) fn replace_native_hurtbox_range(
+        &mut self,
+        baseline: &[HurtboxState],
+        volume: &HurtboxVolume,
+        start: u32,
+        end: u32,
+        status: HurtboxStatus,
+    ) -> Result<(), &'static str> {
+        if volume.default_status != HurtboxStatus::Normal || start == 0 || end < start || end >= 9999 {
+            return Err("Unsupported default status or range.");
+        }
+        let status_token = status.source_token().ok_or("Unknown hurtbox status.")?;
+        let native: Vec<_> = baseline.iter().filter(|state|
+            hurt_target_matches_volume(&state.target, volume)
+                && HurtboxStatus::from_acmd_value(&state.status) != HurtboxStatus::Normal
+        ).collect();
+        let [original] = native.as_slice() else {
+            return Err("Only one native non-normal range per capsule is supported.");
+        };
+        if original.target == HurtTarget::Whole || original.active_end >= 9999
+            || HurtboxStatus::from_acmd_value(&original.status).source_token().is_none()
+        {
+            return Err("Whole-body, unknown and open-ended native ranges are not editable here.");
+        }
+        let target = original.target.clone();
+        let original_calls: Vec<_> = baseline.iter().filter(|state|
+            hurt_target_matches_volume(&state.target, volume)
+        ).collect();
+        if original_calls.iter().any(|state| state.target != target
+            || (state.site != original.site && (
+                HurtboxStatus::from_acmd_value(&state.status) != HurtboxStatus::Normal
+                || state.active_start != original.active_end + 1
+            ))) || original_calls.len() > 2 {
+            return Err("Overlapping native hurtbox commands cannot be retimed safely.");
+        }
+
+        let mut edited = self.clone();
+        let mut frame = 0.0_f32;
+        // Normalize flat waits so insertion between the original start and reset
+        // does not move the reset or the unrelated hitbox clear.
+        for stmt in &mut edited.stmts {
+            match stmt {
+                AcmdStmt::Frame(next) => {
+                    if !next.is_finite() || *next < frame || next.fract() != 0.0 {
+                        return Err("Non-monotonic or fractional source timing.");
+                    }
+                    frame = *next;
+                }
+                AcmdStmt::Wait(wait) => {
+                    if !wait.is_finite() || *wait <= 0.0 || wait.fract() != 0.0 {
+                        return Err("Unsupported relative timing.");
+                    }
+                    frame += *wait;
+                    *stmt = AcmdStmt::Frame(frame);
+                }
+                AcmdStmt::Loop { .. } | AcmdStmt::RawBlock { .. } | AcmdStmt::WaitLoopClear => {
+                    return Err("Conditional or looping native ranges are not editable here.");
+                }
+                AcmdStmt::Raw(line) if line.contains("HitModule::") => {
+                    return Err("Unsupported native hurtbox command.");
+                }
+                AcmdStmt::Bare(call) if matches!(call.as_ref(), ExcuteStmt::HitStatus { .. } | ExcuteStmt::HitResetAll) => {
+                    return Err("Unsupported bare hurtbox command.");
+                }
+                AcmdStmt::Excute(calls) => {
+                    for call in calls.iter() {
+                        match call {
+                            ExcuteStmt::HitStatus { target: other, .. }
+                                if other != &target && hurt_target_matches_volume(other, volume) => {
+                                return Err("Overlapping hurtbox targets.");
+                            }
+                            ExcuteStmt::Raw(line) if line.contains("HitModule::")
+                                && line.split_whitespace().collect::<String>()
+                                    != "HitModule::set_status_all(agent.module_accessor,HitStatus(*HIT_STATUS_NORMAL),0);" => {
+                                return Err("Unsupported native hurtbox command.");
+                            }
+                            _ => {}
+                        }
+                    }
+                    calls.retain(|call| !matches!(call, ExcuteStmt::HitStatus { target: other, .. } if other == &target));
+                }
+                _ => {}
+            }
+        }
+        let resets: std::collections::BTreeSet<u32> = edited.to_hurtbox_events().iter()
+            .filter_map(|event| match event {
+                HurtboxEvent::ResetAll { frame, .. } => Some(*frame),
+                HurtboxEvent::Set { frame, target: HurtTarget::Whole, status: HurtboxStatus::Normal, .. } => Some(*frame),
+                _ => None,
+            }).collect();
+
+        let mut schedule = std::collections::BTreeMap::new();
+        let normal = "HIT_STATUS_NORMAL";
+        for call in original_calls {
+            let at = call.active_start;
+            schedule.insert(at, if (start..=end).contains(&at) { status_token } else { normal });
+        }
+        if status != HurtboxStatus::Normal {
+            schedule.insert(start, status_token);
+            if !resets.contains(&(end + 1)) {
+                schedule.insert(end + 1, normal);
+            }
+            for at in resets.range(start..=end) {
+                schedule.insert(*at, status_token);
+            }
+        }
+        for (at, token) in schedule {
+            // Insert after all existing calls at this frame, including a global reset.
+            // If no frame boundary exists here, insert one before the next absolute frame.
+            let mut insertion = edited.stmts.len();
+            let mut current = 1;
+            for (index, stmt) in edited.stmts.iter().enumerate() {
+                if let AcmdStmt::Frame(value) = stmt {
+                    let next = script_frame(*value);
+                    if next > at {
+                        insertion = index;
+                        break;
+                    }
+                    current = next;
+                }
+            }
+            if current != at {
+                edited.stmts.insert(insertion, AcmdStmt::Frame(at as f32));
+                insertion += 1;
+            }
+            edited.stmts.insert(insertion, AcmdStmt::Excute(vec![ExcuteStmt::HitStatus {
+                target: target.clone(), status: token.to_string(),
+            }]));
+        }
+        *self = edited;
+        Ok(())
     }
 
     /// Replace the extra endpoints previously authored by the parameter-hurtbox range editor,
@@ -10108,6 +10248,7 @@ unsafe extern "C" fn game_attackhi4(agent: &mut L2CAgentBase) {
     }
     frame(agent.lua_state_agent, 9.0);
     if macros::is_excute(agent) {
+        macros::ATTACK(agent, 0, 0, Hash40::new("head"), 14.0, 83, 94, 0, 32, 5.0, 2.5, 1.1, 0.0, None, None, None, 1.0, 1.0, *ATTACK_SETOFF_KIND_ON, *ATTACK_LR_CHECK_POS, false, 0, 0.0, 0, false, false, false, false, true, *COLLISION_SITUATION_MASK_GA, *COLLISION_CATEGORY_MASK_ALL, *COLLISION_PART_MASK_ALL, false, Hash40::new("collision_attr_normal"), *ATTACK_SOUND_LEVEL_L, *COLLISION_SOUND_ATTR_PUNCH, *ATTACK_REGION_HEAD);
         macros::HIT_NODE(agent, Hash40::new("head"), *HIT_STATUS_XLU);
     }
     wait(agent.lua_state_agent, 4.0);
@@ -10137,9 +10278,28 @@ unsafe extern "C" fn game_attackhi4(agent: &mut L2CAgentBase) {
         }
         assert_eq!(effective_hurtbox_status(&head, &events, 13), HurtboxStatus::Normal);
         assert_eq!(effective_hurtbox_range(&head, &events, 13), None);
+        assert_eq!(effective_hurtbox_ranges(&head, &events), vec![(HurtboxStatus::Xlu, 9, Some(12))]);
         let exported = crate::acmd::export_acmd_source(&script, "mario", "attack_hi4");
         assert!(exported.contains("HitModule::set_status_all(agent.module_accessor, HitStatus(*HIT_STATUS_NORMAL), 0);"));
         assert_eq!(crate::acmd::parse_acmd_script(&exported).to_hurtboxes().0, states);
+
+        // Exercise real source timing, including the wait and unrelated clear.
+        assert!(!script.to_hitboxes().is_empty());
+        let mut edited = script.clone();
+        for (start, end) in [(5, 18), (10, 11), (15, 20), (9, 12)] {
+            edited.replace_native_hurtbox_range(&states, &head, start, end, HurtboxStatus::Xlu).unwrap();
+            let events = edited.to_hurtbox_events();
+            assert_eq!(effective_hurtbox_ranges(&head, &events), vec![(HurtboxStatus::Xlu, start, Some(end))]);
+            assert!(effective_hurtbox_ranges(&waist, &events).is_empty());
+            assert!(events.iter().any(|event| matches!(event, HurtboxEvent::Set {
+                frame: 13, target: HurtTarget::Whole, status: HurtboxStatus::Normal, ..
+            })));
+            assert_eq!(edited.to_hitboxes(), script.to_hitboxes());
+            let round_trip = crate::acmd::parse_acmd_script(&crate::acmd::export_acmd_source(&edited, "mario", "attack_hi4"));
+            assert_eq!(effective_hurtbox_ranges(&head, &round_trip.to_hurtbox_events()),
+                vec![(HurtboxStatus::Xlu, start, Some(end))]);
+        }
+        assert_eq!(edited.to_hurtboxes().0, states);
 
         // A different native argument must not be silently treated as a normal reset.
         let other = source.replace("HitStatus(*HIT_STATUS_NORMAL), 0", "HitStatus(*HIT_STATUS_XLU), 0");

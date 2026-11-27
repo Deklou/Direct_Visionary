@@ -1340,6 +1340,7 @@ struct Shared {
     /// Only a matching plugin can consume the scoped-cancel wire format.
     scoped_cancels_supported: bool,
     scoped_acmd_supported: bool,
+    scoped_hurtbox_ranges_supported: bool,
     scoped_aliases_supported: bool,
     connection_epoch: u64,
     collision_requests: BTreeMap<i32, u64>,
@@ -1512,6 +1513,7 @@ impl Default for Shared {
             client_id: None,
             scoped_cancels_supported: false,
             scoped_acmd_supported: false,
+            scoped_hurtbox_ranges_supported: false,
             scoped_aliases_supported: false,
             connection_epoch: 0,
             collision_requests: BTreeMap::new(),
@@ -1800,11 +1802,17 @@ impl GameLink {
     /// Send a scoped full replacement only to a plugin that advertised this protocol on the
     /// current socket. An unverified target or legacy plugin receives a clear, never a rule.
     fn send_scoped_acmd_payload<T: Serialize>(&self, family: &str, rules: &[T], valid: bool) -> bool {
+        self.send_scoped_acmd_payload_checked(family, rules, valid, None)
+    }
+
+    fn send_scoped_acmd_payload_checked<T: Serialize>(&self, family: &str, rules: &[T], valid: bool, fallback: Option<&[T]>) -> bool {
         if self.sends_suppressed() {
             return false;
         }
         let scoped_key = format!("{family}_scoped");
-        let scoped = serde_json::to_string(&serde_json::json!({ (scoped_key): rules })).ok();
+        let scoped = serde_json::to_string(&serde_json::json!({ (scoped_key.clone()): rules })).ok();
+        let fallback_payload = fallback.and_then(|rules|
+            serde_json::to_string(&serde_json::json!({ (scoped_key): rules })).ok());
         let clear = format!("<TCP_MESSAGE>{{\"{family}\":[]}}</TCP_MESSAGE>");
         let Ok(mut shared) = self.shared.lock() else { return false; };
         let supported = valid && shared.status == LinkStatus::Connected
@@ -1813,8 +1821,10 @@ impl GameLink {
             } else {
                 shared.scoped_acmd_supported
             };
-        let (frame, sent) = match (supported, scoped) {
-            (true, Some(payload)) => (format!("<TCP_MESSAGE>{payload}</TCP_MESSAGE>"), true),
+        let withheld = fallback.is_some() && !shared.scoped_hurtbox_ranges_supported;
+        let payload = if withheld { fallback_payload } else { scoped };
+        let (frame, sent) = match (supported, payload) {
+            (true, Some(payload)) => (format!("<TCP_MESSAGE>{payload}</TCP_MESSAGE>"), !withheld),
             _ => (clear, false),
         };
         queue_latest_full_replace(&mut shared.outbox, frame);
@@ -2320,7 +2330,27 @@ impl GameLink {
             })
             .collect();
         let valid = scoped.iter().all(|rule| rule.fighter_kind >= 0 && !rule.costume_slots.is_empty());
-        self.send_scoped_acmd_payload("hitbox_rules", &scoped, valid)
+        let native_moves: Vec<_> = rules.iter().filter(|(_, _, rule)| {
+            rule.category == CAT_HURT && rule.inject.as_ref().is_some_and(|inject|
+                matches!(inject.command.as_deref(), Some("HIT_NODE_NATIVE" | "HIT_NO_NATIVE")))
+        }).map(|(kind, slots, rule)| (*kind, *slots, rule.motion)).collect();
+        // An older plugin must not receive only the original-call overrides.
+        // Keep unrelated moves, owners and rule families in the full replacement.
+        let fallback = (!native_moves.is_empty()).then(|| {
+            rules.iter().filter(|(kind, slots, rule)| {
+                rule.category != CAT_HURT || !native_moves.iter().any(|(native_kind, native_slots, motion)|
+                    kind == native_kind && rule.motion == *motion
+                        && slots.iter().any(|slot| native_slots.contains(slot)))
+            }).map(|(fighter_kind, costume_slots, rule)| ScopedHitboxRuleWire {
+                fighter_kind: *fighter_kind, costume_slots: *costume_slots, rule: *rule,
+            }).collect::<Vec<_>>()
+        });
+        self.send_scoped_acmd_payload_checked("hitbox_rules", &scoped, valid, fallback.as_deref())
+    }
+
+    pub fn supports_native_hurtbox_ranges(&self) -> bool {
+        self.shared.lock().is_ok_and(|s| s.status == LinkStatus::Connected
+            && s.client_id.is_some() && s.scoped_hurtbox_ranges_supported)
     }
 
     /// Same full-list replace and TCP coalescing as the original rule sender.
@@ -2396,6 +2426,7 @@ fn link_thread(shared: Arc<Mutex<Shared>>) {
             s.client_id = None;
             s.scoped_cancels_supported = false;
                 s.scoped_acmd_supported = false;
+                s.scoped_hurtbox_ranges_supported = false;
                 s.scoped_aliases_supported = false;
             s.last_rx = None;
         }
@@ -2417,6 +2448,7 @@ fn link_thread(shared: Arc<Mutex<Shared>>) {
                 s.client_id = None;
                 s.scoped_cancels_supported = false;
                 s.scoped_acmd_supported = false;
+                s.scoped_hurtbox_ranges_supported = false;
                 s.scoped_aliases_supported = false;
                 s.last_rx = None;
             }
@@ -2428,6 +2460,7 @@ fn link_thread(shared: Arc<Mutex<Shared>>) {
                 s.client_id = None;
                 s.scoped_cancels_supported = false;
                 s.scoped_acmd_supported = false;
+                s.scoped_hurtbox_ranges_supported = false;
                 s.scoped_aliases_supported = false;
                 s.last_rx = None;
             }
@@ -2929,6 +2962,10 @@ fn handle_frame(shared: &Arc<Mutex<Shared>>, payload: &str) {
                     .and_then(|data| data.get("scoped_acmd"))
                     .and_then(|value| value.as_bool())
                     == Some(true);
+            s.scoped_hurtbox_ranges_supported = s.scoped_acmd_supported
+                && body.get("GiveClientId")
+                    .and_then(|data| data.get("scoped_hurtbox_ranges"))
+                    .and_then(|value| value.as_bool()) == Some(true);
             s.scoped_aliases_supported = client_id.is_some()
                 && body.get("GiveClientId")
                     .and_then(|data| data.get("scoped_aliases"))
@@ -3656,6 +3693,27 @@ mod tests {
             "GiveClientId": { "client_id": 7, "scoped_acmd": true }
         }))]);
         link
+    }
+
+    #[test]
+    fn scoped_acmd_native_hurtbox_ranges_require_new_capability() {
+        let link = scoped_acmd_link();
+        let rule = HitboxRuleWire {
+            motion: 7, category: CAT_HURT, hitbox_id: Some(1), suppress: false,
+            frame_start: None, frame_end: None, overrides: None, func: Some("HIT_NO".into()),
+            inject: Some(InjectRuleWire {
+                frame: 4.0, args: vec![LuaArgWire::Int(1), LuaArgWire::Int(2)],
+                command: Some("HIT_NO_NATIVE".into()),
+            }),
+        };
+        assert!(!link.send_scoped_hitbox_rules(&[(0, &[0], &rule)]));
+        assert_eq!(link.shared.lock().unwrap().outbox[0], r#"<TCP_MESSAGE>{"hitbox_rules_scoped":[]}</TCP_MESSAGE>"#);
+        feed(&link, &[plugin_frame("GiveClientId", &serde_json::json!({
+            "GiveClientId": {"client_id": 8, "scoped_acmd": true, "scoped_hurtbox_ranges": true}
+        }))]);
+        assert!(link.supports_native_hurtbox_ranges());
+        assert!(link.send_scoped_hitbox_rules(&[(0, &[0], &rule)]));
+        assert!(link.shared.lock().unwrap().outbox[0].contains("HIT_NO_NATIVE"));
     }
 
     #[test]

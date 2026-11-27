@@ -3785,7 +3785,75 @@ unsafe fn hook_atk_set_shield_setoff_mul(lua_state: u64) {
 #[skyline::hook(replace = smash::app::sv_animcmd::HIT_RESET_ALL)]
 unsafe fn hook_hit_reset_all(lua_state: u64) {
     record(lua_state, "HIT_RESET_ALL", &[]);
-    original!()(lua_state)
+    original!()(lua_state);
+    if any_rules() && !is_injecting() {
+        let boma = smash::app::sv_system::battle_object_module_accessor(lua_state)
+            as *mut smash::app::BattleObjectModuleAccessor;
+        reapply_native_hurtbox_endpoints(boma);
+    }
+}
+
+// The dumped Mario up smash calls this binding, not HIT_RESET_ALL.
+// Preserve the global reset and only reapply endpoints explicitly scheduled on this frame.
+#[skyline::hook(replace = smash::app::lua_bind::HitModule::set_status_all)]
+unsafe fn hook_native_hit_status_all(
+    boma: *mut smash::app::BattleObjectModuleAccessor,
+    status: smash::app::HitStatus,
+    arg: i32,
+) {
+    original!()(boma, status, arg);
+    if status.0 == 0 && arg == 0 && any_rules() && !is_injecting() {
+        reapply_native_hurtbox_endpoints(boma);
+    }
+}
+
+fn is_native_hurtbox_endpoint(inj: &InjectRule) -> bool {
+    matches!(inj.command.as_deref(), Some("HIT_NODE_NATIVE" | "HIT_NO_NATIVE"))
+}
+
+unsafe fn apply_native_hurtbox_endpoint(
+    boma: *mut smash::app::BattleObjectModuleAccessor,
+    target: RuntimeTarget,
+    inj: &InjectRule,
+) -> bool {
+    if !crate::slight::ver::is_13_0_5() {
+        return false;
+    }
+    use smash::app::{lua_bind::HitModule, HitStatus};
+    let _guard = InjectGuard::new();
+    match (inj.command.as_deref(), inj.args.as_slice()) {
+        (Some("HIT_NODE_NATIVE"), [LuaArg::Hash(bone), LuaArg::Int(status)])
+            if target.fighter_kind != 6 && (0..=3).contains(status) => {
+            HitModule::set_status_joint(boma, smash::phx::Hash40::new_raw(*bone), HitStatus(*status as i32), 0);
+            true
+        }
+        (Some("HIT_NO_NATIVE"), [LuaArg::Int(group), LuaArg::Int(status)])
+            if (0..=255).contains(group) && (0..=3).contains(status) => {
+            HitModule::set_status(boma, *group as i32, HitStatus(*status as i32), 0);
+            true
+        }
+        _ => false,
+    }
+}
+
+unsafe fn reapply_native_hurtbox_endpoints(boma: *mut smash::app::BattleObjectModuleAccessor) {
+    if !crate::slight::ver::is_13_0_5() {
+        return;
+    }
+    let Some(target) = rule_target(boma) else { return; };
+    let motion = smash::app::lua_bind::MotionModule::motion_kind(boma);
+    let frame = smash::app::lua_bind::MotionModule::frame(boma);
+    let endpoints: Vec<_> = RULES.lock().iter()
+        .filter(|rule| rule.category == CAT_HURT && rule.motion == motion
+            && target.matches(rule.fighter_kind, rule.costume_slots.as_deref()))
+        .filter_map(|rule| rule.inject.as_ref())
+        .filter(|inj| is_native_hurtbox_endpoint(inj) && (frame - inj.frame).abs() <= 0.5)
+        .cloned().collect();
+    for inj in &endpoints {
+        if apply_native_hurtbox_endpoint(boma, target, inj) {
+            crate::slight::diag::note(format!("HURT_RANGE reapplied after reset motion={motion:#x} frame={frame:.1}"));
+        }
+    }
 }
 
 // `COL_NORMAL` was hooked here, next to `COL_PRI`, back when both read as body collision. It is
@@ -3849,6 +3917,15 @@ pub unsafe fn inject_tick(lua_state: u64) {
                 .unwrap_or(false)
         };
         if due && !already {
+            if category == CAT_HURT && is_native_hurtbox_endpoint(&inj) {
+                if apply_native_hurtbox_endpoint(boma, target, &inj) {
+                    FIRED.lock().insert(key, (motion, frame));
+                    crate::slight::diag::note(format!(
+                        "HURT_RANGE native endpoint motion={motion:#x} frame={frame:.1}"
+                    ));
+                }
+                continue;
+            }
             let lifecycle_command = match (category, inj.command.as_deref()) {
                 (CAT_ATTACK_LIFETIME, Some("ATTACK_CLEAR_ID")) => {
                     let Some(LuaArg::Int(id)) = inj.args.first() else {
@@ -4277,6 +4354,7 @@ pub fn install() {
         hook_damage_no_reaction,
         hook_col_pri,
         hook_hit_reset_all,
+        hook_native_hit_status_all,
         hook_atk_power,
         hook_atk_set_shield_setoff_mul,
         hook_rumble_hit,
