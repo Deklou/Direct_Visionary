@@ -1572,6 +1572,44 @@ pub(crate) fn effective_hurtbox_status(
     status
 }
 
+/// Find the continuous non-default status range containing the requested frame.
+/// Use the same ordered events as the viewport; None as an end means no authored restoration.
+pub(crate) fn effective_hurtbox_range(
+    volume: &HurtboxVolume,
+    events: &[HurtboxEvent],
+    requested_frame: u32,
+) -> Option<(u32, Option<u32>)> {
+    let requested = requested_frame.max(1);
+    let status = effective_hurtbox_status(volume, events, requested);
+    if status == volume.default_status {
+        return None;
+    }
+
+    let mut frames: Vec<u32> = events
+        .iter()
+        .map(|event| match event {
+            HurtboxEvent::Set { frame, .. } | HurtboxEvent::ResetAll { frame, .. } => *frame,
+        })
+        .collect();
+    frames.sort_unstable();
+    frames.dedup();
+
+    let mut previous = volume.default_status;
+    let mut start = 1;
+    for frame in frames {
+        let next = effective_hurtbox_status(volume, events, frame);
+        if next == previous {
+            continue;
+        }
+        if frame > requested {
+            return Some((start, Some(frame - 1)));
+        }
+        start = frame;
+        previous = next;
+    }
+    Some((start, None))
+}
+
 /// Resolve the fighter-wide damage-reaction condition at a one-based game frame.
 pub(crate) fn effective_hurtbox_condition(
     events: &[HurtboxConditionEvent],
@@ -10037,6 +10075,56 @@ mod tests {
             effective_hurtbox_status(&volumes[2], &bone_event, 1),
             HurtboxStatus::Normal
         );
+    }
+
+    #[test]
+    fn effective_hurtbox_range_resolves_bone_and_global_reset() {
+        let head = sample_volume(1, "Head", HurtboxStatus::Normal);
+        let waist = sample_volume(0, "Waist", HurtboxStatus::Normal);
+        let events = vec![
+            HurtboxEvent::Set {
+                frame: 9, sequence: 0,
+                target: HurtTarget::Bone("head".into()),
+                status: HurtboxStatus::Xlu,
+            },
+            HurtboxEvent::Set {
+                frame: 10, sequence: 1,
+                target: HurtTarget::Group(0),
+                status: HurtboxStatus::Invincible,
+            },
+            HurtboxEvent::ResetAll { frame: 13, sequence: 2 },
+        ];
+        assert_eq!(effective_hurtbox_range(&head, &events, 8), None);
+        for frame in 9..=12 {
+            assert_eq!(effective_hurtbox_range(&head, &events, frame), Some((9, Some(12))));
+        }
+        assert_eq!(effective_hurtbox_range(&head, &events, 13), None);
+        assert_eq!(effective_hurtbox_range(&waist, &events, 11), Some((10, Some(12))));
+    }
+
+    #[test]
+    fn effective_hurtbox_range_resolves_overlapping_targets_and_open_end() {
+        let head = sample_volume(1, "Head", HurtboxStatus::Normal);
+        let events = vec![
+            HurtboxEvent::Set {
+                frame: 3, sequence: 0, target: HurtTarget::Whole,
+                status: HurtboxStatus::Xlu,
+            },
+            HurtboxEvent::Set {
+                frame: 5, sequence: 1, target: HurtTarget::Bone("head".into()),
+                status: HurtboxStatus::Xlu,
+            },
+            HurtboxEvent::Set {
+                frame: 7, sequence: 2, target: HurtTarget::Group(1),
+                status: HurtboxStatus::Normal,
+            },
+            HurtboxEvent::Set {
+                frame: 7, sequence: 3, target: HurtTarget::Group(1),
+                status: HurtboxStatus::Invincible,
+            },
+        ];
+        assert_eq!(effective_hurtbox_range(&head, &events, 5), Some((3, Some(6))));
+        assert_eq!(effective_hurtbox_range(&head, &events, 7), Some((7, None)));
     }
 
     #[test]

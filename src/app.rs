@@ -14997,27 +14997,13 @@ impl VisionaryApp {
                     let events = self.state.script.to_hurtbox_events();
                     self.hurtbox_edit_status =
                         crate::data::effective_hurtbox_status(volume, &events, frame);
-                    let target = crate::data::HurtTarget::Group(volume.index as i64);
-                    if let Some(state) =
-                        self.state
-                            .script
-                            .to_hurtboxes()
-                            .0
-                            .into_iter()
-                            .find(|state| {
-                                state.target == target
-                                    && state.active_start <= frame
-                                    && frame <= state.active_end
-                            })
+                    if let Some((start, end)) =
+                        crate::data::effective_hurtbox_range(volume, &events, frame)
                     {
-                        self.hurtbox_edit_start = state.active_start;
-                        self.hurtbox_edit_end = if state.active_end < 9999 {
-                            state.active_end
-                        } else {
-                            frame.saturating_add(5)
-                        };
-                        self.hurtbox_edit_status =
-                            crate::data::HurtboxStatus::from_acmd_value(&state.status);
+                        self.hurtbox_edit_start = start;
+                        self.hurtbox_edit_end = end.unwrap_or_else(|| {
+                            self.state.total_frames.max(frame).min(9999)
+                        });
                     } else {
                         self.hurtbox_edit_start = frame;
                         self.hurtbox_edit_end = frame.saturating_add(5);
@@ -15035,7 +15021,7 @@ impl VisionaryApp {
             "select · edit · apply range",
         );
         ui.small(
-            "Workflow: select a capsule, choose its status, enter Start and End frames, then click Apply / replace range. The capsule's parameter default is restored on the following frame.",
+            "Select a capsule at the desired frame. Active non-default ranges are read from ACMD; open ranges use the move end. Otherwise the fields suggest a new range. Apply / replace range authors a capsule range and restores its parameter default on the following frame.",
         );
 
         let events = self.state.script.to_hurtbox_events();
@@ -15063,6 +15049,7 @@ impl VisionaryApp {
                     let response = ui.selectable_label(selected, label);
                     if response.clicked() {
                         self.selected_hurtbox = Some(*index);
+                        self.hurtbox_editor_selection = None;
                     }
                     response.on_hover_text(format!(
                         "Parameter list index {} on bone {}. Current status: {}. Default: {}. Click to author a frame range.",
