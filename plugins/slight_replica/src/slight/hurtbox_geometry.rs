@@ -129,14 +129,6 @@ unsafe fn native_record(boma: *mut BattleObjectModuleAccessor, index: u32)
     Some((module, group, record))
 }
 
-// Temporary read-only trace, using the existing guarded group-zero layout.
-pub(super) unsafe fn trace_range_status(
-    boma: *mut BattleObjectModuleAccessor, index: u32,
-) -> Option<(u64, i32, i32, i32)> {
-    let (_, group, record) = native_record(boma, index)?;
-    Some((read_at(record, 0x28), read_at(record, 0), read_at(group, 0x1c), read_at(group, 0x20)))
-}
-
 unsafe fn native_capsule(boma: *mut BattleObjectModuleAccessor, index: u32) -> Option<NativeCapsule> {
     let (_, _, record) = native_record(boma, index)?;
     let capsule = NativeCapsule {
