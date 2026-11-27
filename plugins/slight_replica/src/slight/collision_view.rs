@@ -74,6 +74,12 @@ struct Sphere {
     color: [f32; 3],
 }
 
+impl Sphere {
+    fn needs_refresh(self) -> bool {
+        self.color == BLUE
+    }
+}
+
 struct Marker {
     sphere: Sphere,
     handle: u32,
@@ -427,12 +433,15 @@ pub unsafe fn tick(boma: *mut BattleObjectModuleAccessor) {
     let previous = objects.remove(&id);
     let mut old = previous.filter(|o| o.accessor == boma as usize)
         .map(|o| o.markers).unwrap_or_default();
-    // Reuse matching handles rather than respawning the whole overlay every frame.
+    // A surviving sys_shield handle does not guarantee visible particles.
+    // Renew XLU markers while the native status requests them; cache other volumes as before.
     let mut next = Vec::with_capacity(want.len());
     for sphere in want {
         if let Some(i) = old.iter().position(|m| m.sphere == sphere) {
             let marker = old.swap_remove(i);
-            if EffectModule::is_exist_effect(boma, marker.handle) {
+            if sphere.needs_refresh() {
+                kill(boma, marker);
+            } else if EffectModule::is_exist_effect(boma, marker.handle) {
                 next.push(marker);
                 continue;
             }
@@ -492,6 +501,16 @@ mod tests {
         assert_eq!(effective_status(normal, xlu, off, xlu, invincible), xlu);
         assert_eq!(effective_status(xlu, normal, off, xlu, invincible), xlu);
         assert_eq!(effective_status(off, invincible, off, xlu, invincible), off);
+    }
+
+    #[test]
+    fn only_intangible_markers_are_renewed() {
+        let mut sphere = Sphere { bone: 1, pos: [0.0; 3], radius: 2.0, color: BLUE };
+        assert!(sphere.needs_refresh());
+        for color in [RED, GRAY, GREEN] {
+            sphere.color = color;
+            assert!(!sphere.needs_refresh());
+        }
     }
 
     #[test]
