@@ -6452,7 +6452,24 @@ fn eval_excute_stmt(s: &ExcuteStmt, frame: f32, hitboxes: &mut Vec<Hitbox>, hurt
                 site,
             });
         }
-        ExcuteStmt::Raw(line) => record_raw_partial_frame(line, frame, hurt),
+        ExcuteStmt::Raw(line) => {
+            record_raw_partial_frame(line, frame, hurt);
+            // The vanilla Mario up smash restores every joint with this native call.
+            // Keep it raw for exact source round-tripping and do not allocate a macro site.
+            // Other statuses or final arguments are not interpreted here.
+            if line.split_whitespace().collect::<String>()
+                == "HitModule::set_status_all(agent.module_accessor,HitStatus(*HIT_STATUS_NORMAL),0);"
+            {
+                let frame = script_frame(frame);
+                hurt.reset_all(frame);
+                hurt.events.push(HurtboxEvent::Set {
+                    frame,
+                    sequence: hurt.events.len(),
+                    target: HurtTarget::Whole,
+                    status: HurtboxStatus::Normal,
+                });
+            }
+        }
     }
 }
 
@@ -10075,6 +10092,58 @@ mod tests {
             effective_hurtbox_status(&volumes[2], &bone_event, 1),
             HurtboxStatus::Normal
         );
+    }
+
+    #[test]
+    fn mario_up_smash_native_status_all_closes_head_intangibility() {
+        // Relevant commands from WuBoytH/SSBU-Dumped-Scripts:
+        // smashline/mario/mario/AttackHi4.txt, game_attackhi4.
+        let source = r#"
+unsafe extern "C" fn game_attackhi4(agent: &mut L2CAgentBase) {
+    frame(agent.lua_state_agent, 7.0);
+    execute(agent.lua_state_agent, 7.0);
+    if macros::is_excute(agent) {
+        WorkModule::on_flag(agent.module_accessor, *FIGHTER_STATUS_ATTACK_FLAG_START_SMASH_HOLD);
+        JostleModule::set_status(agent.module_accessor, false);
+    }
+    frame(agent.lua_state_agent, 9.0);
+    if macros::is_excute(agent) {
+        macros::HIT_NODE(agent, Hash40::new("head"), *HIT_STATUS_XLU);
+    }
+    wait(agent.lua_state_agent, 4.0);
+    if macros::is_excute(agent) {
+        AttackModule::clear_all(agent.module_accessor);
+        HitModule::set_status_all(agent.module_accessor, HitStatus(*HIT_STATUS_NORMAL), 0);
+    }
+    frame(agent.lua_state_agent, 20.0);
+    if macros::is_excute(agent) {
+        JostleModule::set_status(agent.module_accessor, true);
+    }
+}
+"#;
+        let script = crate::acmd::parse_acmd_script(source);
+        let head = sample_volume(1, "Head", HurtboxStatus::Normal);
+        let waist = sample_volume(0, "Waist", HurtboxStatus::Normal);
+        let (states, _) = script.to_hurtboxes();
+        assert_eq!(states.len(), 1);
+        assert_eq!(states[0].target, HurtTarget::Bone("head".into()));
+        assert_eq!((states[0].active_start, states[0].active_end), (9, 12));
+        let events = script.to_hurtbox_events();
+        assert_eq!(effective_hurtbox_status(&head, &events, 8), HurtboxStatus::Normal);
+        for frame in 9..=12 {
+            assert_eq!(effective_hurtbox_status(&head, &events, frame), HurtboxStatus::Xlu);
+            assert_eq!(effective_hurtbox_range(&head, &events, frame), Some((9, Some(12))));
+            assert_eq!(effective_hurtbox_status(&waist, &events, frame), HurtboxStatus::Normal);
+        }
+        assert_eq!(effective_hurtbox_status(&head, &events, 13), HurtboxStatus::Normal);
+        assert_eq!(effective_hurtbox_range(&head, &events, 13), None);
+        let exported = crate::acmd::export_acmd_source(&script, "mario", "attack_hi4");
+        assert!(exported.contains("HitModule::set_status_all(agent.module_accessor, HitStatus(*HIT_STATUS_NORMAL), 0);"));
+        assert_eq!(crate::acmd::parse_acmd_script(&exported).to_hurtboxes().0, states);
+
+        // A different native argument must not be silently treated as a normal reset.
+        let other = source.replace("HitStatus(*HIT_STATUS_NORMAL), 0", "HitStatus(*HIT_STATUS_XLU), 0");
+        assert_eq!(crate::acmd::parse_acmd_script(&other).to_hurtboxes().0[0].active_end, 9999);
     }
 
     #[test]

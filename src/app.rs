@@ -15192,8 +15192,16 @@ impl VisionaryApp {
                 volume.bone_name,
                 volume.default_status.label()
             ));
+            let actual_status = crate::data::effective_hurtbox_status(&volume, &events, current_frame);
+            let actual_range = crate::data::effective_hurtbox_range(&volume, &events, current_frame)
+                .map(|(start, end)| match end {
+                    Some(end) => format!(" · frames {start}–{end}"),
+                    None => format!(" · from frame {start}, no authored end"),
+                })
+                .unwrap_or_default();
+            ui.small(format!("Current ACMD: {} at frame {}{}", actual_status.label(), current_frame, actual_range));
             ui.horizontal_wrapped(|ui| {
-                ui.label("Status");
+                ui.label("Range status");
                 egui::ComboBox::from_id_salt("parameter_hurtbox_status")
                     .selected_text(self.hurtbox_edit_status.label())
                     .width(150.0)
@@ -33656,6 +33664,7 @@ If you step every basis for a                          type and NONE of them mat
             TimelineSelection::Command { family, site } => {
                 self.selected_command = Some((family.clone(), *site));
                 if family == "hurtbox" {
+                    self.hurtbox_editor_selection = None;
                     if let Some(state) = self
                         .state
                         .script
@@ -37144,6 +37153,7 @@ impl eframe::App for VisionaryApp {
                             self.state.selected_effect_call = None;
                             self.primary_tab = PrimaryEditorTab::Collisions;
                         } else if let Some((i, _)) = best_hurtbox_pick {
+                            self.hurtbox_editor_selection = None;
                             self.selected_hurtbox = Some(i);
                             self.selected_hitbox = None;
                             self.state.selected_effect_call = None;
